@@ -1,17 +1,22 @@
-# Prototype status
+# Status
 
-## Included
-
-- A standard-library Tkinter desktop UI with file/folder selection, input analysis, section preview, build log and staging output controls.
-- A source-safe builder that reads one JSON object per non-empty line, supports one item file or a full folder tree, and never modifies source files.
-- The current camera-driven section streamer with on-demand section chunks, bounded create/delete work and cooldown.
-- Runtime handling for the sample export's `rotationEuler` array as well as quaternion `rotation` records.
-- Synthetic Python tests exercising section extraction, source immutability, multi-section records and raw-line preservation.
+## Built
+- Prep tool (Python): reads line-delimited `items.level.json` files, moves streamable `TSStatic`
+  records into whole-section files, writes patched items copies without them, verifies the
+  accounting, never modifies the source. Tkinter studio over the same builder (restyle pending).
+- Manager: all 32 instance flags parsed, draw-gate flags applied, emitters/lights with On/Off radios (legacy scene streamer retired). Fidelity notes: `docs/FIDELITY.md`.
+- Collision policy extension (off / settled, timed refreshes) kept apart from rendering.
+- Streamer, manager and panel as engine extensions in `lua/ge/extensions/nfsc/`; offline Lua tests
+  run against the builder's real output (`tests/test_lua_modules.py`).
+- Architecture, interface and diagnostics: `docs/ARCHITECTURE.md`.
 
 ## Not validated yet
+- Everything inside BeamNG (see the list at the end of `docs/ARCHITECTURE.md`).
+- Tkinter on the user's desktop.
+- Collision and memory behaviour of created/deleted objects.
 
-- Launching Tkinter on the user's Windows desktop.
-- Lua execution inside BeamNG.drive.
-- Visual orientation for all exported Euler and negative-scale combinations.
-- Actual shape/texture memory eviction.
-- Collision parity: visual-only mode disables streamed collision and decals.
+## Open
+- Measure collision refresh cost in game; Hyperlinked / MW decomp fidelity comparison.
+- Depth sections (overpass/tunnel variants) in `sections.json` and the lookup.
+- Studio UI restyle.
+- `lua/ge/extensions/nfscSectionStreamPrototype.lua` is superseded and can be removed by hand.

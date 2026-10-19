@@ -42,7 +42,6 @@ class StreamStudio(tk.Tk):
         self.source_var = tk.StringVar()
         self.output_var = tk.StringVar(value=str(Path.home() / "Documents" / "Palmont_Stream_Staging"))
         self.vfs_var = tk.StringVar(value="levels/nfsc")
-        self.chunk_var = tk.StringVar(value="64")
         self.status_var = tk.StringVar(value="Choose your exported item file or the full level folder to begin.")
         self.mode_var = tk.StringVar(value="Auto-detect: one file or a folder")
         self.busy = False
@@ -127,7 +126,7 @@ class StreamStudio(tk.Tk):
         out_card = ttk.Frame(options, style="Panel.TFrame", padding=16)
         out_card.pack(side="left", fill="both", expand=True, padx=(0, 6))
         ttk.Label(out_card, text="02  ·  STAGING DESTINATION", style="Section.TLabel").pack(anchor="w")
-        ttk.Label(out_card, text="Generated patches and chunk files go here; source files stay in place.",
+        ttk.Label(out_card, text="Patched item files and whole-section files go here; source files stay in place.",
                   style="PanelMuted.TLabel").pack(anchor="w", pady=(4, 9))
         out_row = ttk.Frame(out_card, style="Panel.TFrame")
         out_row.pack(fill="x")
@@ -141,8 +140,6 @@ class StreamStudio(tk.Tk):
         config_grid.pack(fill="x", pady=(10, 0))
         ttk.Label(config_grid, text="Level VFS path", style="PanelMuted.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 12))
         ttk.Entry(config_grid, textvariable=self.vfs_var, width=23).grid(row=0, column=1, sticky="ew")
-        ttk.Label(config_grid, text="Records / chunk", style="PanelMuted.TLabel").grid(row=1, column=0, sticky="w", pady=(9, 0), padx=(0, 12))
-        ttk.Spinbox(config_grid, from_=1, to=4096, textvariable=self.chunk_var, width=8).grid(row=1, column=1, sticky="w", pady=(9, 0))
         config_grid.columnconfigure(1, weight=1)
 
         action_row = ttk.Frame(root)
@@ -260,18 +257,10 @@ class StreamStudio(tk.Tk):
         if not output_text:
             messagebox.showwarning(APP_NAME, "Choose a staging output folder first.")
             return None
-        try:
-            chunk = int(self.chunk_var.get())
-        except ValueError:
-            messagebox.showwarning(APP_NAME, "Chunk size must be an integer between 1 and 4096.")
-            return None
-        if not 1 <= chunk <= 4096:
-            messagebox.showwarning(APP_NAME, "Chunk size must be between 1 and 4096.")
-            return None
         if not self.vfs_var.get().strip():
             messagebox.showwarning(APP_NAME, "Enter the level VFS path, e.g. levels/nfsc.")
             return None
-        return Path(source_text), Path(output_text), self.vfs_var.get().strip(), chunk
+        return Path(source_text), Path(output_text), self.vfs_var.get().strip()
 
     def _start_worker(self, task: str) -> None:
         if self.busy:
@@ -279,7 +268,7 @@ class StreamStudio(tk.Tk):
         params = self._get_parameters()
         if params is None:
             return
-        source, out, vfs, chunk = params
+        source, out, vfs = params
         if task == "build":
             try:
                 source_resolved = source.expanduser().resolve()
@@ -309,7 +298,7 @@ class StreamStudio(tk.Tk):
                     result = analyze_source(source, progress=progress)
                     self.msg_queue.put(("analysis_done", result))
                 else:
-                    report = build_stream_pack(source, out, vfs, chunk, progress=progress)
+                    report = build_stream_pack(source, out, vfs, progress=progress)
                     self.msg_queue.put(("build_done", report))
             except Exception as exc:  # deliver context from worker to UI thread
                 self.msg_queue.put(("error", (str(exc), traceback.format_exc())))
@@ -325,7 +314,7 @@ class StreamStudio(tk.Tk):
         params = self._get_parameters()
         if params is None:
             return
-        source, out, _vfs, _chunk = params
+        source, out, _vfs = params
         if not messagebox.askyesno(
             APP_NAME,
             "Build a staging pack from this source?\n\n"
