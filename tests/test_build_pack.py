@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from build_palmont_stream_pack import analyze_source, build_stream_pack, read_item_file
+from build_palmont_stream_pack import analyze_source, build_stream_pack, is_never_rendered, read_item_file
 
 FIXTURE = Path(__file__).parent / "fixtures" / "level_sample"
 RUNTIME = Path("runtime") / "levels" / "nfsc" / "lua" / "carbon_stream"
@@ -152,6 +152,26 @@ class FlagsAndOverridesTests(FixtureCase):
 
 
 class SourcePreservationTests(FixtureCase):
+    def test_skybox_names_are_not_rendered(self):
+        for name in ("SKYDOME", "skydome_00", "SKYDOME_XENON_01", "SKY_SPECULAR.001"):
+            self.assertTrue(is_never_rendered({"name": name}), name)
+        for name in ("XTU_SKYDOMELIKE_1A_00", "SKYDOME_EXTRA", "PAN_SKYDOME_1A_00", ""):
+            self.assertFalse(is_never_rendered({"name": name}), name)
+        self.assertTrue(is_never_rendered({"name": "XYZ_1", "shapeName": "/levels/nfsc/assets/meshes/SKYDOME.dae"}))
+        item_file = self.source_root / "main/MissionGroup/Palmont/Palmont1021/items.level.json"
+        line = {"class": "TSStatic", "name": "SKYDOME_XENON_00", "__parent": "Palmont1021", "position": [0.0, 0.0, 0.0],
+                "rotationEuler": [0.0, 0.0, 0.0], "scale": [1.0, 1.0, 1.0], "isRenderEnabled": True,
+                "shapeName": "/levels/nfsc/assets/meshes/SKYDOME_XENON.dae", "sectionID": "1021"}
+        with item_file.open("a", encoding="utf-8", newline="") as handle:
+            handle.write("\n" + json.dumps(line))
+        report = self.build()
+        self.assertEqual(report["neverRenderedRecords"], 1)
+        sky = [o for o in self.section(1021)["objects"] if o["name"] == "SKYDOME_XENON_00"]
+        self.assertEqual(len(sky), 1)
+        self.assertIs(sky[0]["isRenderEnabled"], False)
+        others = [o for o in self.section(1021)["objects"] if o["name"] != "SKYDOME_XENON_00"]
+        self.assertTrue(all(o.get("isRenderEnabled") is not False for o in others))
+
     def test_source_files_are_never_modified(self):
         before = tree_hashes(self.source_root)
         self.build()

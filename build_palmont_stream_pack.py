@@ -25,6 +25,21 @@ ITEMS_FILENAME = "items.level.json"
 SCHEMA_VERSION = 2
 ProgressCallback = Callable[[str], None] | None
 
+# Objects that must never be drawn, matched on the exported object NAME or on the shape file name
+# (SKYDOME.dae, ...); case-insensitive, a trailing numeric suffix such as _00 or .001 is ignored.
+# They are written with isRenderEnabled false; every other field stays as exported.
+NEVER_RENDERED_NAMES = {"SKYDOME", "SKYDOME_XENON", "SKY_SPECULAR"}
+_NAME_SUFFIX = re.compile(r"(?:[._]\d+)+$")
+
+
+def is_never_rendered(item: dict[str, Any]) -> bool:
+    shape = str(item.get("shapeName", "")).replace("\\", "/").rsplit("/", 1)[-1]
+    shape = re.sub(r"\.dae$", "", shape, flags=re.IGNORECASE)
+    for text in (str(item.get("name", "")).strip(), shape):
+        if _NAME_SUFFIX.sub("", text).upper() in NEVER_RENDERED_NAMES:
+            return True
+    return False
+
 
 def parse_section_ids(value: Any) -> list[int]:
     """Accept numeric IDs, comma-separated IDs, or arrays of those forms."""
@@ -258,6 +273,7 @@ def build_stream_pack(
     moved_records = 0
     source_item_total = 0
     unmatched_tagged = 0
+    never_rendered = 0
     override_objects: Counter[str] = Counter()
     override_sections: dict[str, set[int]] = defaultdict(set)
     flag_objects: Counter[str] = Counter()
@@ -290,6 +306,9 @@ def build_stream_pack(
             streamed["__streamKey"] = f"cs:{digest}"
             streamed["__streamSections"] = ids
             streamed["__streamSource"] = f"{rel}:{line_no}"
+            if is_never_rendered(item):
+                streamed["isRenderEnabled"] = False
+                never_rendered += 1
             for section_id in ids:
                 section_objects[section_id].append(streamed)
             for name in _split_tokens(item.get("sectionOverrideName")):
@@ -379,6 +398,7 @@ def build_stream_pack(
         "verification": {"ok": True, "files": verification},
         "sectionCount": len(section_objects),
         "multiSectionRecords": total_section_copies - moved_records,
+        "neverRenderedRecords": never_rendered,
         "overrideNames": dict(sorted(override_objects.items())),
         "instanceFlags": dict(sorted(flag_objects.items())),
         "patchOutputRoot": str(out_root / "patches"),
@@ -388,7 +408,8 @@ def build_stream_pack(
             "Only TSStatic records with non-empty shapeName and usable sectionID were moved.",
             "TSStatic items without sectionID or shapeName remain in normal level loading.",
             "Every other line of each patched items file is byte-identical to the source line.",
-            "Each section is one whole file; records and their exported metadata are not altered.",
+            "Each section is one whole file; records and their exported metadata are not altered, "
+            "except isRenderEnabled=false on the sky objects (SKYDOME, SKYDOME_XENON, SKY_SPECULAR).",
             "Multi-section items are written into each matching section file and share one __streamKey; "
             "the runtime keeps one live object per key.",
         ],

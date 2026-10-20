@@ -10,6 +10,14 @@
   run against the builder's real output (`tests/test_lua_modules.py`).
 - Architecture, interface and diagnostics: `docs/ARCHITECTURE.md`.
 
+- Queue: bounded feeding from pending lists, stale purge on section change, terrain-first and
+  shapeName-grouped load order, create filter used by the manager for override objects.
+- Look-ahead switch to the predicted section, heading-based load order and timing counters
+  (see ARCHITECTURE). Not validated in BeamNG: read the `settled` log lines and `getStatus()` timings
+  first to see whether queue order or TSStatic creation is the bottleneck.
+- Builder: objects named or shaped SKYDOME / SKYDOME_XENON / SKY_SPECULAR are written with `isRenderEnabled`
+  false.
+
 ## Not validated yet
 - Everything inside BeamNG (see the list at the end of `docs/ARCHITECTURE.md`).
 - Tkinter on the user's desktop.
@@ -20,3 +28,7 @@
 - Depth sections (overpass/tunnel variants) in `sections.json` and the lookup.
 - Studio UI restyle.
 - `lua/ge/extensions/nfscSectionStreamPrototype.lua` is superseded and can be removed by hand.
+- Animated objects (`_anim.dae`, sections 2400/2600): the invisible cause was the manager hiding
+  `ExcludeDisableRendering` objects (fixed). If they still vanish in game, the next candidate is
+  frustum culling of a small bounding box: export a material-less box spanning the animation.
+- `ExcludeGroupDisable` still starts hidden; its meaning is unconfirmed.

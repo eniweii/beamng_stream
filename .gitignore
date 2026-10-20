@@ -1,3 +1,5 @@
 docs/flowcharts.mmd
 README.md
 docs/FIDELITY.md
+/output
+/__pycache__

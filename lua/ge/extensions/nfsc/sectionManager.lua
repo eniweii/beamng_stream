@@ -11,10 +11,16 @@
 --   * ExcludeFreeroam / ExcludeRacing      -> hidden in that game mode (radio, default freeroam)
 --   * LowPlatformOnly / HighPlatformOnly   -> hidden on the other platform (radio, default high);
 --                                             EnvmapShadow exempts LowPlatformOnly like the game
---   * ExcludeDisableRendering / ExcludeGroupDisable -> the object starts as a disabled group member:
+--   * ExcludeGroupDisable                  -> the object starts as a disabled group member:
 --                                             visible only while one of its override names is enabled
+--   * ExcludeDisableRendering              -> NOT hidden: the object is drawn and exempt from the
+--                                             game's distance disabling (metadata here)
 --   * sectionOverrideName (comma separated) -> visible only while at least one name is enabled
 -- Every other flag is parsed and counted but changes nothing here (see FLAGS).
+--
+-- Creation filter: the manager registers itself with the streamer, so an object whose
+-- sectionOverrideName has no enabled name is not even created. Enabling a name makes the streamer
+-- create the held-back objects; disabling it releases the live ones again.
 --
 -- Scene objects (ParticleEmitterNode, lights) are not streamed. They are switched by section
 -- residency + their override names + one On/Off radio per class; emitters also hide beyond their
@@ -30,7 +36,7 @@ M.dependencies = { "nfsc_sectionStreamer" }
 -- ---------------------------------------------------------------------------
 local ALWAYS_ON_OVERRIDES = {}          -- override names enabled on a fresh load
 local TUNING = {
-  honorGroupDisableFlags = true,        -- ExcludeDisableRendering/ExcludeGroupDisable start the object hidden
+  honorGroupDisableFlags = true,        -- ExcludeGroupDisable starts the object hidden
   emitterFarClipScale = 1.0,
   emitterHysteresis = 0.05,             -- shown again only inside farClip * (1 - this)
   emitterCheckInterval = 0.25,
@@ -45,7 +51,7 @@ local FLAGS = {
   { "ExcludeSplitScreen", "metadata", "split screen does not exist in BeamNG" },
   { "ExcludeMainView", "gate", "never drawn in the main view" },
   { "ExcludeRacing", "gate", "hidden in racing mode" },
-  { "ExcludeDisableRendering", "gate", "group-disabled baseline" },
+  { "ExcludeDisableRendering", "metadata", "drawn and exempt from distance disabling, never hidden" },
   { "ExcludeGroupDisable", "gate", "group-disabled baseline" },
   { "ExcludeFreeroam", "gate", "hidden in freeroam mode" },
   { "IncludeRearView", "metadata", "rear-view mirror inclusion; no per-view include in BeamNG" },
@@ -141,6 +147,13 @@ local function isAllowed(names)
   return false
 end
 
+-- Streamer create filter: an object with override names exists only while one of them is enabled.
+local function creationAllowed(item)
+  local value = item.sectionOverrideName
+  if type(value) ~= "string" or value == "" then return true end
+  return isAllowed(splitNames(value))
+end
+
 -- ---------------------------------------------------------------------------
 -- Streamed TSStatic visibility
 -- ---------------------------------------------------------------------------
@@ -156,7 +169,7 @@ end
 local function streamedVisible(rec)
   if not baselineAllowed(rec.flags) then return false end
   if #rec.names > 0 then return isAllowed(rec.names) end
-  if TUNING.honorGroupDisableFlags and (rec.flags.excludedisablerendering or rec.flags.excludegroupdisable) then
+  if TUNING.honorGroupDisableFlags and rec.flags.excludegroupdisable then
     return false
   end
   return true
@@ -196,7 +209,7 @@ function listener:onObjectCreated(key, obj, item)
   end
   local names = splitNames(item.sectionOverrideName)
   if #names == 0 and not any then return end          -- nothing to manage for this object
-  local rec = { objId = obj:getID(), names = names, flags = gate }
+  local rec = { objId = obj:getID(), names = names, flags = gate, item = #names > 0 and item or nil }
   tracked[key] = rec
   trackedCount = trackedCount + 1
   for i = 1, #names do
@@ -392,6 +405,17 @@ function M.setOverrideEnabled(name, on)
   enabled[name] = now and true or nil
   for key in pairs(byOverride[name] or {}) do applyStreamed(tracked[key]) end
   for rec in pairs(sceneByOverride[name] or {}) do applyScene(rec) end
+  local s = streamer()
+  if s then
+    if now then
+      if s.refreshFilter then s.refreshFilter() end          -- create what was held back
+    elseif s.releaseObject then
+      for key in pairs(byOverride[name] or {}) do             -- delete what no name keeps alive
+        local rec = tracked[key]
+        if rec and not isAllowed(rec.names) then s.releaseObject(key, rec.item) end
+      end
+    end
+  end
   if extensions and extensions.hook then extensions.hook("onNfscOverrideChanged", name, now) end
 end
 
@@ -519,13 +543,17 @@ function M.onExtensionLoaded()
   local s = streamer()
   if s then
     s.addListener(listener)
+    if s.setCreateFilter then s.setCreateFilter(creationAllowed) end
     loadOverrideIndex()
   end
 end
 
 function M.onExtensionUnloaded()
   local s = streamer()
-  if s then s.removeListener(listener) end
+  if s then
+    s.removeListener(listener)
+    if s.setCreateFilter then s.setCreateFilter(nil) end
+  end
 end
 
 function M.onSerialize()
@@ -541,6 +569,8 @@ function M.onDeserialized(data)
   if type(data.enabled) == "table" then
     enabled = {}
     for _, name in ipairs(data.enabled) do enabled[name] = true end
+    local s = streamer()
+    if s and s.refreshFilter then s.refreshFilter() end
   end
   if data.gameMode == "freeroam" or data.gameMode == "racing" then gameMode = data.gameMode end
   if data.platform == "high" or data.platform == "low" then platform = data.platform end

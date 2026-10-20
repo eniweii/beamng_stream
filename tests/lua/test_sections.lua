@@ -13,7 +13,9 @@ local function eq(a, b, label)
   else failed = failed + 1; print(string.format("FAIL: %s (got %s, want %s)", label, tostring(a), tostring(b))) end
 end
 
-local function fresh(tuning)
+-- The manager registers a create filter; most tests exercise the streamer alone, so it is removed
+-- unless keepFilter is set.
+local function fresh(tuning, keepFilter)
   H.hookCalls, H.created, H.loaded = {}, {}, {}
   H.install(root)
   H.cam = { x = 3950, y = -200, z = 0 }
@@ -24,6 +26,7 @@ local function fresh(tuning)
   H.loaded = { streamer, manager }
   if tuning then streamer.setTuning(tuning) end
   manager.onExtensionLoaded()
+  if not keepFilter then streamer.setCreateFilter(nil) end
   local ok, err = streamer.initialize("levels/nfsc")
   assert(ok, err)
   return streamer, manager
@@ -131,35 +134,54 @@ do
   eq(s.getStatus().currentSectionID, 1021, "0.05 outside an edge resolves within tolerance")
 end
 
--- 8. manager: overrides decide visibility; streamer never looks at them --------------------------
+-- 8. manager: overrides decide what exists and what is visible; streamer never looks at them -----
 do
-  local s, m = fresh()
+  local s, m = fresh(nil, true)
   settle(s, 5)
-  local barrier = H.byName("XWS_BARRIERCHGATE_1A_00_016")
   local tree = H.byName("XTU_TREEDEADB_1A_00_053")
-  local two = H.byName("XTU_TREESPINGA_1A_00_500")
-  eq(barrier.hidden, true, "override object starts hidden (no override enabled)")
+  eq(H.byName("XWS_BARRIERCHGATE_1A_00_016"), nil, "override object is not created while no name is enabled")
+  eq(H.byName("XTU_TREESPINGA_1A_00_500"), nil, "two-name override object is not created either")
   eq(tree.hidden, false, "object without an override is untouched")
-  eq(two.hidden, true, "two-name override hidden")
+  eq(s.getStatus().liveObjectCount, 7, "7 of the 9 objects exist")
+  eq(s.getStatus().deferredCount, 2, "the two override objects are held back")
   local names = m.getOverrideNames()
   eq(table.concat(names, ","), "0x454C22D2,0x1111AAAA,0x2222BBBB", "nearest-first ordering in 1021")
 
   m.setOverrideEnabled("0x454C22D2", true)
-  eq(barrier.hidden, false, "enabling shows it")
+  settle(s, 5)
+  local barrier = H.byName("XWS_BARRIERCHGATE_1A_00_016")
+  check(barrier ~= nil and barrier.hidden == false, "enabling creates it, visible from the first frame")
   m.setOverrideEnabled("0x2222BBBB", true)
-  eq(two.hidden, false, "any one enabled name is enough")
+  settle(s, 5)
+  local two = H.byName("XTU_TREESPINGA_1A_00_500")
+  check(two ~= nil and two.hidden == false, "any one enabled name is enough")
   m.setOverrideEnabled("0x2222BBBB", false)
-  eq(two.hidden, true, "disabling hides again")
+  eq(two.hidden, true, "disabling hides it at once")
+  settle(s, 40)
+  eq(two.deleted, true, "and the object is deleted after the cooldown")
+  eq(s.getStatus().deferredCount, 1, "held back again")
   local ch = H.hooks("onNfscOverrideChanged")
   eq(#ch, 3, "override hook fired per real change")
   m.setOverrideEnabled("0x2222BBBB", false)
   eq(#H.hooks("onNfscOverrideChanged"), 3, "no hook when nothing changed")
 
+  -- re-enabling inside the cooldown keeps the live object
+  m.setOverrideEnabled("0x2222BBBB", true)
+  settle(s, 5)
+  local two2 = H.byName("XTU_TREESPINGA_1A_00_500")
+  m.setOverrideEnabled("0x2222BBBB", false)
+  m.setOverrideEnabled("0x2222BBBB", true)
+  settle(s, 40)
+  eq(H.byName("XTU_TREESPINGA_1A_00_500"), two2, "re-enabled inside the cooldown: same object, no churn")
+  eq(two2.hidden, false, "and visible")
+  m.setOverrideEnabled("0x2222BBBB", false)
+  settle(s, 40)
+
   -- state survives the object being deleted and recreated
   H.cam = { x = 4100, y = -320, z = 0 }
   settle(s, 40)
   check(H.byName("XWS_BARRIERCHGATE_1A_00_016") == nil, "barrier unloaded away from 1021")
-  eq(m.getStatus().overrideObjectsLive, 1, "manager forgot the deleted barrier; only the 1022 override object is tracked")
+  eq(m.getStatus().overrideObjectsLive, 0, "manager forgot the deleted barrier; the 1022 override object is not enabled")
   names = m.getOverrideNames()
   eq(table.concat(names, ","), "0x1111AAAA,0x2222BBBB,0x454C22D2", "ordering follows the current section")
   H.cam = { x = 3950, y = -200, z = 0 }
@@ -246,6 +268,8 @@ do
   eq(hi.hidden, true, "HighPlatformOnly hidden on the low platform")
   m.setPlatform("high")
 
+  local edr = streamed("ExcludeDisableRendering")
+  eq(edr.hidden, false, "ExcludeDisableRendering is drawn and exempt from distance disabling, never hidden")
   local gd = streamed("ExcludeGroupDisable")
   eq(gd.hidden, true, "group-disabled flag without an override stays hidden")
   local gdo = streamed("ExcludeDisableRendering", "0xBEEF")
@@ -369,6 +393,166 @@ do
   m.setOverrideEnabled("0x454C22D2", true)
   settle(s, 30)
   eq(H.reloadCalls, 1, "minInterval rate-limits refreshes")
+end
+
+-- 14. the load queue is bounded: a big section waits in pending lists, not in the queue -------------
+do
+  local s = fresh({ maxQueuedItems = 3, maxCreatesPerFrame = 1 })
+  local over = false
+  for _ = 1, 40 do
+    H.tick(s, 1, 0.1)
+    if s.getStatus().queuedObjectCount > 3 then over = true end
+  end
+  eq(over, false, "queue never exceeds maxQueuedItems")
+  local st = s.getStatus()
+  eq(st.queueHighWater, 3, "high-water mark reports the cap")
+  eq(st.liveObjectCount, 9, "everything still arrives")
+  eq(st.pendingRecordCount, 0, "pending data is released once fed")
+  eq(st.createdPeakFrame, 1, "creates per frame are tracked")
+  check(s.isIdle(), "idle afterwards")
+end
+
+-- 15. a section change drops stale queue entries at once ---------------------------------------------
+do
+  local s = fresh({ maxQueuedItems = 6, maxCreatesPerFrame = 1 })
+  H.tick(s, 2, 0.1)
+  check(s.getStatus().queuedObjectCount >= 3, "a backlog exists before the move")
+  H.cam = { x = 4100, y = -320, z = 0 }
+  H.tick(s, 1, 0.1)
+  check(s.getStatus().staleDiscarded > 0, "entries of the abandoned section were dropped from the queue")
+  settle(s, 40)
+  eq(s.getStatus().liveObjectCount, 4, "same end state as without a backlog")
+  eq(s.getStatus().pendingRecordCount, 0, "no pending data left")
+end
+
+-- 16. load order: terrain first, then the rest; same shapeName together -------------------------------
+do
+  local s = fresh({ maxCreatesPerFrame = 100 })
+  local order = {}
+  s.addListener({ onObjectCreated = function(self, key) order[#order + 1] = key end })
+  H.readFilter = function(path)
+    if path:find("1021.json", 1, true) then
+      local function item(i, shape, flags)
+        return { class = "TSStatic", name = "syn" .. i, shapeName = shape, instanceFlags = flags,
+                 __streamKey = "syn:" .. i, __streamSections = { 1021 }, sectionID = "1021" }
+      end
+      return { schemaVersion = 2, sectionID = 1021, objectCount = 7, objects = {
+        item(1, "/a.dae"), item(2, "/b.dae"), item(3, "/a.dae"), item(4, "/t.dae", "IdentityMatrix"),
+        item(5, "/b.dae"), item(6, "/c.dae", "IncludeRearView,ChoppedRoadway"), item(7, "/a.dae") } }
+    end
+  end
+  H.tick(s, 1, 0.1)
+  eq(table.concat(order, ",", 1, 7), "syn:4,syn:6,syn:1,syn:3,syn:7,syn:2,syn:5",
+    "terrain first, then grouped by shapeName in order of first appearance")
+  H.readFilter = nil
+end
+
+-- 17. create filter at streamer level: hold back, release, cancel ------------------------------------
+do
+  local s = fresh()
+  local allow = false
+  local seen = {}
+  s.addListener({ onObjectCreated = function(self, key, obj, item) seen[item.name] = { key = key, item = item } end })
+  s.setCreateFilter(function(item) return item.name ~= "XTU_HOUSE_1A_00_001" or allow end)
+  settle(s, 5)
+  eq(s.getStatus().liveObjectCount, 8, "held-back object is not created")
+  eq(s.getStatus().deferredCount, 1, "and remembered")
+  allow = true
+  s.refreshFilter()
+  settle(s, 5)
+  eq(s.getStatus().liveObjectCount, 9, "refreshFilter creates it")
+  eq(s.getStatus().deferredCount, 0, "nothing deferred any more")
+  allow = false
+  local house = seen["XTU_HOUSE_1A_00_001"]
+  s.releaseObject(house.key, house.item)
+  settle(s, 40)
+  eq(s.getStatus().liveObjectCount, 8, "releaseObject deletes it after the cooldown")
+  eq(s.getStatus().deferredCount, 1, "and holds it back again")
+  allow = true
+  s.releaseObject(house.key, house.item)
+  s.refreshFilter()
+  settle(s, 5)
+  eq(s.getStatus().liveObjectCount, 9, "accepted again")
+  H.cam = { x = 4100, y = -320, z = 0 }
+  settle(s, 40)
+  eq(s.getStatus().deferredCount, 0, "deferred lists are released with their section")
+end
+
+-- 18. look-ahead: the section ahead becomes current before the camera crosses the border ---------------
+do
+  local s = fresh({ maxCreatesPerFrame = 100 })
+  H.cam = { x = 3905, y = -320, z = 0 }
+  H.tick(s, 1, 0.1)
+  eq(s.getStatus().currentSectionID, 1022, "starts in 1022")
+  local switched
+  for i = 1, 16 do
+    H.cam.x = H.cam.x + 6                                       -- 60 m/s
+    H.tick(s, 1, 0.1)
+    if s.getStatus().currentSectionID ~= 1022 then switched = i; break end
+  end
+  check(switched ~= nil, "switched to the section ahead")
+  eq(s.getStatus().currentSectionID, 1101, "1101 is current ...")
+  eq(s.getStatus().cameraSectionID, 1022, "... while the camera is still in 1022")
+  check(H.cam.x < 4000, "camera has not crossed the border yet")
+  check(s.getStatus().cameraSpeed > 50, "speed is tracked")
+end
+
+do
+  local s = fresh({ maxCreatesPerFrame = 100, predictionEnabled = false })
+  H.cam = { x = 3905, y = -320, z = 0 }
+  H.tick(s, 1, 0.1)
+  for _ = 1, 14 do
+    H.cam.x = H.cam.x + 6
+    H.tick(s, 1, 0.1)
+  end
+  eq(s.getStatus().currentSectionID, 1022, "without prediction nothing switches before the border")
+  eq(s.getStatus().predictedSectionID, nil, "and nothing is predicted")
+end
+
+do
+  local s = fresh({ maxCreatesPerFrame = 100 })
+  H.cam = { x = 3905, y = -320, z = 0 }
+  H.tick(s, 1, 0.1)
+  H.cam = { x = 4300, y = -320, z = 0 }                          -- a jump is not driving
+  H.tick(s, 1, 0.1)
+  eq(s.getStatus().cameraSpeed, 0, "jump: no velocity")
+  eq(s.getStatus().currentSectionID, nil, "outside every section: nothing current")
+end
+
+-- 19. load order follows the heading (the game's three priority bands) --------------------------------
+do
+  local s = fresh()
+  H.readFilter = function(path)
+    if path:find("sections.json", 1, true) then
+      local function box(id, x0, x1, related)
+        return { id = id, points = { { x0, -50 }, { x1, -50 }, { x1, 50 }, { x0, 50 } },
+                 boundsMin = { x0, -50 }, boundsMax = { x1, 50 }, related = related }
+      end
+      return { sections = { box(9001, -50, 50, { 9002, 9003 }), box(9002, 150, 250, { 9001 }), box(9003, -250, -150, { 9001 }) } }
+    end
+  end
+  s.initialize("levels/nfsc")
+  H.cam = { x = 0, y = 0, z = 0 }
+  H.tick(s, 1, 0.1)
+  eq(table.concat(s.getLoadOrder(), ","), "9001,9002,9003", "standing still: static order")
+  for _ = 1, 8 do
+    H.cam.x = H.cam.x - 3                                        -- 30 m/s west
+    H.tick(s, 1, 0.1)
+  end
+  eq(table.concat(s.getLoadOrder(), ","), "9001,9003,9002", "heading west: the section ahead loads first")
+  H.readFilter = nil
+end
+
+-- 20. timing counters ---------------------------------------------------------------------------------
+do
+  local s = fresh()
+  settle(s, 10)
+  local st = s.getStatus()
+  eq(st.firstUseCreates + st.repeatCreates, st.createdTotal, "every create is counted as first use or repeat")
+  check(st.firstUseCreates > 0, "first-use creates are separated")
+  eq(st.createdSinceChange, st.createdTotal, "creates since the last section change")
+  check(st.settleSeconds >= 0 and st.avgCreateMs >= 0 and st.maxCreateMs >= 0 and st.loadFramePeakMs >= 0, "timings are reported")
+  check(st.maxReadMs >= 0, "section read time is reported")
 end
 
 print(string.format("%d passed, %d failed", passed, failed))
