@@ -24,6 +24,7 @@ local function fresh(tuning, keepFilter)
   local manager = H.load(repo .. "/lua/ge/extensions/nfsc/sectionManager.lua")
   nfsc_sectionManager = manager
   H.loaded = { streamer, manager }
+  streamer.setTuning({ maxFirstUsePerFrame = 1000 })   -- the first-use cap has its own test (21)
   if tuning then streamer.setTuning(tuning) end
   manager.onExtensionLoaded()
   if not keepFilter then streamer.setCreateFilter(nil) end
@@ -553,6 +554,110 @@ do
   eq(st.createdSinceChange, st.createdTotal, "creates since the last section change")
   check(st.settleSeconds >= 0 and st.avgCreateMs >= 0 and st.maxCreateMs >= 0 and st.loadFramePeakMs >= 0, "timings are reported")
   check(st.maxReadMs >= 0, "section read time is reported")
+end
+
+-- 21. first-use cap, shared frame budget, per-change cost split (fake clock: 1 ms per os.clock call) -----
+do
+  local realClock, ticks = os.clock, 0
+  os.clock = function() ticks = ticks + 0.001; return ticks end
+  -- every shape in the fixture counts as new on a fresh streamer: with the cap at 1, frame 1 may start
+  -- one new shape only, and the head of the queue is not lost
+  local s = fresh({ maxCreatesPerFrame = 100, frameBudgetMs = 1000, maxFirstUsePerFrame = 1 })
+  H.tick(s, 1, 0.016)
+  local st = s.getStatus()
+  eq(st.liveObjectCount, 1, "frame 1 creates one new shape and stops before the next new one")
+  check(st.changeDeferredFirstUse >= 1, "a deferred new shape is counted")
+  settle(s, 60)
+  st = s.getStatus()
+  eq(st.liveObjectCount, 9, "the cap only spreads the work, all 9 objects get created")
+  eq(st.failureCount, 0, "no failures with the cap")
+  -- a budget smaller than one create still creates one object per frame (progress is guaranteed)
+  local s2 = fresh({ maxCreatesPerFrame = 100, frameBudgetMs = 0.001, maxFirstUsePerFrame = 1000 })
+  H.tick(s2, 1, 0.016)
+  eq(s2.getStatus().liveObjectCount, 1, "a tiny budget still makes progress: one create per frame")
+  settle(s2, 40)
+  eq(s2.getStatus().liveObjectCount, 9, "and the section completes")
+  -- the split is filled and the change accumulators follow the section change
+  local st2 = s2.getStatus()
+  check(st2.changeCreates == 9 and st2.changeFrames > 0 and st2.changeFps > 0, "per-change creates, frames and fps are reported")
+  local sum = st2.changeSplitMs.createObject + st2.changeSplitMs.setField + st2.changeSplitMs.registerObject + st2.changeSplitMs.groupAdd
+  check(sum > 0 and sum <= st2.changeCreateMs + 1e-6, "split parts add up to no more than the create time")
+  os.clock = realClock
+end
+
+-- 22. first use / reload / warm split and the most expensive shapes ----------------------------------
+do
+  local s = fresh({ unloadCooldown = 0.2 })
+  settle(s, 10)
+  local st = s.getStatus()
+  eq(st.changeFirstUse + st.changeReload + st.changeWarm, st.changeCreates, "every create is first use, reload or warm")
+  check(st.changeFirstUse > 0, "new shapes are first use")
+  eq(st.changeReload, 0, "nothing is a reload on the first visit")
+  check(#st.changeTopShapes >= 1 and #st.changeTopShapes <= 5, "top shapes are reported, at most 5")
+  for i = 2, #st.changeTopShapes do
+    check(st.changeTopShapes[i - 1].ms >= st.changeTopShapes[i].ms, "top shapes are sorted by total time")
+  end
+  -- leave: the 1021-only objects are deleted; come back: shapes without a live instance are reloads
+  H.cam = { x = 4100, y = -320, z = 0 }
+  settle(s, 40)
+  eq(s.getStatus().deletedTotal, 6, "six objects deleted after leaving")
+  H.cam = { x = 3950, y = -200, z = 0 }
+  settle(s, 40)
+  st = s.getStatus()
+  eq(st.liveObjectCount, 9, "everything is back")
+  check(st.changeReload > 0, "shapes that lost their last instance come back as reloads, not first use")
+  eq(st.changeFirstUse, 0, "no shape is new the second time")
+  eq(st.changeFirstUse + st.changeReload + st.changeWarm, st.changeCreates, "split still adds up")
+end
+
+-- 23. the new-shape deferral uses the recent first-use cost -----------------------------------------
+do
+  local realClock, ticks, step = os.clock, 0, 0.001
+  os.clock = function() ticks = ticks + step; return ticks end
+  local s = fresh({ maxCreatesPerFrame = 100, frameBudgetMs = 1000, maxFirstUsePerFrame = 1000 })
+  settle(s, 20)
+  local st = s.getStatus()
+  check(st.expectedFirstUseMs > 0 and st.expectedFirstUseMs < 1000, "expected first-use cost follows the measured creates")
+  os.clock = realClock
+end
+
+-- 24. registerObject probe, name lookup switch, scene trend, idle baseline ---------------------------
+do
+  local s = fresh()
+  settle(s, 10)
+  local before = s.getStatus().liveObjectCount
+  local results, err = s.probeRegister(nil, 8)
+  check(results ~= nil, "probe runs with a live shape: " .. tostring(err))
+  eq(#results, 3, "three passes: unnamed, named, unnamed again")
+  eq(results[1].n, 8, "probe creates the requested number of objects")
+  eq(s.getStatus().liveObjectCount, before, "probe leaves the streamed objects alone")
+  check(H.byName("nfsc_probe_named_1") == nil and H.byName("nfsc_probe_named_8") == nil, "probe objects are deleted again")
+  local none = fresh()
+  local r2, e2 = none.probeRegister(nil, 8)
+  check(r2 == nil and e2 ~= nil, "probe without any live shape explains itself")
+  local logged = false
+  for _, line in ipairs(H.logs) do if line:find("probeRegister did not run", 1, true) then logged = true end end
+  check(logged, "the reason is also written to the log, not only returned")
+  local logged2 = false
+  for _, line in ipairs(H.logs) do if line:find("probeRegister called", 1, true) then logged2 = true end end
+  check(logged2, "every call leaves a log line")
+end
+do
+  local s = fresh({ skipNameLookup = true })
+  settle(s, 10)
+  eq(s.getStatus().liveObjectCount, 9, "skipNameLookup still creates everything")
+  eq(s.getStatus().failureCount, 0, "no failures without the name check")
+end
+do
+  local realClock, ticks = os.clock, 0
+  os.clock = function() ticks = ticks + 0.001; return ticks end
+  local s = fresh()
+  settle(s, 10)
+  H.tick(s, 400, 0.033)                       -- the average starts from the 0.1 s settle ticks and needs time to follow
+  local st = s.getStatus()
+  check(st.idleFrameMs ~= nil and math.abs(st.idleFrameMs - 33) < 5, "idle frame baseline follows the frame time while nothing loads")
+  check(st.changeNameAvgMs >= 0, "name lookup time is reported")
+  os.clock = realClock
 end
 
 print(string.format("%d passed, %d failed", passed, failed))

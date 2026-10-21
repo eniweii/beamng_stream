@@ -70,6 +70,7 @@ local function newObject(class)
   function o:setField(name, idx, value) self.fields[name] = value end
   function o:getID() return self.id end
   function o:registerObject(name)
+    if name == "" then byId[self.id] = self; return end            -- anonymous object, as in the engine
     assert(not byName[name], "name already registered: " .. name)
     self.name = name; byName[name] = self; byId[self.id] = self
     H.created[name] = (H.created[name] or 0) + 1

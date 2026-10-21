@@ -32,3 +32,17 @@
   `ExcludeDisableRendering` objects (fixed). If they still vanish in game, the next candidate is
   frustum culling of a small bounding box: export a material-less box spanning the animation.
 - `ExcludeGroupDisable` still starts hidden; its meaning is unconfirmed.
+- 0008: shared frame budget (deletes first, creates get the rest), one new shape per frame, per-change
+  timing and per-create cost split in the settled log. Defaults now `frameBudgetMs = 16`,
+  `maxCreatesPerFrame = 16`, `maxDeletesPerFrame = 256` (the values tested in game). Shape warming one
+  boundary ahead is NOT built: it needs the cost split and a check that BeamNG keeps a shape loaded
+  after its last instance is deleted.
+- 0009: creates classified as first use / reload / warm (live-instance count per shape), top 5 shapes
+  per settled change, new-shape deferral based on recent first-use cost. Instrumentation to decide
+  between "heavy shapes" and "shape freed on last delete" as the cause of the 5-8 ms registerObject
+  cost seen in the tunnel transition (section 128). No behaviour change besides the deferral estimate.
+- 0010: finds what makes registerObject slow (3-10 ms per object in game). Separate name-check timing,
+  scene trend and idle frame time in the settled log, `skipNameLookup` switch, `probeRegister()` console
+  probe. Instrumentation only; defaults unchanged. Findings so far: reloads are rare (not the cause),
+  cost is per instance and varies by shape and section.
+

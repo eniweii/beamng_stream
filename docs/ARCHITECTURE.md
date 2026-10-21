@@ -45,9 +45,23 @@ flowchart LR
 - Load order: related sections are fed in the game's three priority bands (distance of the point one
   second ahead outside the section, reduced when heading towards it, 75 m bands), the static related
   order breaks ties, the current section is always first. Refreshed every 0.5 s (`getLoadOrder()`).
+- Frame budget (0008): one `frameBudgetMs` for the whole frame. Deletes run first and may use
+  `deleteBudgetShare` of it; creates get what is left. A new shape (first use, 8-14 ms measured) is the
+  expensive create: at most `maxFirstUsePerFrame` per frame, and a new shape is not started when the
+  expected first-use cost no longer fits in the remaining budget (it stays at the head of the queue).
+  The first create of a frame is always allowed, so a tiny budget still makes progress. The queue is
+  grouped by shape, so a frame is typically one new shape plus its cheap repeat instances.
 - Timing: `getStatus()` reports average and maximum create time, first-use versus repeat shape
   creates, section read time, per-frame load time (last and peak) and seconds until the last section
-  change settled; one log line per settled change prints the same summary (`logSettle`).
+  change settled. Since 0008 the numbers that matter are per section change (`change*` fields, reset at
+  every change) and `logSettle` prints three lines per settled change: objects, seconds, objects/s,
+  frames, fps and worst frame while loading, streaming ms per frame; create totals split into first
+  use (shape never created this session), reload (created before, but no live instance at that moment:
+  the engine may have freed it) and warm (a live instance exists); the five most expensive shapes
+  (`top N:` lines, with first/reload counts); and the cost split of one create (createObject, setField
+  loop, registerObject, group add) plus deletes. Measured in game: registerObject is practically the
+  whole create cost, group add is not a factor. The deferral of a new shape uses a moving average of
+  the latest first-use creates, not the session average. The session-wide averages in `getStatus()` are cumulative and hide changes.
 - Section change: queue entries and pending data no active section needs are dropped at once
   (`staleDiscarded`), order is preserved, `queuedKeys` is rebuilt, so new work never waits behind
   stale records.
@@ -133,3 +147,10 @@ position and scale line.
 - Nothing here has run in BeamNG. To verify: camera tracking, transitions, recreation after
   cooldown, setField behaviour for `rotationEuler`, negative scale and `collisionType`, object counts
   and memory over a long drive, `onDeserialized` (the hook name is assumed), and the imgui calls.
+- registerObject investigation (0010): the settled log has a `name` bucket (the duplicate-name
+  check, separate from the engine call) and a `scene:` line (live objects while creating, a least-
+  squares trend of registerObject ms per 1000 live objects, and the idle frame time). `skipNameLookup`
+  names every object `nfsc_<key>` without `scenetree.findObject` for an A/B test. For a controlled
+  test run `extensions.nfsc_sectionStreamer.probeRegister()` in the console: three passes of test
+  TSStatics of one live shape (unnamed, named, unnamed again), averages with first/last quarter, name
+  lookup and delete time, objects deleted again.

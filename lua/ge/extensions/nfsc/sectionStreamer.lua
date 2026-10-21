@@ -46,9 +46,13 @@ local M = {}
 -- ---------------------------------------------------------------------------
 local TUNING = {
   levelRoot = "levels/nfsc",
-  maxCreatesPerFrame = 24,
-  maxDeletesPerFrame = 60,
-  frameBudgetMs = 3.0,            -- stop creating/deleting for this frame after this many ms
+  maxCreatesPerFrame = 16,
+  maxDeletesPerFrame = 256,
+  frameBudgetMs = 16.0,           -- one budget for the whole frame: deletes first, creates get what is left
+  deleteBudgetShare = 0.25,       -- deletes may use at most this share of frameBudgetMs
+  maxFirstUsePerFrame = 1,        -- new shapes (11-14 ms each) per frame; a later new shape waits for the next frame
+  firstUseGuessMs = 6.0,          -- expected first-use cost until a real average exists
+  skipNameLookup = false,         -- true: name every object "nfsc_<key>" without the scenetree.findObject duplicate check
   maxSectionReadsPerFrame = 1,
   maxQueuedItems = 512,           -- hard cap of the load queue; the rest waits in pending lists
   maxPendingRecords = 8192,       -- do not read another section file while this many records wait
@@ -108,6 +112,19 @@ local feedOrder, priorityTimer = {}, 0         -- sections in loading order: cur
 local timing = { creates = 0, createMs = 0, createMax = 0, firsts = 0, firstMs = 0, repeats = 0, repeatMs = 0,
                  reads = 0, readMs = 0, readMax = 0, frameLast = 0, framePeak = 0 }
 local seenShapes = {}
+local shapeLive = {}                 -- shape -> number of live instances (0/nil: the engine may have freed it)
+local recentFirstMs = nil            -- moving average of the latest first-use creates
+local function newChange()
+  return { creates = 0, createMs = 0, firsts = 0, firstMs = 0, repeats = 0, repeatMs = 0, maxMs = 0,
+           objectMs = 0, fieldsMs = 0, registerMs = 0, groupMs = 0, frames = 0, workMs = 0, dtSum = 0, dtMax = 0,
+           deleted = 0, deleteMs = 0, deferredFirst = 0,
+           reloads = 0, reloadMs = 0, warms = 0, warmMs = 0, shapes = {},
+           nameMs = 0, liveSum = 0, liveMin = nil, liveMax = 0, rn = 0, rx = 0, ry = 0, rxx = 0, rxy = 0 }   -- r*: regression sums of registerObject ms over live count   -- shapes: name -> { n, ms, max, first, reload }
+end
+local change = newChange()                -- everything since the last section change
+local split = { objectMs = 0, fieldsMs = 0, registerMs = 0, groupMs = 0, nameMs = 0, live = 0 }
+local idleFrameMs = nil              -- moving average of the frame time while nothing is loading   -- cost of the last create
+local frameStart, frameDeleteMs = 0, 0
 local changeStamp, createdSinceChange, settled, settleSeconds, settlePeak = 0, 0, true, 0, 0
 local createdTotal, deletedTotal, failureCount, verified = 0, 0, 0, 0
 local failures = {}
@@ -326,6 +343,7 @@ local function anyActive(ids)
 end
 
 local function runtimeName(item, key)
+  if TUNING.skipNameLookup then return "nfsc_" .. tostring(key) end
   local wanted = (type(item.name) == "string" and item.name ~= "") and item.name or ("nfsc_" .. key)
   if scenetree.findObject(wanted) then wanted = wanted .. "_s" .. tostring(key):gsub("[^%w]", ""):sub(-6) end
   return wanted
@@ -334,8 +352,10 @@ end
 local function createStreamedObject(item)
   local shape = item.shapeName
   if type(shape) ~= "string" or shape == "" then return nil, "missing shapeName" end
+  local t0 = os.clock()
   local obj = createObject("TSStatic")
   if not obj then return nil, "createObject(TSStatic) returned nil" end
+  local t1 = os.clock()
   pcall(obj.setField, obj, "shapeName", 0, shape)
   for field, value in pairs(item) do
     if field ~= "shapeName" and not RESERVED[field] then
@@ -347,13 +367,21 @@ local function createStreamedObject(item)
     pcall(obj.setField, obj, "collisionType", 0, "None")
     pcall(obj.setField, obj, "decalType", 0, "None")
   end
-  local ok, err = pcall(obj.registerObject, obj, runtimeName(item, item.__streamKey or "x"))
+  local t2 = os.clock()
+  local wantedName = runtimeName(item, item.__streamKey or "x")
+  local tn = os.clock()
+  local ok, err = pcall(obj.registerObject, obj, wantedName)
   if not ok then
     pcall(obj.delete, obj)
     return nil, "registerObject failed: " .. tostring(err)
   end
+  local t3 = os.clock()
   local group = ensureRuntimeGroup()
   pcall(group.addObject, group, obj)
+  local t4 = os.clock()
+  split.objectMs, split.fieldsMs, split.registerMs, split.groupMs =
+    (t1 - t0) * 1000, (t2 - t1) * 1000, (t3 - tn) * 1000, (t4 - t3) * 1000
+  split.nameMs, split.live = (tn - t2) * 1000, liveCount
   return obj
 end
 
@@ -369,8 +397,9 @@ end
 
 local function registerLive(key, obj, item)
   local ids = itemSections(item)
-  live[key] = { id = obj:getID(), sections = ids }
+  live[key] = { id = obj:getID(), sections = ids, shape = item.shapeName }
   liveCount = liveCount + 1
+  if item.shapeName then shapeLive[item.shapeName] = (shapeLive[item.shapeName] or 0) + 1 end
   for i = 1, #ids do
     local bucket = liveBySection[ids[i]]
     if not bucket then bucket = {}; liveBySection[ids[i]] = bucket end
@@ -383,6 +412,10 @@ local function unregisterLive(key)
   if not entry then return nil end
   live[key] = nil
   liveCount = liveCount - 1
+  if entry.shape and shapeLive[entry.shape] then
+    local left = shapeLive[entry.shape] - 1
+    shapeLive[entry.shape] = left > 0 and left or nil
+  end
   for i = 1, #entry.sections do
     local bucket = liveBySection[entry.sections[i]]
     if bucket then bucket[key] = nil end
@@ -602,34 +635,79 @@ local function processSectionReads()
   if srHead > srTail then sectionReadQueue, srHead, srTail = {}, 1, 0 end
 end
 
+-- Expected cost of creating the first instance of a shape (real average once there is one).
+local function expectedFirstMs()
+  return recentFirstMs or TUNING.firstUseGuessMs
+end
+
 local function processLoads()
   local started = os.clock()
-  local made, skipped = 0, 0
+  local budget = TUNING.frameBudgetMs - frameDeleteMs    -- creates get what the deletes left
+  local made, firstUse, skipped = 0, 0, 0
   while lqHead <= lqTail and made < TUNING.maxCreatesPerFrame and skipped < SKIP_CAP do
     local item = loadQueue[lqHead]
-    loadQueue[lqHead] = nil
-    lqHead = lqHead + 1
     local key = item.__streamKey
-    queuedKeys[key] = nil
+    local shape = item.shapeName
     if live[key] or not anyActive(itemSections(item)) then
+      loadQueue[lqHead] = nil
+      lqHead = lqHead + 1
+      queuedKeys[key] = nil
       skipped = skipped + 1
     else
+      local isFirst = shape ~= nil and not seenShapes[shape]
+      local isWarm = shape ~= nil and (shapeLive[shape] or 0) > 0      -- a live instance keeps the shape loaded
+      if isFirst and made > 0 then
+        -- a new shape is the expensive create: at most maxFirstUsePerFrame, and never one the budget cannot hold
+        local elapsed = (os.clock() - started) * 1000
+        if firstUse >= TUNING.maxFirstUsePerFrame or elapsed + expectedFirstMs() > budget then
+          change.deferredFirst = change.deferredFirst + 1
+          break                                          -- stays at the head of the queue for the next frame
+        end
+      end
+      loadQueue[lqHead] = nil
+      lqHead = lqHead + 1
+      queuedKeys[key] = nil
       local createStart = os.clock()
       local obj, err = createStreamedObject(item)
       local createMs = (os.clock() - createStart) * 1000
       timing.creates, timing.createMs = timing.creates + 1, timing.createMs + createMs
+      change.creates, change.createMs = change.creates + 1, change.createMs + createMs
       if createMs > timing.createMax then timing.createMax = createMs end
-      local shape = item.shapeName
+      if createMs > change.maxMs then change.maxMs = createMs end
       if shape then
-        if seenShapes[shape] then
-          timing.repeats, timing.repeatMs = timing.repeats + 1, timing.repeatMs + createMs
-        else
+        local cost = change.shapes[shape]
+        if not cost then cost = { n = 0, ms = 0, max = 0, first = 0, reload = 0 }; change.shapes[shape] = cost end
+        cost.n, cost.ms = cost.n + 1, cost.ms + createMs
+        if createMs > cost.max then cost.max = createMs end
+        if isFirst then
           seenShapes[shape] = true
+          firstUse = firstUse + 1
+          cost.first = cost.first + 1
+          recentFirstMs = recentFirstMs and (recentFirstMs * 0.7 + createMs * 0.3) or createMs
           timing.firsts, timing.firstMs = timing.firsts + 1, timing.firstMs + createMs
+          change.firsts, change.firstMs = change.firsts + 1, change.firstMs + createMs
+        else
+          timing.repeats, timing.repeatMs = timing.repeats + 1, timing.repeatMs + createMs
+          change.repeats, change.repeatMs = change.repeats + 1, change.repeatMs + createMs
+          if isWarm then
+            change.warms, change.warmMs = change.warms + 1, change.warmMs + createMs
+          else
+            cost.reload = cost.reload + 1
+            change.reloads, change.reloadMs = change.reloads + 1, change.reloadMs + createMs
+          end
         end
       end
       createdSinceChange = createdSinceChange + 1
       if obj then
+        change.objectMs, change.fieldsMs = change.objectMs + split.objectMs, change.fieldsMs + split.fieldsMs
+        change.registerMs, change.groupMs = change.registerMs + split.registerMs, change.groupMs + split.groupMs
+        change.nameMs = change.nameMs + split.nameMs
+        local live, reg = split.live, split.registerMs
+        change.liveSum = change.liveSum + live
+        if not change.liveMin or live < change.liveMin then change.liveMin = live end
+        if live > change.liveMax then change.liveMax = live end
+        change.rn, change.rx, change.ry = change.rn + 1, change.rx + live, change.ry + reg
+        change.rxx, change.rxy = change.rxx + live * live, change.rxy + live * reg
         registerLive(key, obj, item)
         createdTotal = createdTotal + 1
         verifyReadback(key, item, obj)
@@ -638,7 +716,7 @@ local function processLoads()
         recordFailure(string.format("create %s failed: %s", tostring(item.name), tostring(err)))
       end
       made = made + 1
-      if (os.clock() - started) * 1000 >= TUNING.frameBudgetMs then break end
+      if (os.clock() - started) * 1000 >= budget then break end
     end
   end
   if lqHead > lqTail then loadQueue, lqHead, lqTail = {}, 1, 0 end
@@ -650,6 +728,7 @@ end
 
 local function processUnloads()
   local started = os.clock()
+  local limit = TUNING.frameBudgetMs * TUNING.deleteBudgetShare
   local removed = 0
   while uqHead <= uqTail and removed < TUNING.maxDeletesPerFrame do
     local entry = unloadQueue[uqHead]
@@ -664,12 +743,14 @@ local function processUnloads()
       unloadQueue[uqHead] = nil; uqHead = uqHead + 1
       deleteLive(key)
       removed = removed + 1
-      if (os.clock() - started) * 1000 >= TUNING.frameBudgetMs then break end
+      if (os.clock() - started) * 1000 >= limit then break end
     else
       break                                                     -- FIFO by time: the rest are newer
     end
   end
   if uqHead > uqTail then unloadQueue, uqHead, uqTail = {}, 1, 0 end
+  frameDeleteMs = (os.clock() - started) * 1000
+  change.deleted, change.deleteMs = change.deleted + removed, change.deleteMs + frameDeleteMs
 end
 
 -- ---------------------------------------------------------------------------
@@ -702,6 +783,7 @@ local function setCurrentSection(newID)
   end
   purgeQueue()                                                     -- nothing stale waits behind new work
   changeStamp, createdSinceChange, settled = totalTime, 0, (newID == nil)
+  change = newChange()
   priorityTimer = 0
   rebuildFeedOrder()
   for i = 1, #feedOrder do queueSectionRead(feedOrder[i]) end      -- current section first
@@ -775,7 +857,8 @@ local function resetState()
   cameraSectionID, predictedSectionID, aheadCandidate, aheadTime = nil, nil, nil, 0
   feedOrder, priorityTimer = {}, 0
   for k in pairs(timing) do timing[k] = 0 end
-  seenShapes = {}
+  seenShapes, shapeLive, recentFirstMs, idleFrameMs = {}, {}, nil, nil
+  change, frameDeleteMs = newChange(), 0
   changeStamp, createdSinceChange, settled, settleSeconds, settlePeak = 0, 0, true, 0, 0
 end
 
@@ -899,6 +982,102 @@ function M.sectionIDToDisplayName(id)
   return string.format("%d (%s%02d)", id, string.char(64 + letterIndex), id % 100)
 end
 
+-- Least-squares slope of registerObject ms over the live object count, per 1000 objects (nil: too little spread).
+local function registerSlopePer1000()
+  local c = change
+  if c.rn < 20 then return nil end
+  local denom = c.rn * c.rxx - c.rx * c.rx
+  if denom <= 0 or (c.liveMax - (c.liveMin or 0)) < 200 then return nil end
+  return (c.rn * c.rxy - c.rx * c.ry) / denom * 1000
+end
+
+-- The shapes that cost the most since the last section change, by total create time.
+local function topShapes(limit)
+  local list = {}
+  for name, c in pairs(change.shapes) do list[#list + 1] = { name = name, n = c.n, ms = c.ms, max = c.max, first = c.first, reload = c.reload } end
+  table.sort(list, function(a, b) if a.ms ~= b.ms then return a.ms > b.ms end return a.name < b.name end)
+  for i = #list, limit + 1, -1 do list[i] = nil end
+  return list
+end
+
+local function shortShapeName(name)
+  local base = (name:match("([^/\\]+)$") or name):gsub("%.dae$", "")
+  return base
+end
+
+-- Controlled measurement of what registerObject costs, run once from the console:
+--   extensions.nfsc_sectionStreamer.probeRegister()                 (any live shape, 40 objects)
+--   extensions.nfsc_sectionStreamer.probeRegister("<shapeName>", 80)
+-- Creates `count` test TSStatics of one shape underground below the camera in four passes
+-- (unnamed, named with the duplicate check timed on its own, unnamed again to expose order/warm-up
+-- effects), logs the averages with the first and last quarter of each pass, and deletes them again.
+-- It blocks the game for a moment (count x about 5 ms per pass).
+local function runProbe(shapeName, count)
+  if not initialized then return nil, "the streamer is not initialized (is the level loaded?)" end
+  count = math.max(4, math.min(tonumber(count) or 40, 200))
+  if not shapeName then
+    for _, entry in pairs(live) do
+      if entry.shape then shapeName = entry.shape; break end
+    end
+  end
+  if not shapeName then return nil, "no streamed object is live yet (stand in a loaded section, or pass a shapeName)" end
+  local cam = core_camera and core_camera.getPosition and core_camera.getPosition()
+  local pos = cam and string.format("%.3f %.3f %.3f", cam.x, cam.y, cam.z - 800) or "0 0 -800"
+  local results = {}
+  local function pass(label, named)
+    local objs, regMs, lookupMs = {}, {}, {}
+    for i = 1, count do
+      local obj = createObject("TSStatic")
+      if not obj then break end
+      pcall(obj.setField, obj, "shapeName", 0, shapeName)
+      pcall(obj.setField, obj, "position", 0, pos)
+      pcall(obj.setField, obj, "collisionType", 0, "None")
+      pcall(obj.setField, obj, "decalType", 0, "None")
+      local name = ""
+      if named then
+        name = "nfsc_probe_" .. label .. "_" .. i
+        local a = os.clock()
+        scenetree.findObject(name)
+        lookupMs[i] = (os.clock() - a) * 1000
+      end
+      local a = os.clock()
+      pcall(obj.registerObject, obj, name)
+      regMs[i] = (os.clock() - a) * 1000
+      objs[i] = obj
+    end
+    local d0 = os.clock()
+    for i = 1, #objs do pcall(objs[i].delete, objs[i]) end
+    local deleteMs = (os.clock() - d0) * 1000
+    local function avg(list, from, to)
+      local sum, n = 0, 0
+      for i = from, to do if list[i] then sum, n = sum + list[i], n + 1 end end
+      return n > 0 and sum / n or 0
+    end
+    local n, q = #regMs, math.max(1, math.floor(#regMs / 4))
+    local r = { label = label, n = n, register = avg(regMs, 1, n), first = avg(regMs, 1, q), last = avg(regMs, n - q + 1, n),
+                lookup = named and avg(lookupMs, 1, n) or 0, delete = n > 0 and deleteMs / n or 0 }
+    results[#results + 1] = r
+    logMsg("I", "probe %s: %d x %s: registerObject avg %.2f ms (first quarter %.2f, last quarter %.2f), name lookup %.3f ms, delete %.2f ms each",
+      label, r.n, shapeName:match("([^/\\]+)$") or shapeName, r.register, r.first, r.last, r.lookup, r.delete)
+  end
+  pass("unnamed", false)
+  pass("named", true)
+  pass("unnamed2", false)
+  return results
+end
+
+-- Always says something in the log: the reason it could not run, or the Lua error it hit.
+function M.probeRegister(shapeName, count)
+  logMsg("I", "probeRegister called (shape %s, count %s)", tostring(shapeName or "any live shape"), tostring(count or "default"))
+  local ok, results, err = pcall(runProbe, shapeName, count)
+  if not ok then
+    logMsg("E", "probeRegister failed: %s", tostring(results))
+    return nil, tostring(results)
+  end
+  if not results then logMsg("W", "probeRegister did not run: %s", tostring(err)) end
+  return results, err
+end
+
 function M.getStatus()
   local pending = 0
   for _ in pairs(pendingUnload) do pending = pending + 1 end
@@ -930,6 +1109,16 @@ function M.getStatus()
     repeatCreates = timing.repeats, repeatAvgMs = timing.repeats > 0 and timing.repeatMs / timing.repeats or 0,
     avgReadMs = timing.reads > 0 and timing.readMs / timing.reads or 0, maxReadMs = timing.readMax,
     loadFrameLastMs = timing.frameLast, loadFramePeakMs = timing.framePeak,
+    changeCreates = change.creates, changeCreateMs = change.createMs, changeFrames = change.frames,
+    changeFps = change.dtSum > 0 and change.frames / change.dtSum or 0, changeWorstFrameMs = change.dtMax * 1000,
+    changeDeferredFirstUse = change.deferredFirst,
+    changeFirstUse = change.firsts, changeReload = change.reloads, changeWarm = change.warms,
+    changeReloadAvgMs = change.reloads > 0 and change.reloadMs / change.reloads or 0,
+    changeWarmAvgMs = change.warms > 0 and change.warmMs / change.warms or 0,
+    changeTopShapes = topShapes(5), expectedFirstUseMs = expectedFirstMs(), idleFrameMs = idleFrameMs,
+    changeNameAvgMs = change.creates > 0 and change.nameMs / change.creates or 0, changeRegisterSlopePer1000 = registerSlopePer1000(),
+    changeSplitMs = { createObject = change.objectMs, setField = change.fieldsMs,
+                      registerObject = change.registerMs, groupAdd = change.groupMs },
     pendingUnloadCount = pending,
     createdTotal = createdTotal, deletedTotal = deletedTotal,
     failureCount = failureCount,
@@ -958,20 +1147,53 @@ function M.onUpdate(dtReal)
     priorityTimer = 0
     rebuildFeedOrder()
   end
+  if settled and M.isIdle() then
+    local dt = dtReal or 0
+    if dt > 0 and dt < 0.5 then idleFrameMs = idleFrameMs and (idleFrameMs * 0.98 + dt * 1000 * 0.02) or dt * 1000 end
+  end
+  local frameStarted = os.clock()
   processSectionReads()
   feedQueue()
-  processLoads()
-  processUnloads()
+  processUnloads()                                   -- deletes first, within their share of the frame budget
+  processLoads()                                     -- creates use what is left of it
+  if not settled then
+    change.frames = change.frames + 1
+    change.workMs = change.workMs + (os.clock() - frameStarted) * 1000
+    local dt = dtReal or 0
+    change.dtSum = change.dtSum + dt
+    if dt > change.dtMax then change.dtMax = dt end
+  end
   if not settled and M.isIdle() then
     settled = true
     settleSeconds = totalTime - changeStamp
     if settleSeconds > settlePeak then settlePeak = settleSeconds end
     if TUNING.logSettle then
-      logMsg("I", "section %s settled: %d objects in %.2f s, create avg %.2f ms (first use %.2f, repeat %.2f), max %.1f ms, section read max %.1f ms",
+      local c = change
+      logMsg("I", "section %s settled: %d objects in %.2f s (%.0f/s), %d frames, %.1f fps (worst frame %.0f ms), streaming %.1f ms/frame",
         tostring(currentSectionID), createdSinceChange, settleSeconds,
-        timing.creates > 0 and timing.createMs / timing.creates or 0,
-        timing.firsts > 0 and timing.firstMs / timing.firsts or 0,
-        timing.repeats > 0 and timing.repeatMs / timing.repeats or 0, timing.createMax, timing.readMax)
+        settleSeconds > 0 and createdSinceChange / settleSeconds or 0,
+        c.frames, c.dtSum > 0 and c.frames / c.dtSum or 0, c.dtMax * 1000, c.frames > 0 and c.workMs / c.frames or 0)
+      if c.creates > 0 then
+        logMsg("I", "  creates: %.0f ms total, avg %.2f ms, max %.1f ms; first use %d x %.2f ms, reload %d x %.2f ms, warm %d x %.2f ms, new shapes deferred %d times",
+          c.createMs, c.createMs / c.creates, c.maxMs,
+          c.firsts, c.firsts > 0 and c.firstMs / c.firsts or 0,
+          c.reloads, c.reloads > 0 and c.reloadMs / c.reloads or 0,
+          c.warms, c.warms > 0 and c.warmMs / c.warms or 0, c.deferredFirst)
+        local top = topShapes(5)
+        for i = 1, #top do
+          local t = top[i]
+          logMsg("I", "  top %d: %s %d x, %.0f ms total, avg %.2f, max %.1f ms (first %d, reload %d)",
+            i, shortShapeName(t.name), t.n, t.ms, t.ms / t.n, t.max, t.first, t.reload)
+        end
+        local slope = registerSlopePer1000()
+        logMsg("I", "  per create: createObject %.2f, setField %.2f, name %.2f, registerObject %.2f, group add %.2f ms; deleted %d in %.0f ms; section read max %.1f ms",
+          c.objectMs / c.creates, c.fieldsMs / c.creates, c.nameMs / c.creates, c.registerMs / c.creates, c.groupMs / c.creates,
+          c.deleted, c.deleteMs, timing.readMax)
+        logMsg("I", "  scene: live objects %d to %d (avg %.0f) while creating, registerObject trend %s, idle frame %s",
+          c.liveMin or 0, c.liveMax, c.liveSum / c.creates,
+          slope and string.format("%+.2f ms per 1000 live", slope) or "n/a (live count barely changed)",
+          idleFrameMs and string.format("%.1f ms (%.0f fps)", idleFrameMs, 1000 / idleFrameMs) or "n/a")
+      end
     end
   end
 end
