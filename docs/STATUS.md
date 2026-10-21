@@ -45,4 +45,12 @@
   scene trend and idle frame time in the settled log, `skipNameLookup` switch, `probeRegister()` console
   probe. Instrumentation only; defaults unchanged. Findings so far: reloads are rare (not the cause),
   cost is per instance and varies by shape and section.
+- 0010c: the registerObject probe runs by itself at the end of every settled change (`probeOnSettle`),
+  compares itself with the real cost of the most-created shape, and flags refused registers.
+- 0011: first-use cap 3, refused registers count as failures, probe with real fields and position,
+  warm-create cost by camera distance, lights/emitters state in the settled block. Open question it
+  answers: why real objects cost 0.5-2 ms (sometimes 4 ms) while a bare probe costs 0.01-0.1 ms.
+- 0012: skip-ahead in the load queue (urgent lane for the camera's section and the streamed one,
+  promotion on section change). Neighbour-section terrain no longer goes before the current section's
+  rest; `currentSectionFirst = false` restores the old order for comparison.
 

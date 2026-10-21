@@ -154,3 +154,29 @@ position and scale line.
   test run `extensions.nfsc_sectionStreamer.probeRegister()` in the console: three passes of test
   TSStatics of one live shape (unnamed, named, unnamed again), averages with first/last quarter, name
   lookup and delete time, objects deleted again.
+- Probe after settle (0010c): with `probeOnSettle` (default on) every settled change that created
+  objects ends with a probe of the change's most-created shape: `probeCount` (20) test TSStatics,
+  named and unnamed, logged as `probe named:` / `probe unnamed:` plus a `probe vs real:` line that sets
+  the probe next to the real average of that shape in the same change. A pass whose registerObject
+  calls were refused by the engine is marked FAILED (its timing is meaningless). The manual
+  `probeRegister()` keeps its three passes.
+- 0011: `maxFirstUsePerFrame` defaults to 3 (the frame budget still stops a new shape that does not fit).
+  A `registerObject` that the engine refuses (returns false) now counts as a failure and the object is
+  deleted instead of being counted as created. The probe has a fourth pass, `probe real`, that creates
+  copies of a real live object of the same shape through the normal create path (real fields and
+  position, runtime group, probe names) and deletes them again; bare passes now verify the
+  registration (found by name, or a non-zero id) before trusting their timing. Settled blocks gain a
+  line with warm creates by horizontal distance to the camera (under 100 m, 100-300 m, over 300 m) and
+  the Section Manager's lights/emitters switches. `getTuning()` returns a copy of the tuning values.
+- Skip ahead (0012, `currentSectionFirst`, default on): the load queue has an urgent lane. Objects
+  of the section the camera is in and of the section the streamer currently loads for (they differ
+  while the look-ahead is ahead of the camera) are fed into `priQueue` and created before anything in
+  `loadQueue`; the urgent lane has its own `maxQueuedItems` cap, so a full queue of leftovers never
+  holds them back. When the section changes (or the camera crosses into the section streamed ahead),
+  `purgeQueue` drops what no active section needs and re-sorts the rest: queued objects of the new
+  section jump into the urgent lane, items that were urgent for the section just left lead the normal
+  lane, each keeping its original order. Terrain still comes first inside a section; neighbours'
+  terrain no longer precedes the current section's other objects. `getStatus()` has
+  `queuedUrgentCount` and `promotedObjectCount`; a section change that promoted objects logs
+  `moved ahead of the leftovers`.
+

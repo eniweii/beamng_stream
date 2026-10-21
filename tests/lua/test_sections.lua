@@ -628,7 +628,9 @@ do
   local before = s.getStatus().liveObjectCount
   local results, err = s.probeRegister(nil, 8)
   check(results ~= nil, "probe runs with a live shape: " .. tostring(err))
-  eq(#results, 3, "three passes: unnamed, named, unnamed again")
+  eq(#results, 4, "four passes: unnamed, named, unnamed again, real fields")
+  eq(results[4].label, "real", "the last pass uses a real item's fields")
+  eq(results[4].failed, 0, "no probe register failed")
   eq(results[1].n, 8, "probe creates the requested number of objects")
   eq(s.getStatus().liveObjectCount, before, "probe leaves the streamed objects alone")
   check(H.byName("nfsc_probe_named_1") == nil and H.byName("nfsc_probe_named_8") == nil, "probe objects are deleted again")
@@ -658,6 +660,100 @@ do
   check(st.idleFrameMs ~= nil and math.abs(st.idleFrameMs - 33) < 5, "idle frame baseline follows the frame time while nothing loads")
   check(st.changeNameAvgMs >= 0, "name lookup time is reported")
   os.clock = realClock
+end
+
+-- 25. the probe runs by itself after a section settled with new objects ------------------------------
+do
+  local function count(pattern)
+    local n = 0
+    for _, line in ipairs(H.logs) do if line:find(pattern, 1, true) then n = n + 1 end end
+    return n
+  end
+  local s = fresh()
+  local base = count("probe vs real")
+  settle(s, 10)
+  eq(count("probe vs real") - base, 1, "one probe summary after the section settled")
+  check(count("probe named:") >= 1 and count("probe unnamed:") >= 1, "named and unnamed passes are logged")
+  eq(s.getStatus().liveObjectCount, 9, "the probe leaves the streamed objects alone")
+  H.tick(s, 30, 0.1)
+  eq(count("probe vs real") - base, 1, "an idle section does not probe again")
+  local off = fresh({ probeOnSettle = false })
+  local before = count("probe vs real")
+  settle(off, 10)
+  eq(count("probe vs real"), before, "probeOnSettle = false keeps the log quiet")
+end
+
+-- 26. refused registers, distance buckets, lights state, cap 3 -------------------------------------
+do
+  H.refuseRegister = true
+  local s = fresh()
+  settle(s, 10)
+  local st = s.getStatus()
+  eq(st.liveObjectCount, 0, "an engine that refuses registerObject leaves nothing live")
+  check(st.failureCount > 0, "a refused register is counted as a failure, not as a created object")
+  H.refuseRegister = false
+end
+do
+  local s = fresh()
+  settle(s, 10)
+  local st = s.getStatus()
+  local d = st.changeWarmByDistance
+  local sum = d.c1.n + d.c2.n + d.c3.n
+  check(sum <= st.changeWarm, "distance buckets hold warm creates only")
+  eq(st.liveObjectCount, 9, "nothing else changed")
+  local seen = false
+  for _, line in ipairs(H.logs) do if line:find("warm creates by horizontal distance", 1, true) then seen = true end end
+  check(seen, "the distance line is logged with the settled block")
+end
+do
+  local s = fresh()
+  local untouched = H.load(repo .. "/lua/ge/extensions/nfsc/sectionStreamer.lua")
+  eq(untouched.getTuning().maxFirstUsePerFrame, 3, "default cap of new shapes per frame is 3")
+  eq(untouched.getTuning().frameBudgetMs, 16, "default frame budget is the tested 16 ms")
+  settle(s, 10)
+  local on = false
+  for _, line in ipairs(H.logs) do if line:find("lights on, emitters on", 1, true) then on = true end end
+  check(on, "the settled block says whether lights and emitters were on")
+end
+
+-- 27. the section the camera is in jumps ahead of the leftovers of the section it left --------------
+do
+  local only1021 = { "XTU_SPRINGTREETREELINEB_1A_00_10071", "XTU_TREEDEADB_1A_00_053", "XTU_TREEJPNMAPLE_1A_00_379",
+                     "XTU_TREESPINGA_1A_00_291", "XWS_BARRIERCHGATE_1A_00_016", "XWU_CHAINLINKCAS8MA_1B_00_445" }
+  local function run(tuning)
+    local s = fresh(tuning)
+    H.tick(s, 3, 0.1)                                  -- a few objects of 1021, the rest waits in the queue (1022 is read by now)
+    H.cam = { x = 3950, y = -310, z = 0 }              -- into 1022 (its own objects: a tree and a house)
+    local frames = 0
+    while frames < 40 and not (H.byName("XTU_TREESPINGA_1A_00_500") and H.byName("XTU_HOUSE_1A_00_001")) do
+      H.tick(s, 1, 0.1)
+      frames = frames + 1
+    end
+    local left = 0
+    for _, name in ipairs(only1021) do if not H.byName(name) then left = left + 1 end end
+    return s, left, frames
+  end
+  -- (every fresh() reinstalls the engine mock, so the comparison run goes first)
+  local _, leftOff = run({ maxCreatesPerFrame = 1, frameBudgetMs = 1000, currentSectionFirst = false })
+  local s, left = run({ maxCreatesPerFrame = 1, frameBudgetMs = 1000 })
+  eq(s.getStatus().currentSectionID, 1022, "camera moved into 1022")
+  check(left > leftOff, "the new section's objects were created before old-section leftovers (left: " .. left .. " against " .. leftOff .. " without the switch)")
+  check(s.getStatus().promotedObjectCount > 0, "queued objects of the new section were moved ahead")
+  settle(s, 60)
+  local st = s.getStatus()
+  eq(st.failureCount, 0, "no failures")
+  check(st.queuedObjectCount == 0, "both queues drain")
+end
+do
+  -- a full queue of leftovers does not keep the current section's objects out
+  local s = fresh({ maxCreatesPerFrame = 1, frameBudgetMs = 1000, maxQueuedItems = 2 })
+  H.tick(s, 1, 0.1)
+  H.cam = { x = 3950, y = -310, z = 0 }
+  local frames = 0
+  while frames < 12 and not H.byName("XTU_HOUSE_1A_00_001") do H.tick(s, 1, 0.1); frames = frames + 1 end
+  check(H.byName("XTU_HOUSE_1A_00_001") ~= nil, "the house of the camera's section loads within a few frames despite a full queue")
+  settle(s, 60)
+  eq(s.getStatus().liveObjectCount, 10, "everything arrives in the end (1022 also brings the 1101 rock)")
 end
 
 print(string.format("%d passed, %d failed", passed, failed))

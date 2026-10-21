@@ -50,8 +50,11 @@ local TUNING = {
   maxDeletesPerFrame = 256,
   frameBudgetMs = 16.0,           -- one budget for the whole frame: deletes first, creates get what is left
   deleteBudgetShare = 0.25,       -- deletes may use at most this share of frameBudgetMs
-  maxFirstUsePerFrame = 1,        -- new shapes (11-14 ms each) per frame; a later new shape waits for the next frame
+  maxFirstUsePerFrame = 3,        -- new shapes (4-20 ms each) per frame; a later new shape waits for the next frame
   firstUseGuessMs = 6.0,          -- expected first-use cost until a real average exists
+  currentSectionFirst = true,     -- objects of the section the camera is in (and the one streamed for) load before everything else
+  probeOnSettle = true,           -- after a section settled with new objects, time a few test registerObject calls and log them
+  probeCount = 20,                -- test objects per probe pass when it runs by itself
   skipNameLookup = false,         -- true: name every object "nfsc_<key>" without the scenetree.findObject duplicate check
   maxSectionReadsPerFrame = 1,
   maxQueuedItems = 512,           -- hard cap of the load queue; the rest waits in pending lists
@@ -96,6 +99,8 @@ local currentSectionID, activeSet = nil, {}
 local sectionRead, sectionReading = {}, {}
 local sectionReadQueue, srHead, srTail = {}, 1, 0
 local loadQueue, lqHead, lqTail = {}, 1, 0
+local priQueue, pqHead, pqTail = {}, 1, 0      -- urgent: objects of the current / camera section, served before loadQueue
+local promotedTotal = 0                         -- queued objects moved ahead when a section changed
 local queuedKeys = {}
 local pending, pendingCount = {}, 0   -- id -> { terrain = tier, rest = tier }, tier = { list, at, n }
 local deferred = {}                   -- id -> items the create filter held back
@@ -119,7 +124,7 @@ local function newChange()
            objectMs = 0, fieldsMs = 0, registerMs = 0, groupMs = 0, frames = 0, workMs = 0, dtSum = 0, dtMax = 0,
            deleted = 0, deleteMs = 0, deferredFirst = 0,
            reloads = 0, reloadMs = 0, warms = 0, warmMs = 0, shapes = {},
-           nameMs = 0, liveSum = 0, liveMin = nil, liveMax = 0, rn = 0, rx = 0, ry = 0, rxx = 0, rxy = 0 }   -- r*: regression sums of registerObject ms over live count   -- shapes: name -> { n, ms, max, first, reload }
+           dist = { { n = 0, ms = 0 }, { n = 0, ms = 0 }, { n = 0, ms = 0 } }, nameMs = 0, liveSum = 0, liveMin = nil, liveMax = 0, rn = 0, rx = 0, ry = 0, rxx = 0, rxy = 0 }   -- r*: regression sums of registerObject ms over live count   -- shapes: name -> { n, ms, max, first, reload }
 end
 local change = newChange()                -- everything since the last section change
 local split = { objectMs = 0, fieldsMs = 0, registerMs = 0, groupMs = 0, nameMs = 0, live = 0 }
@@ -349,7 +354,7 @@ local function runtimeName(item, key)
   return wanted
 end
 
-local function createStreamedObject(item)
+local function createStreamedObject(item, nameOverride)
   local shape = item.shapeName
   if type(shape) ~= "string" or shape == "" then return nil, "missing shapeName" end
   local t0 = os.clock()
@@ -368,9 +373,10 @@ local function createStreamedObject(item)
     pcall(obj.setField, obj, "decalType", 0, "None")
   end
   local t2 = os.clock()
-  local wantedName = runtimeName(item, item.__streamKey or "x")
+  local wantedName = nameOverride or runtimeName(item, item.__streamKey or "x")
   local tn = os.clock()
   local ok, err = pcall(obj.registerObject, obj, wantedName)
+  if ok and err == false then ok, err = false, "the engine refused it (returned false)" end
   if not ok then
     pcall(obj.delete, obj)
     return nil, "registerObject failed: " .. tostring(err)
@@ -397,7 +403,7 @@ end
 
 local function registerLive(key, obj, item)
   local ids = itemSections(item)
-  live[key] = { id = obj:getID(), sections = ids, shape = item.shapeName }
+  live[key] = { id = obj:getID(), sections = ids, shape = item.shapeName, item = item }
   liveCount = liveCount + 1
   if item.shapeName then shapeLive[item.shapeName] = (shapeLive[item.shapeName] or 0) + 1 end
   for i = 1, #ids do
@@ -479,15 +485,32 @@ local function queueSectionRead(id)
   sectionReadQueue[srTail] = id
 end
 
+-- Objects of the section the camera is in, or the one the streamer is currently loading for, are
+-- urgent: they are served before anything left over from the section just left.
+local function isUrgent(item)
+  if not TUNING.currentSectionFirst then return false end
+  local ids = itemSections(item)
+  for i = 1, #ids do
+    local id = ids[i]
+    if id == currentSectionID or id == cameraSectionID then return true end
+  end
+  return false
+end
+
 local function queueItem(item)
   local key = item.__streamKey
   if not key or live[key] or queuedKeys[key] then return end
   queuedKeys[key] = true
-  lqTail = lqTail + 1
-  loadQueue[lqTail] = item
+  if isUrgent(item) then
+    pqTail = pqTail + 1
+    priQueue[pqTail] = item
+  else
+    lqTail = lqTail + 1
+    loadQueue[lqTail] = item
+  end
 end
-
-local function queueLength() return lqTail - lqHead + 1 end
+local function priLength() return pqTail - pqHead + 1 end
+local function queueLength() return (lqTail - lqHead + 1) + (pqTail - pqHead + 1) end
 
 -- Terrain-like objects (identity matrix / chopped roadway) are loaded before everything else.
 local function isTerrainItem(item)
@@ -559,8 +582,14 @@ local function feedTier(id, tierName)
   if not entry then return end
   local tier = entry[tierName]
   local list = tier.list
-  while tier.at <= tier.n and queueLength() < TUNING.maxQueuedItems do
+  while tier.at <= tier.n do
     local item = list[tier.at]
+    -- urgent objects have a queue of their own, so a full queue of leftovers never holds them back
+    if isUrgent(item) then
+      if priLength() >= TUNING.maxQueuedItems then break end
+    elseif queueLength() >= TUNING.maxQueuedItems then
+      break
+    end
     list[tier.at] = nil
     tier.at = tier.at + 1
     pendingCount = pendingCount - 1
@@ -573,6 +602,12 @@ end
 -- Terrain of every active section first, then the rest; sections in feedOrder (current first).
 local function feedQueue()
   if pendingCount <= 0 or not currentSectionID or not sections[currentSectionID] then return end
+  if TUNING.currentSectionFirst then                       -- the camera's section and the streamed one, terrain first
+    for _, tierName in ipairs({ "terrain", "rest" }) do
+      feedTier(currentSectionID, tierName)
+      if cameraSectionID and cameraSectionID ~= currentSectionID then feedTier(cameraSectionID, tierName) end
+    end
+  end
   for _, tierName in ipairs({ "terrain", "rest" }) do
     for i = 1, #feedOrder do
       if queueLength() >= TUNING.maxQueuedItems then break end
@@ -583,23 +618,39 @@ local function feedQueue()
   if length > queueHighWater then queueHighWater = length end
 end
 
--- Keeps only the entries some active section still needs, in their original order.
+-- Keeps only the entries some active section still needs and sorts them into the two queues: what
+-- belongs to the camera's section or the streamed one goes first (in its original order), what was
+-- urgent for a section that is no longer current goes to the front of the rest.
 local function purgeQueue()
-  if lqHead > lqTail then return end
-  local kept, n = {}, 0
+  if lqHead > lqTail and pqHead > pqTail then return end
+  local urgent, rest, nu, nr = {}, {}, 0, 0
+  local promoted = 0
   queuedKeys = {}
-  for i = lqHead, lqTail do
-    local item = loadQueue[i]
-    local key = item.__streamKey
-    if not live[key] and anyActive(itemSections(item)) then
-      n = n + 1
-      kept[n] = item
-      queuedKeys[key] = true
-    else
-      staleDiscarded = staleDiscarded + 1
+  local function sort(queue, from, to, wasUrgent)
+    for i = from, to do
+      local item = queue[i]
+      local key = item.__streamKey
+      if not live[key] and anyActive(itemSections(item)) then
+        queuedKeys[key] = true
+        if isUrgent(item) then
+          nu = nu + 1
+          urgent[nu] = item
+          if not wasUrgent then promoted = promoted + 1 end
+        else
+          nr = nr + 1
+          rest[nr] = item
+        end
+      else
+        staleDiscarded = staleDiscarded + 1
+      end
     end
   end
-  loadQueue, lqHead, lqTail = kept, 1, n
+  sort(priQueue, pqHead, pqTail, true)                    -- old urgent items first: demoted ones lead the rest
+  sort(loadQueue, lqHead, lqTail, false)
+  priQueue, pqHead, pqTail = urgent, 1, nu
+  loadQueue, lqHead, lqTail = rest, 1, nr
+  promotedTotal = promotedTotal + promoted
+  return promoted
 end
 
 local function scheduleUnload(key)
@@ -644,13 +695,13 @@ local function processLoads()
   local started = os.clock()
   local budget = TUNING.frameBudgetMs - frameDeleteMs    -- creates get what the deletes left
   local made, firstUse, skipped = 0, 0, 0
-  while lqHead <= lqTail and made < TUNING.maxCreatesPerFrame and skipped < SKIP_CAP do
-    local item = loadQueue[lqHead]
+  while (pqHead <= pqTail or lqHead <= lqTail) and made < TUNING.maxCreatesPerFrame and skipped < SKIP_CAP do
+    local fromUrgent = pqHead <= pqTail
+    local item = fromUrgent and priQueue[pqHead] or loadQueue[lqHead]
     local key = item.__streamKey
     local shape = item.shapeName
     if live[key] or not anyActive(itemSections(item)) then
-      loadQueue[lqHead] = nil
-      lqHead = lqHead + 1
+      if fromUrgent then priQueue[pqHead] = nil; pqHead = pqHead + 1 else loadQueue[lqHead] = nil; lqHead = lqHead + 1 end
       queuedKeys[key] = nil
       skipped = skipped + 1
     else
@@ -664,8 +715,7 @@ local function processLoads()
           break                                          -- stays at the head of the queue for the next frame
         end
       end
-      loadQueue[lqHead] = nil
-      lqHead = lqHead + 1
+      if fromUrgent then priQueue[pqHead] = nil; pqHead = pqHead + 1 else loadQueue[lqHead] = nil; lqHead = lqHead + 1 end
       queuedKeys[key] = nil
       local createStart = os.clock()
       local obj, err = createStreamedObject(item)
@@ -690,6 +740,12 @@ local function processLoads()
           timing.repeats, timing.repeatMs = timing.repeats + 1, timing.repeatMs + createMs
           change.repeats, change.repeatMs = change.repeats + 1, change.repeatMs + createMs
           if isWarm then
+            local p = item.position
+            if camPos and p and p[1] and p[2] then
+              local d = math.sqrt((p[1] - camPos.x) ^ 2 + (p[2] - camPos.y) ^ 2)
+              local bucket = change.dist[d < 100 and 1 or (d < 300 and 2 or 3)]
+              bucket.n, bucket.ms = bucket.n + 1, bucket.ms + createMs
+            end
             change.warms, change.warmMs = change.warms + 1, change.warmMs + createMs
           else
             cost.reload = cost.reload + 1
@@ -720,6 +776,7 @@ local function processLoads()
     end
   end
   if lqHead > lqTail then loadQueue, lqHead, lqTail = {}, 1, 0 end
+  if pqHead > pqTail then priQueue, pqHead, pqTail = {}, 1, 0 end
   createdLastFrame = made
   if made > createdPeakFrame then createdPeakFrame = made end
   timing.frameLast = (os.clock() - started) * 1000
@@ -781,7 +838,10 @@ local function setCurrentSection(newID)
       end
     end
   end
-  purgeQueue()                                                     -- nothing stale waits behind new work
+  local promoted = purgeQueue()                                    -- nothing stale waits behind new work
+  if promoted and promoted > 0 and TUNING.logSettle then
+    logMsg("I", "section %s: %d queued objects of this section moved ahead of the leftovers", tostring(newID), promoted)
+  end
   changeStamp, createdSinceChange, settled = totalTime, 0, (newID == nil)
   change = newChange()
   priorityTimer = 0
@@ -836,8 +896,13 @@ local function updateCamera(dt)
   else
     aheadCandidate, aheadTime = nil, 0
   end
+  local cameraMoved = cameraSectionID ~= actual
   cameraSectionID = actual
-  if desired ~= currentSectionID then setCurrentSection(desired) end
+  if desired ~= currentSectionID then
+    setCurrentSection(desired)
+  elseif cameraMoved then
+    purgeQueue()                                                   -- the camera crossed into the section streamed ahead
+  end
 end
 
 -- ---------------------------------------------------------------------------
@@ -848,6 +913,7 @@ local function resetState()
   sectionRead, sectionReading = {}, {}
   sectionReadQueue, srHead, srTail = {}, 1, 0
   loadQueue, lqHead, lqTail, queuedKeys = {}, 1, 0, {}
+  priQueue, pqHead, pqTail, promotedTotal = {}, 1, 0, 0
   pending, pendingCount, deferred = {}, 0, {}
   staleDiscarded, queueHighWater, createdLastFrame, createdPeakFrame = 0, 0, 0, 0
   live, liveBySection, liveCount = {}, {}, 0
@@ -939,6 +1005,13 @@ end
 function M.setSuspended(flag) suspended = flag and true or false end
 function M.isSuspended() return suspended end
 
+-- A copy of the current tuning values (for the console: dump(extensions.nfsc_sectionStreamer.getTuning())).
+function M.getTuning()
+  local copy = {}
+  for k, v in pairs(TUNING) do copy[k] = v end
+  return copy
+end
+
 function M.setTuning(values)
   for k, v in pairs(values or {}) do
     if TUNING[k] ~= nil then TUNING[k] = v end
@@ -1012,7 +1085,7 @@ end
 -- (unnamed, named with the duplicate check timed on its own, unnamed again to expose order/warm-up
 -- effects), logs the averages with the first and last quarter of each pass, and deletes them again.
 -- It blocks the game for a moment (count x about 5 ms per pass).
-local function runProbe(shapeName, count)
+local function runProbe(shapeName, count, auto)
   if not initialized then return nil, "the streamer is not initialized (is the level loaded?)" end
   count = math.max(4, math.min(tonumber(count) or 40, 200))
   if not shapeName then
@@ -1025,7 +1098,7 @@ local function runProbe(shapeName, count)
   local pos = cam and string.format("%.3f %.3f %.3f", cam.x, cam.y, cam.z - 800) or "0 0 -800"
   local results = {}
   local function pass(label, named)
-    local objs, regMs, lookupMs = {}, {}, {}
+    local objs, regMs, lookupMs, failed = {}, {}, {}, 0
     for i = 1, count do
       local obj = createObject("TSStatic")
       if not obj then break end
@@ -1041,8 +1114,16 @@ local function runProbe(shapeName, count)
         lookupMs[i] = (os.clock() - a) * 1000
       end
       local a = os.clock()
-      pcall(obj.registerObject, obj, name)
+      local okc, res = pcall(obj.registerObject, obj, name)
       regMs[i] = (os.clock() - a) * 1000
+      -- registered for real? refused (false), or not findable afterwards (by name, or by a non-zero id)
+      local found = okc and res ~= false
+      if found and named then found = scenetree.findObject(name) ~= nil end
+      if found and not named then
+        local idOk, id = pcall(obj.getID, obj)
+        found = idOk and id ~= nil and id ~= 0
+      end
+      if not found then failed = failed + 1 end
       objs[i] = obj
     end
     local d0 = os.clock()
@@ -1055,14 +1136,53 @@ local function runProbe(shapeName, count)
     end
     local n, q = #regMs, math.max(1, math.floor(#regMs / 4))
     local r = { label = label, n = n, register = avg(regMs, 1, n), first = avg(regMs, 1, q), last = avg(regMs, n - q + 1, n),
-                lookup = named and avg(lookupMs, 1, n) or 0, delete = n > 0 and deleteMs / n or 0 }
+                lookup = named and avg(lookupMs, 1, n) or 0, delete = n > 0 and deleteMs / n or 0, failed = failed }
     results[#results + 1] = r
-    logMsg("I", "probe %s: %d x %s: registerObject avg %.2f ms (first quarter %.2f, last quarter %.2f), name lookup %.3f ms, delete %.2f ms each",
-      label, r.n, shapeName:match("([^/\\]+)$") or shapeName, r.register, r.first, r.last, r.lookup, r.delete)
+    local short = shapeName:match("([^/\\]+)$") or shapeName
+    logMsg("I", "probe %s: %d x %s: registerObject avg %.2f ms (first quarter %.2f, last quarter %.2f), name lookup %.3f ms, delete %.2f ms each%s",
+      label, r.n, short, r.register, r.first, r.last, r.lookup, r.delete,
+      failed > 0 and string.format(" -- %d of %d registers FAILED, timing not valid", failed, n) or "")
   end
-  pass("unnamed", false)
-  pass("named", true)
-  pass("unnamed2", false)
+
+  -- the same shape as a real streamed object: its real fields and position, created through the normal
+  -- create path (which also adds it to the runtime group), under probe names, deleted again
+  local function realPass()
+    local item
+    for _, entry in pairs(live) do
+      if entry.item and entry.shape == shapeName then item = entry.item; break end
+    end
+    if not item then return end
+    local objs, totalMs, regMs, failed = {}, 0, 0, 0
+    for i = 1, count do
+      local a = os.clock()
+      local obj = createStreamedObject(item, "nfsc_probe_real_" .. i)
+      totalMs = totalMs + (os.clock() - a) * 1000
+      if obj then
+        objs[#objs + 1] = obj
+        regMs = regMs + split.registerMs
+      else
+        failed = failed + 1
+      end
+    end
+    for i = 1, #objs do pcall(objs[i].delete, objs[i]) end
+    local n = math.max(1, #objs)
+    local r = { label = "real", n = #objs, register = regMs / n, total = totalMs / math.max(1, count), failed = failed }
+    results[#results + 1] = r
+    local short = shapeName:match("([^/\\\\]+)$") or shapeName
+    logMsg("I", "probe real: %d x %s with its real fields and position: create avg %.2f ms (registerObject %.2f ms)%s",
+      r.n, short, r.total, r.register,
+      failed > 0 and string.format(" -- %d of %d FAILED", failed, count) or "")
+  end
+  if auto then
+    pass("named", true)
+    pass("unnamed", false)
+    realPass()
+  else
+    pass("unnamed", false)
+    pass("named", true)
+    pass("unnamed2", false)
+    realPass()
+  end
   return results
 end
 
@@ -1089,7 +1209,8 @@ function M.getStatus()
     currentSectionName = M.sectionIDToDisplayName(currentSectionID),
     activeSectionCount = active,
     liveObjectCount = liveCount,
-    queuedObjectCount = lqTail - lqHead + 1,
+    queuedObjectCount = (lqTail - lqHead + 1) + (pqTail - pqHead + 1),
+    queuedUrgentCount = pqTail - pqHead + 1, promotedObjectCount = promotedTotal,
     queuedSectionReads = srTail - srHead + 1,
     pendingRecordCount = pendingCount,
     deferredCount = (function()
@@ -1115,7 +1236,8 @@ function M.getStatus()
     changeFirstUse = change.firsts, changeReload = change.reloads, changeWarm = change.warms,
     changeReloadAvgMs = change.reloads > 0 and change.reloadMs / change.reloads or 0,
     changeWarmAvgMs = change.warms > 0 and change.warmMs / change.warms or 0,
-    changeTopShapes = topShapes(5), expectedFirstUseMs = expectedFirstMs(), idleFrameMs = idleFrameMs,
+    changeTopShapes = topShapes(5),
+    changeWarmByDistance = { c1 = change.dist[1], c2 = change.dist[2], c3 = change.dist[3] }, expectedFirstUseMs = expectedFirstMs(), idleFrameMs = idleFrameMs,
     changeNameAvgMs = change.creates > 0 and change.nameMs / change.creates or 0, changeRegisterSlopePer1000 = registerSlopePer1000(),
     changeSplitMs = { createObject = change.objectMs, setField = change.fieldsMs,
                       registerObject = change.registerMs, groupAdd = change.groupMs },
@@ -1136,7 +1258,7 @@ function M.getLoadOrder()
 end
 
 -- true when no section file and no object is waiting to be created (cheap, per-frame safe)
-function M.isIdle() return lqHead > lqTail and srHead > srTail and pendingCount <= 0 end
+function M.isIdle() return lqHead > lqTail and pqHead > pqTail and srHead > srTail and pendingCount <= 0 end
 
 function M.onUpdate(dtReal)
   if not initialized or suspended then return end
@@ -1193,6 +1315,35 @@ function M.onUpdate(dtReal)
           c.liveMin or 0, c.liveMax, c.liveSum / c.creates,
           slope and string.format("%+.2f ms per 1000 live", slope) or "n/a (live count barely changed)",
           idleFrameMs and string.format("%.1f ms (%.0f fps)", idleFrameMs, 1000 / idleFrameMs) or "n/a")
+        local mgr = rawget(_G, "nfsc_sectionManager")
+        local okState, lightsOn, emittersOn = false, nil, nil
+        if mgr and mgr.getSceneClassState then okState, lightsOn, emittersOn = pcall(mgr.getSceneClassState) end
+        local function onOff(v) if not okState or v == nil then return "n/a" end return v and "on" or "off" end
+        local function bucket(b) return string.format("%d x %.2f ms", b.n, b.n > 0 and b.ms / b.n or 0) end
+        logMsg("I", "  warm creates by horizontal distance to the camera: under 100 m %s, 100-300 m %s, over 300 m %s; lights %s, emitters %s",
+          bucket(c.dist[1]), bucket(c.dist[2]), bucket(c.dist[3]), onOff(lightsOn), onOff(emittersOn))
+        if TUNING.probeOnSettle then
+          -- the shape with the most creates in this change: its real average sits next to the probe
+          local bestName, best = nil, nil
+          for name, cost in pairs(c.shapes) do
+            if not best or cost.n > best.n or (cost.n == best.n and name < bestName) then bestName, best = name, cost end
+          end
+          if bestName then
+            local ok, results, why = pcall(runProbe, bestName, TUNING.probeCount, true)
+            if not ok then
+              logMsg("E", "probe after settle failed: %s", tostring(results))
+            elseif not results then
+              logMsg("W", "probe after settle did not run: %s", tostring(why))
+            else
+              local byLabel = {}
+              for _, r in ipairs(results) do byLabel[r.label] = r end
+              local function ms(r) return r and string.format("%.2f ms%s", r.register, (r.failed or 0) > 0 and " (FAILED)" or "") or "n/a" end
+              logMsg("I", "  probe vs real: %s real avg %.2f ms over %d creates in this change (warm avg %.2f ms); probe named %s, unnamed %s, real fields %s",
+                shortShapeName(bestName), best.ms / best.n, best.n, c.warms > 0 and c.warmMs / c.warms or 0,
+                ms(byLabel.named), ms(byLabel.unnamed), ms(byLabel.real))
+            end
+          end
+        end
       end
     end
   end

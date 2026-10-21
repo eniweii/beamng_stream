@@ -70,15 +70,21 @@ local function newObject(class)
   function o:setField(name, idx, value) self.fields[name] = value end
   function o:getID() return self.id end
   function o:registerObject(name)
+    if H.refuseRegister then return false end                      -- test switch: the engine refuses
     if name == "" then byId[self.id] = self; return end            -- anonymous object, as in the engine
     assert(not byName[name], "name already registered: " .. name)
     self.name = name; byName[name] = self; byId[self.id] = self
     H.created[name] = (H.created[name] or 0) + 1
   end
-  function o:addObject(child) self.children[#self.children + 1] = child end
+  function o:addObject(child) self.children[#self.children + 1] = child; child.parent = self end
   function o:delete()
     if self.deleted then return end
     self.deleted = true
+    if self.parent then                                             -- leaves its group, as in the engine
+      for i, c in ipairs(self.parent.children) do
+        if c == self then table.remove(self.parent.children, i); break end
+      end
+    end
     if self.name then byName[self.name] = nil end
     byId[self.id] = nil
     for _, c in ipairs(self.children) do c:delete() end

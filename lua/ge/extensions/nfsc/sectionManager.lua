@@ -494,6 +494,11 @@ function M.getUnknownFlags()
   return out
 end
 
+-- Cheap read of the two scene switches (the streamer's settled log prints them).
+function M.getSceneClassState()
+  return sceneClassOn.lights, sceneClassOn.emitters
+end
+
 function M.getStatus()
   local s = streamer()
   local status = s and s.getStatus() or {}
