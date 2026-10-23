@@ -71,6 +71,11 @@ local function newObject(class)
   function o:getID() return self.id end
   function o:registerObject(name)
     if H.refuseRegister then return false end                      -- test switch: the engine refuses
+    local shape = self.fields.shapeName
+    if H.fsMock and shape and shape:lower():find("%.dae$") then      -- the first use imports the COLLADA and writes the .cdae
+      local cdae = shape:gsub("%.[Dd][Aa][Ee]$", ".cdae")
+      if not H.cdaeFiles[cdae] then H.imported[#H.imported + 1] = shape; H.cdaeFiles[cdae] = true end
+    end
     if name == "" then byId[self.id] = self; return end            -- anonymous object, as in the engine
     assert(not byName[name], "name already registered: " .. name)
     self.name = name; byName[name] = self; byId[self.id] = self
@@ -111,6 +116,10 @@ function H.install(root)
   }
   local mission = newObject("SimGroup"); mission:registerObject("MissionGroup")
   H.reloadCalls = 0
+  -- FS:fileExists mock, off unless a test sets H.fsMock = true (H.preCdae lists paths that already exist)
+  H.cdaeFiles, H.imported = {}, {}
+  for _, path in ipairs(H.preCdae or {}) do H.cdaeFiles[path] = true end
+  FS = H.fsMock and { fileExists = function(_, path) return H.cdaeFiles[path] == true end } or nil
   be = { reloadCollision = function() H.reloadCalls = H.reloadCalls + 1 end }
   core_camera = { getPosition = function() return H.cam end }
   log = function(level, origin, msg) H.logs[#H.logs + 1] = level .. " " .. msg end

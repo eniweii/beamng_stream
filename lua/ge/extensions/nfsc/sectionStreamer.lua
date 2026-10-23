@@ -11,6 +11,7 @@
 -- Files (all under <levelRoot>/):
 --   lua/sections.json                   {sections = {{id, points, boundsMin, boundsMax, related}}}
 --   lua/carbon_stream/index.json        written by the builder (schemaVersion 2)
+--   lua/carbon_stream/shapes.json       written by the builder (schemaVersion 1): unique shapes + per-section lists
 --   lua/carbon_stream/sections/<id>.json  one whole file per section
 --
 -- Events (coarse, via extensions.hook):
@@ -38,6 +39,15 @@
 --
 -- Exported transforms are applied exactly as exported: position, rotationEuler and scale
 -- are written with setField as space-joined text, the same way every other field is.
+--
+-- Shape cache warm-up (idle lane): BeamNG builds <shape>.cdae from the .dae the first time a shape is
+-- used ("Importing COLLADA..."), inside the registerObject call, which cannot be split across frames.
+-- When both queues have been empty for cacheWarmIdleSeconds, the lane takes the shapes of the current and
+-- related sections first, then the rest of shapes.json, skips shapes whose .cdae already exists
+-- (FS:fileExists) and imports the others one at a time, cacheWarmGapSeconds apart: a hidden TSStatic
+-- below the camera, created and deleted in the same call, so it is never drawn and keeps no memory. The
+-- .cdae on disk is the progress record. Without FS:fileExists or shapes.json the lane stays off.
+-- getCacheWarmStatus() feeds a progress display.
 
 local M = {}
 
@@ -56,6 +66,14 @@ local TUNING = {
   probeOnSettle = true,           -- after a section settled with new objects, time a few test registerObject calls and log them
   probeCount = 20,                -- test objects per probe pass when it runs by itself
   skipNameLookup = false,         -- true: name every object "nfsc_<key>" without the scenetree.findObject duplicate check
+  stallLogMs = 100,               -- a single create or cache import slower than this is logged at once (shape, kind)
+  logEmptySettles = false,        -- true: also print the settled line of a change that created nothing
+  cacheWarm = true,               -- idle-time warm-up of the .cdae shape cache (see header)
+  cacheWarmPerFrame = 1,          -- shapes imported per frame; each one is a stall of its own import time
+  cacheWarmGapSeconds = 0.25,     -- pause after every import (0 = back to back, for a loading screen)
+  cacheWarmIdleSeconds = 1.0,     -- both load queues must have been empty this long before the lane starts
+  cacheWarmCheckMs = 1.0,         -- time per frame for skipping shapes that already have a .cdae
+  cacheWarmLogEvery = 100,        -- progress line after this many imports (0 = none)
   maxSectionReadsPerFrame = 1,
   maxQueuedItems = 512,           -- hard cap of the load queue; the rest waits in pending lists
   maxPendingRecords = 8192,       -- do not read another section file while this many records wait
@@ -79,6 +97,7 @@ local TUNING = {
 local SUPPORTED_SCHEMA = 2
 local SECTIONS_JSON = "lua/sections.json"
 local STREAM_INDEX = "lua/carbon_stream/index.json"
+local SHAPES_JSON = "lua/carbon_stream/shapes.json"
 local SKIP_CAP = 4096
 
 local RESERVED = {
@@ -121,7 +140,8 @@ local shapeLive = {}                 -- shape -> number of live instances (0/nil
 local recentFirstMs = nil            -- moving average of the latest first-use creates
 local function newChange()
   return { creates = 0, createMs = 0, firsts = 0, firstMs = 0, repeats = 0, repeatMs = 0, maxMs = 0,
-           objectMs = 0, fieldsMs = 0, registerMs = 0, groupMs = 0, frames = 0, workMs = 0, dtSum = 0, dtMax = 0,
+           objectMs = 0, fieldsMs = 0, registerMs = 0, groupMs = 0, frames = 0, workMs = 0, dtSum = 0, dtMax = 0, workMax = 0,
+           importN = 0, importMs = 0, hitN = 0, hitMs = 0, unkN = 0, unkMs = 0,   -- first use: no .cdae before / .cdae existed / unknown
            deleted = 0, deleteMs = 0, deferredFirst = 0,
            reloads = 0, reloadMs = 0, warms = 0, warmMs = 0, shapes = {},
            dist = { { n = 0, ms = 0 }, { n = 0, ms = 0 }, { n = 0, ms = 0 } }, nameMs = 0, liveSum = 0, liveMin = nil, liveMax = 0, rn = 0, rx = 0, ry = 0, rxx = 0, rxy = 0 }   -- r*: regression sums of registerObject ms over live count   -- shapes: name -> { n, ms, max, first, reload }
@@ -687,6 +707,31 @@ local function processSectionReads()
 end
 
 -- Expected cost of creating the first instance of a shape (real average once there is one).
+local function shortShapeName(name)
+  local base = (name:match("([^/\\]+)$") or name):gsub("%.dae$", "")
+  return base
+end
+
+-- Does the engine already have a .cdae for this shape? true: a load is a cache read; false: the first use
+-- imports the COLLADA and writes the cache; nil: cannot tell (no FS:fileExists, or not a .dae shape).
+local fsUnavailable = false
+local function fileExists(fs, path)
+  local ok, res = pcall(function() return fs:fileExists(path) end)
+  if not ok then return nil end
+  return res and true or false
+end
+local function shapeCached(shape)
+  if fsUnavailable or type(shape) ~= "string" or not shape:lower():find("%.dae$") then return nil end
+  local fs = rawget(_G, "FS")
+  if fs == nil then fsUnavailable = true; return nil end
+  local path = shape:gsub("%.[Dd][Aa][Ee]$", ".cdae")
+  local found = fileExists(fs, path)
+  if found == nil then fsUnavailable = true; return nil end
+  if found then return true end
+  local alt = path:sub(1, 1) == "/" and path:sub(2) or ("/" .. path)          -- with and without the leading slash
+  return fileExists(fs, alt) == true
+end
+
 local function expectedFirstMs()
   return recentFirstMs or TUNING.firstUseGuessMs
 end
@@ -717,9 +762,18 @@ local function processLoads()
       end
       if fromUrgent then priQueue[pqHead] = nil; pqHead = pqHead + 1 else loadQueue[lqHead] = nil; lqHead = lqHead + 1 end
       queuedKeys[key] = nil
+      local firstKind = nil
+      if isFirst then
+        local cached = shapeCached(shape)
+        firstKind = (cached == true and "cached") or (cached == false and "import") or "unknown"
+      end
       local createStart = os.clock()
       local obj, err = createStreamedObject(item)
       local createMs = (os.clock() - createStart) * 1000
+      if createMs >= TUNING.stallLogMs then
+        logMsg("W", "slow create: %s %.0f ms (%s), section %s", shape and shortShapeName(shape) or "?", createMs,
+          isFirst and ("first use, " .. firstKind) or (isWarm and "warm" or "reload"), tostring(currentSectionID))
+      end
       timing.creates, timing.createMs = timing.creates + 1, timing.createMs + createMs
       change.creates, change.createMs = change.creates + 1, change.createMs + createMs
       if createMs > timing.createMax then timing.createMax = createMs end
@@ -736,6 +790,9 @@ local function processLoads()
           recentFirstMs = recentFirstMs and (recentFirstMs * 0.7 + createMs * 0.3) or createMs
           timing.firsts, timing.firstMs = timing.firsts + 1, timing.firstMs + createMs
           change.firsts, change.firstMs = change.firsts + 1, change.firstMs + createMs
+          if firstKind == "import" then change.importN, change.importMs = change.importN + 1, change.importMs + createMs
+          elseif firstKind == "cached" then change.hitN, change.hitMs = change.hitN + 1, change.hitMs + createMs
+          else change.unkN, change.unkMs = change.unkN + 1, change.unkMs + createMs end
         else
           timing.repeats, timing.repeatMs = timing.repeats + 1, timing.repeatMs + createMs
           change.repeats, change.repeatMs = change.repeats + 1, change.repeatMs + createMs
@@ -906,6 +963,153 @@ local function updateCamera(dt)
 end
 
 -- ---------------------------------------------------------------------------
+-- Shape cache warm-up (idle lane, see header)
+-- ---------------------------------------------------------------------------
+local function newWarm()
+  return { loaded = false, names = {}, bySection = {}, total = 0, done = {}, processed = 0,
+           near = {}, nearPos = 1, nearFor = false, cursor = 1, idle = 0, gap = 0,
+           hadCdae = 0, imported = 0, failed = 0, skipped = 0, importMs = 0, importMax = 0, importMaxShape = nil,
+           current = nil, finished = false }
+end
+local warm = newWarm()
+
+local function loadShapeList()
+  warm = newWarm()
+  local data = jsonReadFile(levelRoot .. "/" .. SHAPES_JSON)
+  if type(data) ~= "table" or type(data.shapes) ~= "table" then
+    logMsg("I", "no %s: the shape cache warm-up is off (rebuild with the current builder)", SHAPES_JSON)
+    return
+  end
+  warm.names, warm.total = data.shapes, #data.shapes
+  if type(data.sections) == "table" then
+    for id, list in pairs(data.sections) do
+      local n = tonumber(id)
+      if n and type(list) == "table" then warm.bySection[n] = list end
+    end
+  end
+  warm.loaded = warm.total > 0
+end
+
+-- shapes of the current section and its related sections, in loading order, not done yet
+local function warmRefreshNear()
+  warm.near, warm.nearPos, warm.nearFor = {}, 1, currentSectionID
+  local seen = {}
+  for i = 1, #feedOrder do
+    local list = warm.bySection[feedOrder[i]]
+    if list then
+      for j = 1, #list do
+        local idx = list[j]
+        if not seen[idx] and warm.done[idx] == nil then
+          seen[idx] = true
+          warm.near[#warm.near + 1] = idx
+        end
+      end
+    end
+  end
+end
+
+local function warmNextCandidate()
+  while warm.nearPos <= #warm.near do
+    local idx = warm.near[warm.nearPos]
+    warm.nearPos = warm.nearPos + 1
+    if warm.done[idx] == nil then return idx end
+  end
+  while warm.cursor <= warm.total do
+    local idx = warm.cursor
+    warm.cursor = warm.cursor + 1
+    if warm.done[idx] == nil then return idx end
+  end
+  return nil
+end
+
+local function warmMark(idx, value)
+  warm.done[idx] = value
+  warm.processed = warm.processed + 1
+end
+
+-- Creates one hidden TSStatic of the shape below the camera and deletes it in the same call: the engine
+-- imports the COLLADA and writes the .cdae, nothing is drawn and nothing stays in memory.
+local function warmImport(idx, name)
+  warm.current = name
+  local started = os.clock()
+  local cam = core_camera and core_camera.getPosition and core_camera.getPosition()
+  local pos = cam and string.format("%.3f %.3f %.3f", cam.x, cam.y, cam.z - 800) or "0 0 -800"
+  local ok = false
+  local obj = createObject("TSStatic")
+  if obj then
+    pcall(function() obj.hidden = true end)
+    pcall(obj.setField, obj, "shapeName", 0, name)
+    pcall(obj.setField, obj, "position", 0, pos)
+    pcall(obj.setField, obj, "collisionType", 0, "None")
+    pcall(obj.setField, obj, "decalType", 0, "None")
+    local okc, res = pcall(obj.registerObject, obj, "")
+    ok = okc and res ~= false
+    pcall(obj.delete, obj)
+  end
+  local ms = (os.clock() - started) * 1000
+  if ok then
+    warmMark(idx, true)
+    warm.imported = warm.imported + 1
+    warm.importMs = warm.importMs + ms
+    if ms > warm.importMax then warm.importMax, warm.importMaxShape = ms, name end
+    if TUNING.cacheWarmLogEvery > 0 and warm.imported % TUNING.cacheWarmLogEvery == 0 then
+      logMsg("I", "cache warm: %d of %d shapes done (%d already had a .cdae, %d imported now, %d failed), import avg %.1f ms, max %.0f ms (%s)",
+        warm.processed, warm.total, warm.hadCdae, warm.imported, warm.failed, warm.importMs / warm.imported,
+        warm.importMax, shortShapeName(warm.importMaxShape or "?"))
+    end
+  else
+    warmMark(idx, false)
+    warm.failed = warm.failed + 1
+    if warm.failed <= 10 then logMsg("W", "cache warm: %s could not be created", shortShapeName(name)) end
+  end
+  if ms >= TUNING.stallLogMs then logMsg("W", "slow cache warm import: %s %.0f ms", shortShapeName(name), ms) end
+end
+
+local function cacheWarmUpdate(dt)
+  if not TUNING.cacheWarm or not warm.loaded or warm.finished or suspended or not initialized then return end
+  if not M.isIdle() then warm.idle = 0; return end                -- the section streamer has work: it goes first
+  warm.idle = warm.idle + dt
+  if warm.idle < TUNING.cacheWarmIdleSeconds then return end
+  if warm.gap > 0 then
+    warm.gap = warm.gap - dt
+    if warm.gap > 0 then return end
+  end
+  if warm.nearFor ~= currentSectionID then warmRefreshNear() end
+  local imports, mark = 0, os.clock()
+  while imports < math.max(1, TUNING.cacheWarmPerFrame) do
+    local idx = warmNextCandidate()
+    if not idx then
+      warm.finished, warm.current = true, nil
+      logMsg("I", "cache warm finished: %d shapes (%d already had a .cdae, %d imported now, %d failed, %d skipped), import avg %.1f ms",
+        warm.total, warm.hadCdae, warm.imported, warm.failed, warm.skipped,
+        warm.imported > 0 and warm.importMs / warm.imported or 0)
+      return
+    end
+    local name = warm.names[idx]
+    local cached
+    if seenShapes[name] or shapeLive[name] then cached = true else cached = shapeCached(name) end
+    if cached == nil then
+      if fsUnavailable then
+        warm.loaded = false
+        logMsg("W", "cache warm is off: FS:fileExists is not available here")
+        return
+      end
+      warmMark(idx, false)                                        -- not a .dae shape: nothing to cache
+      warm.skipped = warm.skipped + 1
+    elseif cached then
+      warmMark(idx, true)
+      warm.hadCdae = warm.hadCdae + 1
+    else
+      warmImport(idx, name)
+      imports = imports + 1
+      warm.gap = TUNING.cacheWarmGapSeconds
+      mark = os.clock()
+    end
+    if (os.clock() - mark) * 1000 >= TUNING.cacheWarmCheckMs then break end   -- the time cap is for the skipping
+  end
+end
+
+-- ---------------------------------------------------------------------------
 -- State reset
 -- ---------------------------------------------------------------------------
 local function resetState()
@@ -947,6 +1151,8 @@ function M.initialize(basePath)
     return false, tostring(err)
   end
   initialized = true
+  local okShapes, errShapes = pcall(loadShapeList)
+  if not okShapes then warm = newWarm(); logMsg("W", "shapes.json could not be read: %s", tostring(errShapes)) end
   logMsg("I", "initialized: %d sections, %d with streamed objects", #sectionOrder, (function()
     local n = 0
     for _ in pairs(sectionIndex) do n = n + 1 end
@@ -1071,11 +1277,6 @@ local function topShapes(limit)
   table.sort(list, function(a, b) if a.ms ~= b.ms then return a.ms > b.ms end return a.name < b.name end)
   for i = #list, limit + 1, -1 do list[i] = nil end
   return list
-end
-
-local function shortShapeName(name)
-  local base = (name:match("([^/\\]+)$") or name):gsub("%.dae$", "")
-  return base
 end
 
 -- Controlled measurement of what registerObject costs, run once from the console:
@@ -1232,6 +1433,10 @@ function M.getStatus()
     loadFrameLastMs = timing.frameLast, loadFramePeakMs = timing.framePeak,
     changeCreates = change.creates, changeCreateMs = change.createMs, changeFrames = change.frames,
     changeFps = change.dtSum > 0 and change.frames / change.dtSum or 0, changeWorstFrameMs = change.dtMax * 1000,
+    changeWorkPeakMs = change.workMax,
+    changeFirstUseSplit = { import = { n = change.importN, ms = change.importMs }, cached = { n = change.hitN, ms = change.hitMs },
+                            unknown = { n = change.unkN, ms = change.unkMs } },
+    cacheWarm = M.getCacheWarmStatus(),
     changeDeferredFirstUse = change.deferredFirst,
     changeFirstUse = change.firsts, changeReload = change.reloads, changeWarm = change.warms,
     changeReloadAvgMs = change.reloads > 0 and change.reloadMs / change.reloads or 0,
@@ -1260,6 +1465,30 @@ end
 -- true when no section file and no object is waiting to be created (cheap, per-frame safe)
 function M.isIdle() return lqHead > lqTail and pqHead > pqTail and srHead > srTail and pendingCount <= 0 end
 
+-- Progress of the shape cache warm-up, for a console check or a progress display.
+function M.getCacheWarmStatus()
+  local imported = warm.imported
+  return {
+    enabled = TUNING.cacheWarm, available = warm.loaded, finished = warm.finished,
+    running = TUNING.cacheWarm and warm.loaded and not warm.finished and not suspended and M.isIdle()
+      and warm.idle >= TUNING.cacheWarmIdleSeconds,
+    total = warm.total, processed = warm.processed, remaining = warm.total - warm.processed,
+    alreadyCached = warm.hadCdae, imported = imported, failed = warm.failed, skipped = warm.skipped,
+    importAvgMs = imported > 0 and warm.importMs / imported or 0, importMaxMs = warm.importMax,
+    importMaxShape = warm.importMaxShape, current = warm.current,
+    nearQueued = math.max(0, #warm.near - warm.nearPos + 1),
+  }
+end
+
+function M.setCacheWarm(flag) TUNING.cacheWarm = flag and true or false end
+
+-- Forgets what the lane has checked (after .cdae files were deleted, say) and starts over.
+function M.restartCacheWarm()
+  local names, bySection, total = warm.names, warm.bySection, warm.total
+  warm = newWarm()
+  warm.names, warm.bySection, warm.total, warm.loaded = names, bySection, total, total > 0
+end
+
 function M.onUpdate(dtReal)
   if not initialized or suspended then return end
   totalTime = totalTime + (dtReal or 0)
@@ -1279,28 +1508,36 @@ function M.onUpdate(dtReal)
   processUnloads()                                   -- deletes first, within their share of the frame budget
   processLoads()                                     -- creates use what is left of it
   if not settled then
+    local workMs = (os.clock() - frameStarted) * 1000
     change.frames = change.frames + 1
-    change.workMs = change.workMs + (os.clock() - frameStarted) * 1000
+    change.workMs = change.workMs + workMs
+    if workMs > change.workMax then change.workMax = workMs end
     local dt = dtReal or 0
     change.dtSum = change.dtSum + dt
     if dt > change.dtMax then change.dtMax = dt end
   end
+  cacheWarmUpdate(dtReal or 0)                       -- idle lane: only while nothing is queued
   if not settled and M.isIdle() then
     settled = true
     settleSeconds = totalTime - changeStamp
     if settleSeconds > settlePeak then settlePeak = settleSeconds end
-    if TUNING.logSettle then
+    if TUNING.logSettle and (createdSinceChange > 0 or TUNING.logEmptySettles) then
       local c = change
-      logMsg("I", "section %s settled: %d objects in %.2f s (%.0f/s), %d frames, %.1f fps (worst frame %.0f ms), streaming %.1f ms/frame",
+      logMsg("I", "section %s settled: %d objects in %.2f s (%.0f/s), %d frames, %.1f fps (worst frame %.0f ms), streaming %.1f ms/frame (peak %.0f ms)",
         tostring(currentSectionID), createdSinceChange, settleSeconds,
         settleSeconds > 0 and createdSinceChange / settleSeconds or 0,
-        c.frames, c.dtSum > 0 and c.frames / c.dtSum or 0, c.dtMax * 1000, c.frames > 0 and c.workMs / c.frames or 0)
+        c.frames, c.dtSum > 0 and c.frames / c.dtSum or 0, c.dtMax * 1000, c.frames > 0 and c.workMs / c.frames or 0, c.workMax)
       if c.creates > 0 then
         logMsg("I", "  creates: %.0f ms total, avg %.2f ms, max %.1f ms; first use %d x %.2f ms, reload %d x %.2f ms, warm %d x %.2f ms, new shapes deferred %d times",
           c.createMs, c.createMs / c.creates, c.maxMs,
           c.firsts, c.firsts > 0 and c.firstMs / c.firsts or 0,
           c.reloads, c.reloads > 0 and c.reloadMs / c.reloads or 0,
           c.warms, c.warms > 0 and c.warmMs / c.warms or 0, c.deferredFirst)
+        if c.firsts > 0 then
+          logMsg("I", "  first use split: import (no .cdae yet) %d x %.2f ms, cached (.cdae existed) %d x %.2f ms, unknown %d x %.2f ms",
+            c.importN, c.importN > 0 and c.importMs / c.importN or 0, c.hitN, c.hitN > 0 and c.hitMs / c.hitN or 0,
+            c.unkN, c.unkN > 0 and c.unkMs / c.unkN or 0)
+        end
         local top = topShapes(5)
         for i = 1, #top do
           local t = top[i]

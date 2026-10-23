@@ -1,9 +1,9 @@
-# Handoff: section streamer performance work (patches 0007 - 0012)
+# Handoff: section streamer performance work (patches 0007 - 0014)
 
-State of the repo after patch 0012. Everything below was measured in game by the maintainer
+State of the repo after patch 0014 (0013 only added this document and the lupa runner). Everything below was measured in game by the maintainer
 (free camera, no collision, game locked at 30 fps, Section Manager lights and emitters off).
 Nothing here was run in BeamNG by the assistant; offline it only runs the Lua tests
-(`python tests/run_lua_tests_lupa.py`, 220 passing, needs `pip install lupa`).
+(`python tests/run_lua_tests_lupa.py`, 247 passing, needs `pip install lupa`).
 
 ## How the work is organised
 - Code: `lua/ge/extensions/nfsc/sectionStreamer.lua` (queues, budget, timing, probe) and
@@ -21,6 +21,8 @@ Nothing here was run in BeamNG by the assistant; offline it only runs the Lua te
 | 0010 / b / c | name check timed separately, `scene:` line (live count trend, idle frame), `skipNameLookup`, `probeRegister()` console probe, probe logs every call, probe runs by itself after each settle, refused registers flagged |
 | 0011 | `maxFirstUsePerFrame` default 3, a refused `registerObject` counts as a failure, `probe real` pass (real fields and position), warm creates by camera distance, lights/emitters state in the log, `getTuning()` |
 | 0012 | skip-ahead: urgent queue lane for the camera's section and the streamed one, promotion on section change |
+| 0013 | this handoff document, `tests/run_lua_tests_lupa.py` |
+| 0014 | first use split import / cached / unknown, `stallLogMs` slow-create line, peak frame work, no empty settled blocks, idle `.cdae` cache warm-up lane + builder `shapes.json` |
 
 Defaults now: `frameBudgetMs 16`, `maxCreatesPerFrame 16`, `maxDeletesPerFrame 256`,
 `deleteBudgetShare 0.25`, `maxFirstUsePerFrame 3`, `firstUseGuessMs 6`, `currentSectionFirst true`,
@@ -106,3 +108,36 @@ Verdict: hold off. If frame hitches become the priority, preload only heavy shap
 about 10 ms, taken from the `top N:` lines), one per frame, during idle frames, with a held instance.
 A lookup table of shape names would add little: the section data already lists them, the cost is the
 engine load.
+
+## After 0013: runs with skip-ahead and look-ahead off (daytime, free camera, unlocked to 60 fps)
+- `currentSectionFirst = false`, `predictionEnabled = false` (path prediction is not built yet, it comes
+  with TrackPathZones). Reloads fell from 4-27% of creates to 0-1.5% and empty settles from 5 to 1: the
+  churn came from skip-ahead and the look-ahead.
+- Count caps do not matter. maxCreatesPerFrame 4 / 16 / 256 all give 13-18 ms of streaming per frame and
+  loading frames at 27-35 fps: the 16 ms budget binds, objects per frame follow per-object cost
+  (about 8 in a fast state, about 3 in a slow one). Load rate = budget / per-object cost. Warm creates
+  are 75% of objects and 33-49% of create time (1.6-1.8 ms each in the slow state); first use is the rest.
+- A per-frame fixed cost is ruled out: warm average did not change between about 4 and about 8 creates
+  per frame. `deleteBudgetShare 2.0` is pointless (deletes cost about 0.01 ms each).
+- Worst hitch: `XOU_TOWERCRANEARMA_1A_00.002_anim` first use 4581 ms (the `.006_anim` sibling took 1782 ms,
+  then 356 ms). Pattern fits a `.cdae` build followed by cache reads; not verified. `worst frame` in the
+  settled header did not show it, the peak work per frame (0014) does.
+- Hardware: BeamNG's performance graph flags CPU and GameEngine (the main thread), not the GPU; render
+  scale was already at its minimum; RAM 66% used; during a load the CPU graph goes from about 5-10% to
+  about 50% (helper threads), so total CPU use says nothing about the main-thread limit. The shape load
+  runs synchronously inside `registerObject`. Cause of the fast/slow state is still unknown.
+- Heavy first use after a `.cdae` exists remains (`XBU_*` 30-100 ms, file read and materials).
+
+## 0014 and how to use it
+- Settled blocks: `first use split: import (no .cdae yet) N x ms, cached (.cdae existed) N x ms, unknown ...`
+  tells how much of first use is the COLLADA import. `unknown` means `FS:fileExists` was not usable.
+- `slow create: <shape> <ms> (first use, import|cached|unknown | warm | reload), section <id>` for any single
+  create over `stallLogMs` (100), logged immediately, also when the camera leaves before a settle.
+- Cache warm-up: runs only while both queues are empty. Console: `getCacheWarmStatus()`,
+  `setCacheWarm(false)`, `restartCacheWarm()`. For a fast first run stand still and use
+  `setTuning{cacheWarmGapSeconds=0, cacheWarmPerFrame=4}`; each import is a stall of its own length, so
+  roaming with the defaults (one per 0.25 s) gives a hitch per uncached shape. About 30k unique shapes.
+- Needs the builder output `lua/carbon_stream/shapes.json` (rebuild the pack); without it the lane is off.
+- Unverified in game: that `FS:fileExists` accepts the shape's `.cdae` path, and that BeamNG writes the
+  `.cdae` next to the `.dae` where that call sees it. If the split shows only `unknown` or only `import`
+  after a second session, check this first.

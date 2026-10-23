@@ -23,6 +23,7 @@ from typing import Any, Callable
 
 ITEMS_FILENAME = "items.level.json"
 SCHEMA_VERSION = 2
+SHAPES_SCHEMA_VERSION = 1
 ProgressCallback = Callable[[str], None] | None
 
 # Objects that must never be drawn, matched on the exported object NAME or on the shape file name
@@ -388,6 +389,24 @@ def build_stream_pack(
     }
     atomic_write(runtime_root / "index.json", json.dumps(index, indent=2, ensure_ascii=False) + "\n")
 
+    # shapes.json feeds the runtime's shape cache warm-up (idle lane): every unique shapeName once, most
+    # widely used first, and per section the 1-based positions in that list. Section keys are strings.
+    shape_sections: dict[str, set[int]] = {}
+    for section_id, records in section_objects.items():
+        for record in records:
+            shape_sections.setdefault(str(record["shapeName"]), set()).add(section_id)
+    shape_names = sorted(shape_sections, key=lambda name: (-len(shape_sections[name]), name.lower(), name))
+    shape_position = {name: position for position, name in enumerate(shape_names, 1)}
+    shapes_payload = {
+        "schemaVersion": SHAPES_SCHEMA_VERSION,
+        "shapes": shape_names,
+        "sections": {str(section_id): sorted(shape_position[str(record["shapeName"])] for record in section_objects[section_id])
+                     for section_id in sorted_ids},
+    }
+    for listed in shapes_payload["sections"].values():          # one entry per shape, not per object
+        listed[:] = sorted(set(listed))
+    atomic_write(runtime_root / "shapes.json", json.dumps(shapes_payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+
     stats = {
         **index,
         "inputPath": str(input_path.expanduser().resolve()),
@@ -397,6 +416,7 @@ def build_stream_pack(
         "patchedItemFiles": len(sources),
         "verification": {"ok": True, "files": verification},
         "sectionCount": len(section_objects),
+        "uniqueShapes": len(shape_names),
         "multiSectionRecords": total_section_copies - moved_records,
         "neverRenderedRecords": never_rendered,
         "overrideNames": dict(sorted(override_objects.items())),

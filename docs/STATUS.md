@@ -53,4 +53,8 @@
 - 0012: skip-ahead in the load queue (urgent lane for the camera's section and the streamed one,
   promotion on section change). Neighbour-section terrain no longer goes before the current section's
   rest; `currentSectionFirst = false` restores the old order for comparison.
-
+- 0014: first use split into import (no `.cdae` yet) / cached / unknown, a log line for any single
+  create over `stallLogMs`, peak frame work in the settled header, no settled block for changes that
+  created nothing (`logEmptySettles`), and the idle shape cache warm-up lane (`cacheWarm`, builder
+  writes `shapes.json`). Last streamer patch: what is left is tuning `frameBudgetMs` and the warm-up
+  settings in game.

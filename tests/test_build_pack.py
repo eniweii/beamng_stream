@@ -88,6 +88,22 @@ class SectionGroupingTests(FixtureCase):
         self.assertEqual(index["overrides"],
                          {"0x1111AAAA": [1022], "0x2222BBBB": [1022], "0x454C22D2": [1021]})
 
+    def test_shapes_list_for_the_cache_warm_up(self):
+        self.build()
+        shapes = json.loads((self.out / RUNTIME / "shapes.json").read_text(encoding="utf-8"))
+        self.assertEqual(shapes["schemaVersion"], 1)
+        names = shapes["shapes"]
+        self.assertEqual(len(names), len(set(names)))
+        self.assertEqual(sorted(shapes["sections"]), ["1021", "1022", "1101"])
+        for section_id, positions in shapes["sections"].items():          # 1-based positions, one entry per shape
+            self.assertEqual(positions, sorted(set(positions)))
+            self.assertTrue(all(1 <= p <= len(names) for p in positions))
+        used_in = {name: sum(1 for ps in shapes["sections"].values() if i + 1 in ps) for i, name in enumerate(names)}
+        self.assertEqual([used_in[n] for n in names], sorted(used_in.values(), reverse=True))   # widest use first
+        report = json.loads((self.out / "build_report.json").read_text(encoding="utf-8")) if (self.out / "build_report.json").exists() else {}
+        if report:
+            self.assertEqual(report.get("uniqueShapes"), len(names))
+
 
 class MultiSectionTests(FixtureCase):
     def test_multi_section_object_shares_one_key(self):

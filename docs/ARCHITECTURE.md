@@ -168,6 +168,18 @@ position and scale line.
   registration (found by name, or a non-zero id) before trusting their timing. Settled blocks gain a
   line with warm creates by horizontal distance to the camera (under 100 m, 100-300 m, over 300 m) and
   the Section Manager's lights/emitters switches. `getTuning()` returns a copy of the tuning values.
+- Shape cache warm-up (0014, `cacheWarm`, default on): BeamNG builds `<shape>.cdae` from the `.dae`
+  inside the first `registerObject` of a shape ("Importing COLLADA..."), a stall that cannot be sliced.
+  When both load queues have been empty for `cacheWarmIdleSeconds`, an idle lane walks the shapes of
+  `shapes.json` (builder output: every unique shape once, widest use first, plus per-section position
+  lists): the current and related sections first, then the rest. A shape that is live, already used
+  this session or has a `.cdae` (`FS:fileExists`, with and without the leading slash) is skipped; the
+  others get one hidden TSStatic below the camera that is created and deleted in the same call, so
+  nothing is drawn and no instance is kept. One import per frame, `cacheWarmGapSeconds` apart
+  (0 for a loading screen). The `.cdae` on disk is the progress record. Without `FS:fileExists` or
+  `shapes.json` the lane stays off. `getCacheWarmStatus()` returns totals for a progress display,
+  `setCacheWarm(flag)` and `restartCacheWarm()` control it. First use in the settled block is split by
+  whether the `.cdae` existed before the create, and any create over `stallLogMs` is logged at once.
 - Skip ahead (0012, `currentSectionFirst`, default on): the load queue has an urgent lane. Objects
   of the section the camera is in and of the section the streamer currently loads for (they differ
   while the look-ahead is ahead of the camera) are fed into `priQueue` and created before anything in

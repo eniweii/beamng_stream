@@ -756,5 +756,108 @@ do
   eq(s.getStatus().liveObjectCount, 10, "everything arrives in the end (1022 also brings the 1101 rock)")
 end
 
+-- 27. patch 0014: first use split into import / cached / unknown, stall log, empty settles, cache warm-up lane
+local MESH = "/levels/nfsc/assets/meshes/"
+local function logHas(text)
+  for _, line in ipairs(H.logs) do if line:find(text, 1, true) then return true end end
+  return false
+end
+local function logCount(text)
+  local n = 0
+  for _, line in ipairs(H.logs) do if line:find(text, 1, true) then n = n + 1 end end
+  return n
+end
+do
+  -- with FS:fileExists the first use is told apart: one shape already has its .cdae, the others get imported
+  H.fsMock, H.preCdae = true, { MESH .. "XTU_TREESPINGA_1A_00.cdae" }
+  local s = fresh({ cacheWarm = false })
+  settle(s, 40)
+  local sp = s.getStatus().changeFirstUseSplit
+  eq(sp.cached.n, 1, "27a: one first use found its .cdae")
+  check(sp.import.n >= 1 and sp.unknown.n == 0, "27a: the rest are imports, nothing unknown")
+  check(logHas("first use split: import (no .cdae yet)"), "27a: the settled block prints the split")
+  check(s.getStatus().changeWorkPeakMs >= 0, "27a: the peak frame work is reported")
+  check(logHas("(peak "), "27a: the settled header carries the peak")
+  -- a shape that was imported earlier in the session counts as cached when it is used for real
+  H.fsMock, H.preCdae = false, nil
+  local s2 = fresh({ cacheWarm = false })
+  settle(s2, 40)
+  local sp2 = s2.getStatus().changeFirstUseSplit
+  check(sp2.unknown.n >= 1 and sp2.import.n == 0 and sp2.cached.n == 0, "27b: without FS:fileExists every first use is 'unknown'")
+end
+do
+  -- a single create over stallLogMs is logged at once with its kind
+  local s = fresh({ cacheWarm = false, stallLogMs = 0 })
+  settle(s, 40)
+  check(logHas("slow create: "), "27c: slow create line")
+  check(logHas("first use, unknown"), "27c: ... with the first use kind")
+  H.logs = {}
+  local quiet = fresh({ cacheWarm = false })
+  settle(quiet, 40)
+  check(not logHas("slow create: "), "27c: nothing is logged below stallLogMs")
+end
+do
+  -- a change that created nothing prints no settled block unless asked to
+  local function run(tuning)
+    local s = fresh(tuning)
+    settle(s, 40)
+    local before = logCount("settled:")
+    H.cam = { x = 3950, y = -310, z = 0 }              -- into 1022: its objects load, then the camera goes back
+    settle(s, 40)
+    H.cam = { x = 3950, y = -200, z = 0 }
+    settle(s, 40)
+    return before, logCount("settled:"), s
+  end
+  local before, after = run({ cacheWarm = false, unloadCooldown = 1000 })
+  eq(after - before, 1, "27d: only the change that created objects prints a block")
+  local before2, after2 = run({ cacheWarm = false, unloadCooldown = 1000, logEmptySettles = true })
+  eq(after2 - before2, 2, "27d: logEmptySettles brings the empty one back")
+end
+do
+  -- the warm-up lane walks every shape once: used ones and ones with a .cdae are skipped, the rest imported
+  H.fsMock, H.preCdae = true, { MESH .. "XTU_TREESPINGA_1A_00.cdae" }
+  local baseline = fresh({ cacheWarm = false })       -- (every fresh() reinstalls the mock, so the comparison run goes first)
+  settle(baseline, 80)
+  local liveWithout = baseline.getStatus().liveObjectCount
+  local s = fresh({ cacheWarmIdleSeconds = 0, cacheWarmGapSeconds = 0, cacheWarmPerFrame = 1, maxCreatesPerFrame = 1, frameBudgetMs = 1000 })
+  H.tick(s, 3, 0.1)
+  eq(s.getCacheWarmStatus().imported, 0, "27e: the lane waits while the load queues have work")
+  settle(s, 80)
+  local w = s.getCacheWarmStatus()
+  check(w.available and w.finished, "27e: the lane finished")
+  eq(w.total, 9, "27e: all unique shapes of shapes.json")
+  eq(w.processed, 9, "27e: every shape was looked at once")
+  eq(w.failed, 0, "27e: no failures")
+  eq(w.imported + w.alreadyCached + w.skipped, 9, "27e: imported + already cached + skipped covers everything")
+  check(w.imported >= 1, "27e: shapes nobody used yet were imported (" .. w.imported .. ")")
+  check(#H.imported >= w.imported, "27e: the engine wrote their .cdae")
+  eq(s.getStatus().liveObjectCount, liveWithout, "27e: the warm-up objects are gone again, only the streamed ones are live")
+  check(logHas("cache warm finished"), "27e: finish line")
+  -- the same shapes are not imported twice
+  local importedNow = w.imported
+  settle(s, 40)
+  eq(s.getCacheWarmStatus().imported, importedNow, "27e: a finished lane does nothing more")
+  H.fsMock, H.preCdae = false, nil
+end
+do
+  -- no FS:fileExists: the lane stays off instead of importing blindly
+  local s = fresh({ cacheWarmIdleSeconds = 0, cacheWarmGapSeconds = 0 })
+  settle(s, 60)
+  local w = s.getCacheWarmStatus()
+  check(not w.available and w.imported == 0, "27f: the lane switched itself off")
+  check(logHas("FS:fileExists is not available"), "27f: and says why")
+  -- switched off by tuning: nothing happens either
+  H.fsMock = true
+  local off = fresh({ cacheWarm = false, cacheWarmIdleSeconds = 0, cacheWarmGapSeconds = 0 })
+  settle(off, 60)
+  eq(off.getCacheWarmStatus().imported, 0, "27f: cacheWarm = false keeps the lane idle")
+  off.setCacheWarm(true)
+  settle(off, 60)
+  check(off.getCacheWarmStatus().finished, "27f: setCacheWarm(true) starts it")
+  off.restartCacheWarm()
+  check(not off.getCacheWarmStatus().finished and off.getCacheWarmStatus().processed == 0, "27f: restartCacheWarm starts over")
+  H.fsMock = false
+end
+
 print(string.format("%d passed, %d failed", passed, failed))
 os.exit(failed == 0 and 0 or 1)
