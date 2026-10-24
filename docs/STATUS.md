@@ -58,3 +58,31 @@
   created nothing (`logEmptySettles`), and the idle shape cache warm-up lane (`cacheWarm`, builder
   writes `shapes.json`). Last streamer patch: what is left is tuning `frameBudgetMs` and the warm-up
   settings in game.
+- 0015: creation methods. `creationMode = "current"` (create and delete every object, unchanged) or
+  `"shells"`: a released object is parked (tiny `shellShape`, hidden, free list) and the next load
+  fills a parked shell in (shapeName, all item fields, one `postApply`, unhide; fields the previous item
+  set and the new one lacks go back to the engine default). With no parked shell left the object is
+  created the current way and joins the pool when released. `shellTarget` builds parked shells ahead in
+  the background (only while the urgent queue is empty). Switch in the manager panel or with
+  `setCreationMode`. Probe results (console probe, not in the repo): a registered TSStatic needs a
+  shape (empty ones are refused); retarget of a parked shell about 0.005-0.04 ms against 0.5 ms (idle)
+  to 2.6 ms (spread over frames) for a fresh create; 20000 hidden shells cost about 1.7-2.5 ms per
+  frame in one idle sample, so keep `shellTarget` near the real peak of live objects. Not validated in
+  a long drive: compare the two modes on the same camera track (settled log has a `shells:` line).
+  Level asset: `examples/NFSC_DOT.dae` goes to `levels/nfsc/Assets/Meshes/`.
+- 0016: third creation method `"resident"` (shells plus a resting state, like the game's LOADED section): an
+  unwanted object is deactivated at once (hidden, still bound to its key with shape and fields, no field
+  writes), wanting it again revives it (unhide only), and only when the pool is at `residentMax` the oldest
+  resting object is evicted and its shell reused; `residentReserve` keeps free shells ready by evicting in idle
+  frames. Live tuning: sliders and checkboxes in the manager panel (applied at once through `setTuning`),
+  presets (`startup`, A, B, C) saved in `lua/carbon_stream/tuning_presets.json` (`startup` is applied at
+  initialize), `resetTuning`, `printTuning`. Dropped sections: a section change that happens before the
+  previous one settled is logged (`dropped section <id>: left after ...`), counted in the panel and in
+  `getStatus` (`droppedSections`, `droppedObjects`, `droppedLast`). Not validated in game. Still pending:
+  the camera track and the comparison of the three modes (see HANDOFF_STREAMER_PERF.md, "Next conversation").
+- 0016b: fix for 0016. `sectionStreamer.lua` did not load in the game ("function at line 1420 has more than
+  60 upvalues": LuaJIT's limit, `resetState` had 68). The pool, resting and dropped-section state is now reset in
+  its own function (`resetPoolState`, resetState is at 52). The tests now run under LuaJIT 2.1 by default
+  (`tests/run_lua_tests_lupa.py`, `--lua54` for the other one), a Python test compiles every Lua file under
+  LuaJIT, and a Lua test fails when any function gets above 56 upvalues. New module-level state belongs in a
+  table or in a helper function, not in more locals read by the big functions.

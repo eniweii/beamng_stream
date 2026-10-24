@@ -29,5 +29,26 @@ class LuaModuleTests(unittest.TestCase):
             self.assertIn("0 failed", result.stdout)
 
 
+try:
+    from lupa.luajit21 import LuaRuntime as _LuaJit
+except ImportError:  # lupa missing or built without LuaJIT
+    _LuaJit = None
+
+
+@unittest.skipUnless(_LuaJit, "lupa with LuaJIT is not installed (pip install lupa)")
+class LuaJitCompileTests(unittest.TestCase):
+    """BeamNG runs LuaJIT: it refuses a function with more than 60 upvalues and has other limits newer Lua
+    versions do not have, so a file that loads under Lua 5.4 can still fail in the game."""
+
+    def test_every_lua_file_compiles_under_luajit(self):
+        lua = _LuaJit(unpack_returned_tuples=True)
+        compile_lua = lua.eval("function(src, name) local fn, err = loadstring(src, name) return fn, err end")
+        files = sorted((REPO / "lua").rglob("*.lua"))
+        self.assertTrue(files)
+        for path in files:
+            fn, err = compile_lua(path.read_text(encoding="utf-8"), "@" + path.relative_to(REPO).as_posix())
+            self.assertIsNotNone(fn, "%s does not load in LuaJIT: %s" % (path.name, err))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

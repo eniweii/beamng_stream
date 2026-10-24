@@ -859,5 +859,381 @@ do
   H.fsMock = false
 end
 
+-- 28. patch 0015: shell pool (creationMode = "shells") ---------------------------------------------
+do
+  local DOT = "/levels/nfsc/Assets/Meshes/NFSC_DOT.dae"
+  local s = fresh({ creationMode = "shells" })
+  local made = {}
+  s.addListener({ onObjectCreated = function(self, key, obj, item) made[item.name] = { key = key, obj = obj, item = item } end })
+  settle(s, 5)
+  local st = s.getStatus()
+  eq(st.creationMode, "shells", "28a: mode is shells")
+  check(st.shellPoolActive, "28a: pool active")
+  eq(st.liveObjectCount, 9, "28a: same objects as the current way")
+  eq(st.shellsFresh, 9, "28a: empty pool: every object is created the current way")
+  eq(st.shellsRecycled, 0, "28a: nothing recycled yet")
+  local gate = made["XWS_BARRIERCHGATE_1A_00_016"]
+  check(gate and gate.obj.name:find("^nfsc_shell_"), "28a: pooled objects are named nfsc_shell_<n>")
+  check(gate.obj.fields.sectionOverrideName ~= nil and gate.obj.fields.instanceFlags ~= nil, "28a: the gate carries override and flags")
+
+  -- 28b: released objects are parked, not deleted
+  s.releaseObject(gate.key, gate.item)
+  settle(s, 40)
+  st = s.getStatus()
+  eq(st.liveObjectCount, 8, "28b: the gate left the live set")
+  eq(st.shellsFree, 1, "28b: and sits in the pool")
+  eq(st.shellsParked, 1, "28b: parked once")
+  check(not gate.obj.deleted and H.byName(gate.obj.name) == gate.obj, "28b: the engine object still exists")
+  eq(gate.obj.fields.shapeName, DOT, "28b: a parked shell shows the dot shape")
+  eq(gate.obj.hidden, true, "28b: and is hidden")
+  check((gate.obj.postApplied or 0) >= 1, "28b: postApply was called")
+  eq(st.deletedTotal, 1, "28b: counted as a release")
+
+  -- 28c: the next load takes the parked shell and fills it in; stale fields go back to the default
+  H.cam = { x = 4100, y = -320, z = 0 }
+  H.tick(s, 3, 0.1)
+  local rock = made["XTU_ROCK_1A_00_002"]
+  check(rock ~= nil, "28c: the rock was created")
+  check(rock.obj == gate.obj, "28c: it reuses the parked gate shell")
+  st = s.getStatus()
+  eq(st.shellsRecycled, 1, "28c: one recycle")
+  eq(st.shellsFree, 0, "28c: pool empty again")
+  eq(rock.obj.fields.shapeName, rock.item.shapeName, "28c: shapeName of the new item")
+  eq(rock.obj.fields.scale, "1.5 1.5 1.5", "28c: scale of the new item")
+  eq(rock.obj.fields.sectionOverrideName, "", "28c: the gate's override name is cleared (engine default)")
+  eq(rock.obj.fields.instanceFlags, "", "28c: and its flags")
+  eq(rock.obj.fields.isRenderEnabled, "1", "28c: isRenderEnabled stays as exported")
+  eq(rock.obj.fields.collisionType, "None", "28c: collision forced off again")
+  eq(rock.obj.hidden, false, "28c: shown")
+
+  -- 28d: leaving 1021 parks its objects; coming back reuses them, the group does not grow
+  settle(s, 40)
+  st = s.getStatus()
+  eq(st.liveObjectCount, 4, "28d: pole + 1022's two + rock")
+  eq(st.shellsFree, 5, "28d: the other five are parked")
+  local group = H.byName("NFSC_StreamedScenery")
+  eq(#group.children, 9, "28d: nothing was deleted, nothing added")
+  H.cam = { x = 3950, y = -200, z = 0 }
+  settle(s, 40)
+  st = s.getStatus()
+  eq(st.liveObjectCount, 9, "28d: back in 1021 everything is live again")
+  eq(st.shellsRecycled, 6, "28d: five more recycles")
+  eq(st.shellsFresh, 10, "28d: one fresh create for the gate (nine plus one)")
+  check(#group.children >= st.shellPeakLive and #group.children <= st.createdTotal, "28d: group size follows the peak, not the traffic")
+  eq(st.failureCount, 0, "28d: no failures")
+  check(st.shellRecycleAvgMs >= 0 and st.shellParkAvgMs >= 0, "28d: timing counters exist")
+end
+do
+  -- 28e: shells are built ahead up to the target, a few per frame, only while nothing urgent waits
+  local s = fresh({ creationMode = "shells", shellTarget = 20, shellBuildPerFrame = 4, maxCreatesPerFrame = 2 })
+  H.tick(s, 1, 0.1)
+  check(s.getStatus().queuedUrgentCount > 0, "28e: the current section is still loading")
+  eq(s.getStatus().shellsBuilt, 0, "28e: no shell is built while urgent objects wait")
+  settle(s, 60)
+  local st = s.getStatus()
+  eq(st.liveObjectCount, 9, "28e: all objects arrived")
+  eq(st.shellsFree + st.liveObjectCount, 20, "28e: free + live reaches the target exactly")
+  eq(st.shellsBuilt + st.shellsFresh, 20, "28e: every pooled object was built ahead or created fresh")
+  check(st.shellsBuilt >= 11, "28e: at least the eleven spare ones were built ahead")
+  local group = H.byName("NFSC_StreamedScenery")
+  eq(#group.children, 20, "28e: all of them live in the runtime group")
+  local hiddenDots = 0
+  for _, o in ipairs(group.children) do
+    if o.hidden and o.fields.shapeName == "/levels/nfsc/Assets/Meshes/NFSC_DOT.dae" then hiddenDots = hiddenDots + 1 end
+  end
+  eq(hiddenDots, st.shellsFree, "28e: the free ones are hidden dots")
+  eq(s.buildShells(3), 3, "28e: buildShells(n) builds at once")
+  eq(s.getStatus().shellsFree, st.shellsFree + 3, "28e: and they are free")
+  local freshBefore, recycledBefore = s.getStatus().shellsFresh, s.getStatus().shellsRecycled
+  -- the next section change needs no fresh create for its first objects
+  H.cam = { x = 4100, y = -320, z = 0 }
+  H.tick(s, 3, 0.1)
+  eq(s.getStatus().shellsFresh, freshBefore, "28e: a build-ahead pool means no fresh create")
+  eq(s.getStatus().shellsRecycled, recycledBefore + 1, "28e: the rock took a built shell")
+end
+do
+  -- 28f: switching modes and the shell shape check
+  H.fsMock = true
+  local s = fresh({ creationMode = "current" })
+  settle(s, 5)
+  local ok, why = s.setCreationMode("shells")
+  check(not ok and why == "shellShape not found", "28f: refused while FS says the shell shape is missing")
+  eq(s.getCreationMode(), "current", "28f: mode unchanged")
+  check(select(1, s.setCreationMode("bogus")) == false, "28f: unknown mode refused")
+  H.cdaeFiles["/levels/nfsc/Assets/Meshes/NFSC_DOT.dae"] = true            -- the mock's FS:fileExists now finds it
+  ok = s.setCreationMode("shells")
+  check(ok and s.getCreationMode() == "shells", "28f: accepted once the shape exists")
+  eq(s.buildShells(4), 4, "28f: four shells")
+  eq(s.getStatus().shellsFree, 4, "28f: pool has four")
+  check(s.setCreationMode("current"), "28f: back to current")
+  eq(s.getStatus().shellsFree, 0, "28f: parked shells are deleted when leaving shells mode")
+  eq(#H.byName("NFSC_StreamedScenery").children, 9, "28f: only the nine live objects remain in the group")
+  H.fsMock = false
+  -- configured as shells from the start with a missing shape: falls back to the current way and says so
+  H.fsMock = true
+  local t = fresh({ creationMode = "shells" })
+  settle(t, 5)
+  eq(t.getStatus().liveObjectCount, 9, "28f: the missing shape does not stop streaming")
+  check(not t.getStatus().shellPoolActive, "28f: the pool switched itself off")
+  check(t.getStatus().failureCount >= 1, "28f: and recorded why")
+  H.fsMock = false
+end
+do
+  -- 28g: building stops after repeated failures, streaming goes on, reset empties the pool
+  local s = fresh({ creationMode = "shells" })
+  settle(s, 5)
+  H.refuseRegister = true
+  s.setTuning({ shellTarget = 50 })
+  settle(s, 10)
+  H.refuseRegister = false
+  local st = s.getStatus()
+  eq(st.shellsBuilt, 0, "28g: nothing was built")
+  eq(st.failureCount, 1, "28g: one failure line, not one per frame")
+  eq(st.liveObjectCount, 9, "28g: the live objects are untouched")
+  s.buildShells(2)
+  eq(s.getStatus().shellsFree, 2, "28g: manual building still works")
+  s.setTuning({ shellTarget = 0 })
+  s.reset()
+  st = s.getStatus()
+  eq(st.shellsFree, 0, "28g: reset empties the pool")
+  eq(st.shellsRecycled + st.shellsFresh + st.shellsParked, 0, "28g: and the counters")
+  settle(s, 5)
+  eq(s.getStatus().liveObjectCount, 9, "28g: reset streams everything again")
+end
+
+-- 29. patch 0016: resident mode ----------------------------------------------------------------------
+do
+  local DOT = "/levels/nfsc/Assets/Meshes/NFSC_DOT.dae"
+  local s = fresh({ creationMode = "resident" })
+  local made = {}
+  s.addListener({ onObjectCreated = function(self, key, obj, item) made[item.name] = { key = key, obj = obj, item = item } end })
+  settle(s, 5)
+  local st = s.getStatus()
+  check(st.residentActive and st.shellPoolActive, "29a: resident mode is active")
+  eq(st.liveObjectCount, 9, "29a: same objects as the other modes")
+  eq(st.shellsFresh, 9, "29a: the pool starts empty")
+  H.cam = { x = 4100, y = -320, z = 0 }
+  settle(s, 5)
+  st = s.getStatus()
+  eq(st.liveObjectCount, 4, "29b: pole + 1022's two + rock")
+  eq(st.residentDormant, 6, "29b: the six objects of 1021 rest, no cooldown")
+  eq(st.residentDeactivated, 6, "29b: six deactivations")
+  eq(st.shellsParked, 0, "29b: nothing is parked on the dot")
+  eq(st.shellsFree, 0, "29b: and no shell was released")
+  local group = H.byName("NFSC_StreamedScenery")
+  eq(#group.children, 10, "29b: nine plus the rock, nothing deleted")
+  local gate = made["XWS_BARRIERCHGATE_1A_00_016"]
+  check(gate.obj.hidden == true and not gate.obj.deleted, "29b: a resting object is hidden and still there")
+  eq(gate.obj.fields.shapeName, gate.item.shapeName, "29b: it keeps its shape")
+  eq(gate.obj.postApplied or 0, 0, "29b: no field writes happened")
+  -- the resting objects without an override (the manager does not hide those)
+  local resting = {}
+  for name, m in pairs(made) do
+    if m.obj.hidden and m.item.sectionOverrideName == nil then resting[#resting + 1] = { name = name, obj = m.obj, applied = m.obj.postApplied or 0 } end
+  end
+  check(#resting >= 4, "29b: at least four resting objects without an override")
+  local freshBefore = st.shellsFresh
+  H.cam = { x = 3950, y = -200, z = 0 }
+  settle(s, 5)
+  st = s.getStatus()
+  eq(st.liveObjectCount, 9, "29c: back in 1021")
+  eq(st.residentRevived, 6, "29c: the six come back by revive")
+  eq(st.shellsFresh, freshBefore, "29c: no fresh create")
+  eq(st.shellsRecycled, 0, "29c: and no recycle")
+  local allBack = true
+  for _, r in ipairs(resting) do
+    if r.obj.hidden or (r.obj.postApplied or 0) ~= r.applied or made[r.name].obj ~= r.obj then allBack = false end
+  end
+  check(allBack, "29c: same objects, shown, no field writes")
+  eq(st.residentDormant, 1, "29c: the rock rests now")
+  check(st.residentReviveAvgMs >= 0, "29c: revive timing exists")
+  eq(st.failureCount, 0, "29c: no failures")
+
+  -- 29d: leaving resident mode
+  H.cam = { x = 4100, y = -320, z = 0 }
+  settle(s, 5)
+  eq(s.getStatus().residentDormant, 6, "29d: six rest again")
+  check(s.setCreationMode("shells"), "29d: switch to shells")
+  st = s.getStatus()
+  eq(st.residentDormant, 0, "29d: nobody rests in shells mode")
+  eq(st.shellsFree, 6, "29d: the six are parked shells now")
+  eq(gate.obj.fields.shapeName, DOT, "29d: on the dot")
+  check(s.setCreationMode("resident"), "29d: and back")
+  H.cam = { x = 3950, y = -200, z = 0 }
+  settle(s, 5)
+  eq(s.getStatus().liveObjectCount, 9, "29d: everything live again")
+  H.cam = { x = 4100, y = -320, z = 0 }
+  settle(s, 5)
+  check(s.setCreationMode("current"), "29d: switch to current")
+  eq(s.getStatus().shellsFree, 0, "29d: pool is empty")
+  eq(#H.byName("NFSC_StreamedScenery").children, s.getStatus().liveObjectCount, "29d: only live objects remain")
+end
+do
+  -- 29e: the pool cap evicts the oldest resting object; the group never outgrows it
+  local s = fresh({ creationMode = "resident", residentMax = 9 })
+  settle(s, 5)
+  H.cam = { x = 4100, y = -320, z = 0 }
+  settle(s, 5)
+  local st = s.getStatus()
+  eq(st.liveObjectCount, 4, "29e: rock side")
+  check(st.residentEvicted >= 1, "29e: the rock took an evicted shell")
+  eq(st.shellsFresh, 9, "29e: no tenth object was created")
+  eq(#H.byName("NFSC_StreamedScenery").children, 9, "29e: the group stays at the cap")
+  H.cam = { x = 3950, y = -200, z = 0 }
+  settle(s, 10)
+  st = s.getStatus()
+  eq(st.liveObjectCount, 9, "29e: everything is back, evicted ones were refilled")
+  check(#H.byName("NFSC_StreamedScenery").children <= 10, "29e: the group is still at the cap (the rock may need one more)")
+  eq(st.failureCount, 0, "29e: no failures")
+end
+do
+  -- 29f: the free reserve is kept by evicting in idle frames
+  local s = fresh({ creationMode = "resident", residentMax = 9, residentReserve = 3 })
+  settle(s, 5)
+  H.cam = { x = 4100, y = -320, z = 0 }
+  settle(s, 10)
+  local st = s.getStatus()
+  check(st.shellsFree >= 3, "29f: at least three shells are free")
+  eq(st.liveObjectCount, 4, "29f: live objects unchanged")
+  check(st.poolTotal <= 9, "29f: pool at the cap")
+end
+
+-- 30. patch 0016: live tuning and presets ------------------------------------------------------------
+do
+  H.files = {}
+  local s = fresh()
+  local defaults = s.getDefaultTuning()
+  eq(defaults.maxCreatesPerFrame, 16, "30a: defaults are available")
+  s.setTuning({ maxCreatesPerFrame = 3, frameBudgetMs = 7.5 })
+  check(s.savePreset("A"), "30b: save a preset")
+  check(not s.savePreset(""), "30b: an empty name is refused")
+  eq(table.concat(s.listPresets(), ","), "A", "30b: listed")
+  s.setTuning({ maxCreatesPerFrame = 9 })
+  check(s.loadPreset("A"), "30c: load it")
+  eq(s.getTuning().maxCreatesPerFrame, 3, "30c: values applied")
+  eq(s.getTuning().frameBudgetMs, 7.5, "30c: all of them")
+  check(not s.loadPreset("nope"), "30c: unknown preset")
+  s.resetTuning()
+  eq(s.getTuning().maxCreatesPerFrame, 16, "30d: reset restores the defaults")
+  eq(s.getTuning().frameBudgetMs, 16.0, "30d: all of them")
+  -- values of the wrong type or unknown keys are ignored
+  H.files["levels/nfsc/lua/carbon_stream/tuning_presets.json"].bad = { maxCreatesPerFrame = "many", nonsense = 5, logSettle = false }
+  check(s.loadPreset("bad"), "30e: a damaged preset still loads")
+  eq(s.getTuning().maxCreatesPerFrame, 16, "30e: wrong type ignored")
+  eq(s.getTuning().logSettle, false, "30e: valid key applied")
+  check(s.deletePreset("bad") and s.deletePreset("A"), "30f: delete")
+  eq(#s.listPresets(), 0, "30f: none left")
+  -- a preset named startup (with a creation mode) is applied at initialize
+  s.setCreationMode("resident")
+  s.setTuning({ residentMax = 1234 })
+  s.savePreset("startup")
+  local t = fresh()
+  eq(t.getCreationMode(), "resident", "30g: startup preset sets the creation mode")
+  eq(t.getTuning().residentMax, 1234, "30g: and the values")
+  H.logs = {}
+  t.printTuning()
+  local printed = false
+  for _, line in ipairs(H.logs) do if line:find("residentMax = 1234", 1, true) then printed = true end end
+  check(printed, "30h: printTuning lists the values")
+  H.files = {}
+end
+
+-- 31. patch 0016: dropped sections -------------------------------------------------------------------
+do
+  local s = fresh({ maxCreatesPerFrame = 1 })
+  H.logs = {}
+  H.tick(s, 2, 0.1)
+  H.cam = { x = 4100, y = -320, z = 0 }
+  H.tick(s, 3, 0.1)
+  local st = s.getStatus()
+  eq(st.droppedSections, 1, "31a: leaving before the load settled counts as a dropped section")
+  check(st.droppedLast and st.droppedLast.queued + st.droppedLast.waiting + st.droppedLast.reads > 0, "31a: it knows what was missing")
+  local logged = false
+  for _, line in ipairs(H.logs) do if line:find("dropped section", 1, true) then logged = true end end
+  check(logged, "31a: and logs it")
+  s.setTuning({ maxCreatesPerFrame = 16 })
+  settle(s, 20)
+  H.cam = { x = 3950, y = -200, z = 0 }
+  settle(s, 20)
+  H.cam = { x = 4100, y = -320, z = 0 }
+  settle(s, 20)
+  eq(s.getStatus().droppedSections, 1, "31b: sections that settled are not dropped")
+  s.reset()
+  eq(s.getStatus().droppedSections, 0, "31c: reset clears the counter")
+end
+
+-- 32. patch 0016: panel smoke test (mock imgui) ------------------------------------------------------
+do
+  local s, m = fresh()
+  settle(s, 5)
+  local texts, clicks, sliders = {}, {}, {}
+  local function ptr(v) return { [0] = v } end
+  local im
+  im = setmetatable({
+    BoolPtr = ptr, IntPtr = ptr, FloatPtr = ptr,
+    Begin = function() return true end,
+    Text = function(t) texts[#texts + 1] = t end,
+    TextDisabled = function(t) texts[#texts + 1] = t end,
+    CollapsingHeader1 = function() return true end,
+    TreeNode1 = function() return true end,
+    RadioButton1 = function(label) return clicks[label] == true end,
+    Button = function(label) return clicks[label] == true end,
+    SliderInt = function(label, p) if sliders[label] then p[0] = sliders[label]; return true end return false end,
+    SliderFloat = function(label, p) if sliders[label] then p[0] = sliders[label]; return true end return false end,
+    Checkbox = function(label, p) if sliders[label] ~= nil then p[0] = sliders[label]; return true end return false end,
+  }, { __index = function() return function() return false end end })
+  ui_imgui = im
+  local ui = H.load(repo .. "/lua/ge/extensions/nfsc/sectionManagerUi.lua")
+  clicks["Resident##creation"] = true
+  sliders["Max creates per frame##tmaxCreatesPerFrame"] = 5
+  sliders["Look-ahead##tpredictionEnabled"] = false
+  clicks["Save##pA"] = true
+  ui.onUpdate()
+  clicks, sliders = {}, {}
+  check(ui ~= nil, "32a: the panel loads")
+  eq(s.getCreationMode(), "resident", "32b: the radio switches the creation mode")
+  eq(s.getTuning().maxCreatesPerFrame, 5, "32c: a slider changes the tuning at once")
+  eq(s.getTuning().predictionEnabled, false, "32c: so does a checkbox")
+  eq(table.concat(s.listPresets(), ","), "A", "32d: the save button saves a preset")
+  texts = {}
+  ui.onUpdate()                                  -- the next frame shows the new mode
+  local sawDropped, sawPool = false, false
+  for _, t in ipairs(texts) do
+    if t:find("Dropped sections: 0", 1, true) then sawDropped = true end
+    if t:find("Pool: ", 1, true) then sawPool = true end
+  end
+  check(sawDropped and sawPool, "32e: the panel shows the dropped counter and the pool line")
+  clicks["Reset to defaults"] = true
+  ui.onUpdate()
+  clicks = {}
+  eq(s.getTuning().maxCreatesPerFrame, 16, "32f: reset to defaults")
+  eq(s.getCreationMode(), "current", "32f: including the creation mode")
+  ui_imgui = nil
+  H.files = {}
+end
+
+-- 33. LuaJIT: no function may get near the 60 upvalue limit ------------------------------------------
+-- BeamNG runs LuaJIT, which refuses to load a file with a function that has more than 60 upvalues (a local
+-- that a function reads or assigns counts). Lua 5.4 allows 255, so only a LuaJIT run can show it.
+if jit then
+  local fresh_s = fresh()
+  local seen, worst, worstName = {}, 0, ""
+  local function walk(f, name)
+    if seen[f] then return end
+    seen[f] = true
+    local info = debug.getinfo(f, "uS")
+    if info.nups > worst then worst, worstName = info.nups, name .. " (line " .. tostring(info.linedefined) .. ")" end
+    local i = 1
+    while true do
+      local n, v = debug.getupvalue(f, i)
+      if not n then break end
+      if type(v) == "function" then walk(v, n) end
+      i = i + 1
+    end
+  end
+  for k, v in pairs(nfsc_sectionStreamer) do if type(v) == "function" then walk(v, k) end end
+  check(worst <= 56, "33: a function has " .. worst .. " upvalues, the LuaJIT limit is 60: " .. worstName)
+end
+
 print(string.format("%d passed, %d failed", passed, failed))
 os.exit(failed == 0 and 0 or 1)

@@ -68,6 +68,11 @@ local function newObject(class)
   local o = { class = class, fields = {}, id = nextId, deleted = false, hidden = false, children = {} }
   nextId = nextId + 1
   function o:setField(name, idx, value) self.fields[name] = value end
+  function o:getField(name, idx)                                      -- engine defaults for what nobody set
+    if self.fields[name] ~= nil then return self.fields[name] end
+    return H.fieldDefaults[name] or ""
+  end
+  function o:postApply() self.postApplied = (self.postApplied or 0) + 1 end
   function o:getID() return self.id end
   function o:registerObject(name)
     if H.refuseRegister then return false end                      -- test switch: the engine refuses
@@ -100,6 +105,9 @@ local function newObject(class)
   return o
 end
 
+H.files = {}                                  -- path -> table, what jsonWriteFile saved (kept across install)
+H.fieldDefaults = { isRenderEnabled = "1", scale = "1 1 1", collisionType = "Visible Mesh", decalType = "Collision Mesh" }
+
 function H.install(root)
   for k in pairs(byName) do byName[k] = nil end
   for k in pairs(byId) do byId[k] = nil end
@@ -124,7 +132,9 @@ function H.install(root)
   core_camera = { getPosition = function() return H.cam end }
   log = function(level, origin, msg) H.logs[#H.logs + 1] = level .. " " .. msg end
   H.readFilter = nil
+  jsonWriteFile = function(path, data) H.files[path] = data; return true end
   jsonReadFile = function(path)
+    if H.files[path] ~= nil then return H.files[path] end
     if H.readFilter then
       local replaced = H.readFilter(path)
       if replaced ~= nil then return replaced or nil end

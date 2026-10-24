@@ -78,6 +78,55 @@ flowchart LR
 - It reads `instanceFlags` only to order loading (terrain first). It never decides what exists from
   flags or overrides: that is the manager's create filter.
 
+### Creation methods (0015)
+- `TUNING.creationMode`: `"current"` creates every object and deletes it on release. `"shells"` never
+  deletes: `deleteLive` parks the object (`shapeName` = `shellShape`, `postApply`, hidden, id on a free
+  list) and `createStreamedObject` takes a parked shell (`acquireShell`) before creating anything.
+  `setCreationMode(mode)` switches at runtime (`"shells"` is refused when `FS:fileExists` says the shell
+  shape is missing; leaving it deletes the parked shells). The pool is the objects the streamer made;
+  they are named `nfsc_shell_<n>` in shells mode, nothing looks them up by name (everything is keyed by
+  section ID).
+- Filling a shell: `shapeName`, every item field (as in a fresh create), fields the previous item set
+  and this one does not are reset to the engine default (read once from an untouched scratch object),
+  collision forced off again, one `postApply`, `hidden = false`; the manager then applies its own
+  visibility. `shellFields[id]` remembers the field names per object.
+- Build-ahead: `shellTarget > 0` tops the pool up (free + live) at `shellBuildPerFrame` /
+  `shellBuildBudgetMs` per frame, only while the urgent queue is empty; three failures in a row stop it
+  and are logged once. `buildShells(n)` builds n at once; `clearShellPool()` deletes the parked ones.
+- A TSStatic cannot be registered without a shape (probe: refused), which is why parked shells show a tiny
+  shape. Every registered object costs a little per frame even when hidden (about 0.1 us each in the
+  probe), so size the pool to the peak of live objects, not to the level.
+- Not changed: queue order, budgets, cooldown, probes (named probe objects always take the plain path),
+  the cache warm-up lane, collision policy.
+
+### Resident mode, live tuning, dropped sections (0016)
+- `creationMode = "resident"` uses the shell pool and adds a resting state. `deleteLive` deactivates instead of
+  parking: the object is hidden, kept in `dormant[key]` (id, shape, stamp) and in an oldest-first queue; the
+  manager is told `onObjectDeleted` as before, so it never touches a resting object. `createStreamedObject`
+  revives a resting object of the same key first (unhide, nothing else; `registerLive` and `onObjectCreated`
+  then run as for any create). A resting object keeps its shape counted in `shapeLive`, so its reload is
+  classified warm. Eviction (`evictOldest`) moves the oldest resting shells to the free list as they are
+  (hidden, old shape, `shellFields` kept for the stale-field reset); it runs when a load finds no free shell and
+  `liveCount + dormantCount + free >= residentMax`, and in idle frames (`residentTrim`) to keep
+  `residentReserve` shells free. `residentCooldown` (default 0) replaces `unloadCooldown` in this mode.
+  Leaving the mode parks (to "shells") or deletes (to "current") the resting objects.
+- Tuning API: `getTuning`, `getDefaultTuning`, `setTuning`, `resetTuning`, `savePreset/loadPreset/deletePreset/
+  listPresets` (file `lua/carbon_stream/tuning_presets.json`, wrong types and unknown keys are ignored),
+  `printTuning` (values as Lua lines in the log). A preset called `startup` is applied at initialize.
+  The panel (`nfsc_sectionManagerUi`) has a collapsible Tuning section built from a table of rows; if an imgui
+  call is missing in the engine the section turns itself off with one log line.
+- Dropped sections: `setCurrentSection` checks `settled` before it starts the next change; if the previous
+  change had not settled it counts a dropped section and logs what was still missing (queued objects, waiting
+  records, section reads, objects created, seconds in the section).
+
+### LuaJIT limits
+- BeamNG runs LuaJIT: a function may have at most 60 upvalues (every outer local it reads or assigns counts)
+  and a file at most 200 locals per function. `resetState` (52), `getStatus` (44), `setCurrentSection` (35),
+  `processLoads` (34) and `onUpdate` (33) are the biggest. Add state as fields of an existing table or reset it
+  in a small helper (see `resetPoolState`). Tests: `python tests/run_lua_tests_lupa.py` (LuaJIT 2.1 through
+  lupa), `python -m unittest discover -s tests` (compiles every Lua file under LuaJIT), test 33 in
+  `test_sections.lua` (headroom).
+
 ## Manager (`nfsc_sectionManager`) and panel (`nfsc_sectionManagerUi`)
 - Listens to the streamer. For every created object with a `sectionOverrideName` it applies the
   current override state before the first render, so nothing pops in and then hides.
@@ -191,4 +240,3 @@ position and scale line.
   terrain no longer precedes the current section's other objects. `getStatus()` has
   `queuedUrgentCount` and `promotedObjectCount`; a section change that promoted objects logs
   `moved ahead of the leftovers`.
-

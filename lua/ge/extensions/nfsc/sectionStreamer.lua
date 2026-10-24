@@ -48,6 +48,26 @@
 -- below the camera, created and deleted in the same call, so it is never drawn and keeps no memory. The
 -- .cdae on disk is the progress record. Without FS:fileExists or shapes.json the lane stays off.
 -- getCacheWarmStatus() feeds a progress display.
+--
+-- Creation methods (TUNING.creationMode, switch at runtime with M.setCreationMode):
+--   "current": every streamed object is created with createObject/registerObject and deleted again.
+--   "shells":  objects are never deleted. A released object is PARKED: it gets the tiny shellShape, is hidden and
+--              goes to a free list (a TSStatic cannot be registered without a shape). A load takes a parked
+--              shell and fills it in: shapeName, every item field, one postApply, unhide. Fields the previous
+--              item set and the new one does not are put back to the engine default, so nothing leaks between
+--              items. With no parked shell left the object is created the current way and joins the pool when
+--              it is released. TUNING.shellTarget > 0 builds parked shells ahead, in the background, while the
+--              urgent queue is empty. Objects are named nfsc_shell_<n>; everything is keyed by section ID.
+--   "resident": shells, plus a resting state like the game's LOADED section. An object nobody wants any more is
+--              DEACTIVATED at once (residentCooldown, default 0): hidden, still bound to its key with its shape and
+--              fields, no field writes. Wanting it again REVIVES it: unhide, nothing else. Only when a load needs a
+--              shell and the pool is at TUNING.residentMax the oldest deactivated object is EVICTED and its shell
+--              reused (the way the game frees the oldest LOADED section). residentReserve keeps that many shells
+--              free ahead of time, evicting in idle frames. The cap bounds RAM; nothing else grows with the level.
+--
+-- Tuning: M.getTuning / setTuning / resetTuning change the values live; savePreset / loadPreset / listPresets /
+-- deletePreset keep named sets in lua/carbon_stream/tuning_presets.json (a preset called "startup" is applied
+-- at initialize). The manager panel has sliders for the common ones.
 
 local M = {}
 
@@ -92,12 +112,25 @@ local TUNING = {
   selectionInterval = 0.05,       -- seconds between section lookups
   priorityRefreshInterval = 0.5,  -- seconds between load-order refreshes
   logSettle = true,               -- one log line when the load of a section change has finished
+  creationMode = "current",       -- "current", "shells" or "resident" (see header); M.setCreationMode(mode) switches it
+  residentMax = 6000,             -- resident mode: pool size (live + deactivated + free) before the oldest deactivated one is evicted
+  residentReserve = 0,            -- resident mode: free shells kept ready by evicting in idle frames (0 = evict only when a load needs one)
+  residentCooldown = 0.0,         -- resident mode: seconds before an unwanted object is deactivated (it is cheap, so 0)
+  shellShape = "/levels/nfsc/Assets/Meshes/NFSC_DOT.dae",  -- shape of a parked shell (tiny, never drawn: parked shells are hidden)
+  shellTarget = 0,                -- keep at least this many shells (free + in use); built ahead in the background. 0 = off
+  shellBuildPerFrame = 8,         -- shells built ahead per frame ...
+  shellBuildBudgetMs = 2.0,       -- ... and at most this many ms of it
 }
+
+local TUNING_DEFAULTS = {}
+for k, v in pairs(TUNING) do TUNING_DEFAULTS[k] = v end
+local readPresets                      -- defined with the tuning API further down
 
 local SUPPORTED_SCHEMA = 2
 local SECTIONS_JSON = "lua/sections.json"
 local STREAM_INDEX = "lua/carbon_stream/index.json"
 local SHAPES_JSON = "lua/carbon_stream/shapes.json"
+local PRESETS_JSON = "lua/carbon_stream/tuning_presets.json"
 local SKIP_CAP = 4096
 
 local RESERVED = {
@@ -142,7 +175,7 @@ local function newChange()
   return { creates = 0, createMs = 0, firsts = 0, firstMs = 0, repeats = 0, repeatMs = 0, maxMs = 0,
            objectMs = 0, fieldsMs = 0, registerMs = 0, groupMs = 0, frames = 0, workMs = 0, dtSum = 0, dtMax = 0, workMax = 0,
            importN = 0, importMs = 0, hitN = 0, hitMs = 0, unkN = 0, unkMs = 0,   -- first use: no .cdae before / .cdae existed / unknown
-           deleted = 0, deleteMs = 0, deferredFirst = 0,
+           deleted = 0, deleteMs = 0, deferredFirst = 0, shellRecycles = 0, shellRecycleMs = 0, shellFresh = 0, shellParks = 0, shellParkMs = 0, residentRevives = 0, residentReviveMs = 0, residentDeacts = 0, residentEvicts = 0,
            reloads = 0, reloadMs = 0, warms = 0, warmMs = 0, shapes = {},
            dist = { { n = 0, ms = 0 }, { n = 0, ms = 0 }, { n = 0, ms = 0 } }, nameMs = 0, liveSum = 0, liveMin = nil, liveMax = 0, rn = 0, rx = 0, ry = 0, rxx = 0, rxy = 0 }   -- r*: regression sums of registerObject ms over live count   -- shapes: name -> { n, ms, max, first, reload }
 end
@@ -155,6 +188,14 @@ local createdTotal, deletedTotal, failureCount, verified = 0, 0, 0, 0
 local failures = {}
 local listeners = {}
 local runtimeGroup = nil
+local shellFree, shellFreeN = {}, 0      -- object ids of parked shells, last in first out
+local shellFields = {}                   -- object id -> set of field names its current item applied
+local shellDefaults, shellScratch = {}, nil   -- field name -> engine default text (read once from an untouched object)
+local droppedSections, droppedObjects, droppedLast = 0, 0, nil   -- sections entered but left before their load settled
+local shellSerial, shellBuildFails, shellBuildOff = 0, 0, false
+local dormant, dormantOrder, doHead, doTail, dormantCount, dormantSerial = {}, {}, 1, 0, 0, 0   -- resident mode: key -> { id, shape, stamp }, oldest first
+local shellStats = { built = 0, buildMs = 0, recycled = 0, recycleMs = 0, fresh = 0, parked = 0, parkMs = 0, peakLive = 0,
+                     revived = 0, reviveMs = 0, deactivated = 0, evicted = 0 }
 local scratch = { x = 0, y = 0 }
 local aheadPoint = { x = 0, y = 0 }
 
@@ -332,6 +373,7 @@ local function destroyRuntimeGroup()
   local g = scenetree.findObject(TUNING.runtimeGroupName)
   if g then pcall(g.delete, g) end
   runtimeGroup = nil
+  if shellScratch then pcall(shellScratch.delete, shellScratch); shellScratch = nil end
 end
 
 local function fieldText(value)
@@ -374,9 +416,247 @@ local function runtimeName(item, key)
   return wanted
 end
 
+-- ---------------------------------------------------------------------------
+-- Shell pool (creationMode = "shells", see header)
+-- ---------------------------------------------------------------------------
+local shellChecked, shellDisabled = false, false
+
+-- true only when FS:fileExists is available and says the shell shape is not there
+local function shellShapeMissing()
+  local fs = rawget(_G, "FS")
+  if not fs then return false end
+  local path = TUNING.shellShape
+  local alt = path:sub(1, 1) == "/" and path:sub(2) or ("/" .. path)
+  local ok1, a = pcall(function() return fs:fileExists(path) end)
+  local ok2, b = pcall(function() return fs:fileExists(alt) end)
+  if not ok1 and not ok2 then return false end
+  return not ((ok1 and a) or (ok2 and b))
+end
+
+local function shellMode()           -- true in "shells" and "resident": objects come from and go back to the pool
+  if (TUNING.creationMode ~= "shells" and TUNING.creationMode ~= "resident") or shellDisabled then return false end
+  if not shellChecked then
+    shellChecked = true
+    if shellShapeMissing() then
+      shellDisabled = true
+      recordFailure("shell pool off, creating the current way: shellShape not found: " .. tostring(TUNING.shellShape))
+      return false
+    end
+  end
+  return true
+end
+
+local function residentMode()
+  return TUNING.creationMode == "resident" and shellMode()
+end
+
+local function poolTotal() return liveCount + dormantCount + shellFreeN end
+
+local function shellName()
+  shellSerial = shellSerial + 1
+  return "nfsc_shell_" .. shellSerial
+end
+
+-- The engine default of a field as text, read once from an object nobody has set anything on.
+local function shellDefault(field)
+  local d = shellDefaults[field]
+  if d ~= nil then return d end
+  if not shellScratch then shellScratch = createObject("TSStatic") end
+  local text = ""
+  if shellScratch then
+    local ok, v = pcall(shellScratch.getField, shellScratch, field, 0)
+    if ok and v ~= nil then text = tostring(v) end
+  end
+  shellDefaults[field] = text
+  return text
+end
+
+local function forceNoCollision(obj)
+  if TUNING.forceCollisionNone then
+    pcall(obj.setField, obj, "collisionType", 0, "None")
+    pcall(obj.setField, obj, "decalType", 0, "None")
+  end
+end
+
+-- Takes a parked shell and fills it in from item. Returns the object, or nil when no parked shell is left.
+local function acquireShell(item)
+  while shellFreeN > 0 do
+    local id = shellFree[shellFreeN]
+    shellFree[shellFreeN] = nil
+    shellFreeN = shellFreeN - 1
+    local obj = scenetree.findObjectById(id)
+    if obj then
+      local last, applied = shellFields[id], {}
+      pcall(obj.setField, obj, "shapeName", 0, item.shapeName)
+      for field, value in pairs(item) do
+        if field ~= "shapeName" and not RESERVED[field] then
+          local text = fieldText(value)
+          if text ~= nil then
+            pcall(obj.setField, obj, field, 0, text)
+            applied[field] = true
+          end
+        end
+      end
+      if last then                                   -- what the previous item set and this one does not
+        for field in pairs(last) do
+          if not applied[field] then pcall(obj.setField, obj, field, 0, shellDefault(field)) end
+        end
+      end
+      shellFields[id] = applied
+      forceNoCollision(obj)
+      pcall(obj.postApply, obj)
+      pcall(function() obj.hidden = false end)
+      return obj
+    end
+    shellFields[id] = nil                            -- the engine lost it (level change, manual delete)
+  end
+  return nil
+end
+
+-- Releases an object to the pool instead of deleting it. false: the object is already gone.
+local function parkShell(id)
+  local obj = scenetree.findObjectById(id)
+  if not obj then shellFields[id] = nil; return false end
+  pcall(function() obj.hidden = true end)
+  pcall(obj.setField, obj, "shapeName", 0, TUNING.shellShape)
+  pcall(obj.postApply, obj)
+  shellFreeN = shellFreeN + 1
+  shellFree[shellFreeN] = id
+  return true
+end
+
+-- One new parked shell. Returns true, or false and the reason.
+local function buildShell()
+  local obj = createObject("TSStatic")
+  if not obj then return false, "createObject(TSStatic) returned nil" end
+  pcall(obj.setField, obj, "shapeName", 0, TUNING.shellShape)
+  forceNoCollision(obj)
+  pcall(function() obj.hidden = true end)
+  local ok, err = pcall(obj.registerObject, obj, shellName())
+  if ok and err == false then ok, err = false, "the engine refused it (returned false)" end
+  if not ok then
+    pcall(obj.delete, obj)
+    return false, tostring(err)
+  end
+  local okId, id = pcall(obj.getID, obj)
+  if not okId or not id or not scenetree.findObjectById(id) then return false, "the object is not alive after registerObject" end
+  local group = ensureRuntimeGroup()
+  pcall(group.addObject, group, obj)
+  shellFreeN = shellFreeN + 1
+  shellFree[shellFreeN] = id
+  shellStats.built = shellStats.built + 1
+  return true
+end
+
+-- Resident mode: the resting state ------------------------------------------------------------------------
+-- Deactivate: hide, keep key, shape and fields. Returns false when the engine object is gone.
+local function deactivateDormant(key, entry)
+  local obj = scenetree.findObjectById(entry.id)
+  if not obj then shellFields[entry.id] = nil; return false end
+  pcall(function() obj.hidden = true end)
+  dormantSerial = dormantSerial + 1
+  dormant[key] = { id = entry.id, shape = entry.shape, stamp = dormantSerial }
+  doTail = doTail + 1
+  dormantOrder[doTail] = { key = key, stamp = dormantSerial }
+  dormantCount = dormantCount + 1
+  if entry.shape then shapeLive[entry.shape] = (shapeLive[entry.shape] or 0) + 1 end   -- the shape stays loaded
+  shellStats.deactivated = shellStats.deactivated + 1
+  change.residentDeacts = change.residentDeacts + 1
+  return true
+end
+
+local function forgetDormantShape(d)
+  if d.shape and shapeLive[d.shape] then
+    local left = shapeLive[d.shape] - 1
+    shapeLive[d.shape] = left > 0 and left or nil
+  end
+end
+
+-- Revive: the object of this item's key, shown again as it was. nil when there is none.
+local function reviveDormant(item)
+  local key = item.__streamKey
+  local d = key and dormant[key]
+  if not d then return nil end
+  dormant[key] = nil
+  dormantCount = dormantCount - 1
+  forgetDormantShape(d)                                  -- registerLive counts it again
+  local obj = scenetree.findObjectById(d.id)
+  if not obj then shellFields[d.id] = nil; return nil end
+  pcall(function() obj.hidden = false end)
+  return obj
+end
+
+-- Evicts the n oldest deactivated objects: their shells go to the free list as they are (hidden, old shape).
+local function evictOldest(n)
+  local done = 0
+  while done < n and doHead <= doTail do
+    local q = dormantOrder[doHead]
+    dormantOrder[doHead] = nil
+    doHead = doHead + 1
+    local d = q and dormant[q.key]
+    if d and d.stamp == q.stamp then                     -- skip entries that were revived meanwhile
+      dormant[q.key] = nil
+      dormantCount = dormantCount - 1
+      forgetDormantShape(d)
+      shellFreeN = shellFreeN + 1
+      shellFree[shellFreeN] = d.id
+      shellStats.evicted = shellStats.evicted + 1
+      change.residentEvicts = change.residentEvicts + 1
+      done = done + 1
+    end
+  end
+  if doHead > doTail then dormantOrder, doHead, doTail = {}, 1, 0 end
+  return done
+end
+
+-- Every deactivated object back to the pool (mode switch): parked on the dot, or deleted.
+local function releaseDormant(deleteThem)
+  local n = 0
+  for key, d in pairs(dormant) do
+    forgetDormantShape(d)
+    if deleteThem then
+      local obj = scenetree.findObjectById(d.id)
+      if obj then pcall(obj.delete, obj) end
+      shellFields[d.id] = nil
+    else
+      parkShell(d.id)
+    end
+    dormant[key] = nil
+    n = n + 1
+  end
+  dormantOrder, doHead, doTail, dormantCount = {}, 1, 0, 0
+  return n
+end
+
 local function createStreamedObject(item, nameOverride)
   local shape = item.shapeName
   if type(shape) ~= "string" or shape == "" then return nil, "missing shapeName" end
+  local pooled = nameOverride == nil and shellMode()      -- probe objects (named) always take the plain path
+  if pooled then
+    local ta = os.clock()
+    if residentMode() then
+      local back = reviveDormant(item)
+      if back then
+        local ms = (os.clock() - ta) * 1000
+        split.objectMs, split.fieldsMs, split.registerMs, split.groupMs, split.nameMs, split.live = 0, 0, 0, 0, 0, liveCount
+        shellStats.revived, shellStats.reviveMs = shellStats.revived + 1, shellStats.reviveMs + ms
+        change.residentRevives, change.residentReviveMs = change.residentRevives + 1, change.residentReviveMs + ms
+        return back
+      end
+      if shellFreeN == 0 and dormantCount > 0 and poolTotal() >= TUNING.residentMax then evictOldest(1) end
+    end
+    local shell = acquireShell(item)
+    if shell then
+      local ms = (os.clock() - ta) * 1000
+      split.objectMs, split.fieldsMs, split.registerMs, split.groupMs, split.nameMs, split.live = 0, ms, 0, 0, 0, liveCount
+      shellStats.recycled, shellStats.recycleMs = shellStats.recycled + 1, shellStats.recycleMs + ms
+      change.shellRecycles, change.shellRecycleMs = change.shellRecycles + 1, change.shellRecycleMs + ms
+      return shell
+    end
+    shellStats.fresh = shellStats.fresh + 1                  -- no parked shell left: the current way, the object joins the pool later
+    change.shellFresh = change.shellFresh + 1
+  end
+  local applied = pooled and {} or nil
   local t0 = os.clock()
   local obj = createObject("TSStatic")
   if not obj then return nil, "createObject(TSStatic) returned nil" end
@@ -385,7 +665,10 @@ local function createStreamedObject(item, nameOverride)
   for field, value in pairs(item) do
     if field ~= "shapeName" and not RESERVED[field] then
       local text = fieldText(value)
-      if text ~= nil then pcall(obj.setField, obj, field, 0, text) end
+      if text ~= nil then
+        pcall(obj.setField, obj, field, 0, text)
+        if applied then applied[field] = true end
+      end
     end
   end
   if TUNING.forceCollisionNone then
@@ -393,7 +676,7 @@ local function createStreamedObject(item, nameOverride)
     pcall(obj.setField, obj, "decalType", 0, "None")
   end
   local t2 = os.clock()
-  local wantedName = nameOverride or runtimeName(item, item.__streamKey or "x")
+  local wantedName = nameOverride or (pooled and shellName() or runtimeName(item, item.__streamKey or "x"))
   local tn = os.clock()
   local ok, err = pcall(obj.registerObject, obj, wantedName)
   if ok and err == false then ok, err = false, "the engine refused it (returned false)" end
@@ -405,6 +688,7 @@ local function createStreamedObject(item, nameOverride)
   local group = ensureRuntimeGroup()
   pcall(group.addObject, group, obj)
   local t4 = os.clock()
+  if applied then shellFields[obj:getID()] = applied end
   split.objectMs, split.fieldsMs, split.registerMs, split.groupMs =
     (t1 - t0) * 1000, (t2 - t1) * 1000, (t3 - tn) * 1000, (t4 - t3) * 1000
   split.nameMs, split.live = (tn - t2) * 1000, liveCount
@@ -425,6 +709,7 @@ local function registerLive(key, obj, item)
   local ids = itemSections(item)
   live[key] = { id = obj:getID(), sections = ids, shape = item.shapeName, item = item }
   liveCount = liveCount + 1
+  if liveCount > shellStats.peakLive then shellStats.peakLive = liveCount end
   if item.shapeName then shapeLive[item.shapeName] = (shapeLive[item.shapeName] or 0) + 1 end
   for i = 1, #ids do
     local bucket = liveBySection[ids[i]]
@@ -453,9 +738,19 @@ local function deleteLive(key)
   local entry = unregisterLive(key)
   if not entry then return end
   notify("onObjectDeleted", key)
+  deletedTotal = deletedTotal + 1
+  if residentMode() and deactivateDormant(key, entry) then return end
+  if shellMode() then
+    local ta = os.clock()
+    if parkShell(entry.id) then
+      local ms = (os.clock() - ta) * 1000
+      shellStats.parked, shellStats.parkMs = shellStats.parked + 1, shellStats.parkMs + ms
+      change.shellParks, change.shellParkMs = change.shellParks + 1, change.shellParkMs + ms
+      return
+    end
+  end
   local obj = scenetree.findObjectById(entry.id)
   if obj then pcall(obj.delete, obj) end
-  deletedTotal = deletedTotal + 1
 end
 
 -- ---------------------------------------------------------------------------
@@ -852,7 +1147,7 @@ local function processUnloads()
     elseif not live[key] then
       pendingUnload[key] = nil
       unloadQueue[uqHead] = nil; uqHead = uqHead + 1
-    elseif totalTime - entry.stamp >= TUNING.unloadCooldown then
+    elseif totalTime - entry.stamp >= (residentMode() and TUNING.residentCooldown or TUNING.unloadCooldown) then
       pendingUnload[key] = nil
       unloadQueue[uqHead] = nil; uqHead = uqHead + 1
       deleteLive(key)
@@ -894,6 +1189,16 @@ local function setCurrentSection(newID)
         for key in pairs(bucket) do pendingUnload[key] = nil end   -- came back within the cooldown
       end
     end
+  end
+  if not settled and oldID ~= nil then                             -- the camera left before the last change finished loading
+    local waiting = (pqTail - pqHead + 1) + (lqTail - lqHead + 1)
+    local reads = srTail - srHead + 1
+    droppedSections = droppedSections + 1
+    droppedObjects = droppedObjects + waiting + pendingCount
+    droppedLast = { section = oldID, after = totalTime - changeStamp, created = createdSinceChange,
+                    queued = waiting, waiting = pendingCount, reads = reads, to = newID }
+    logMsg("W", "dropped section %s: left after %.2f s with %d objects created, %d queued and %d waiting records not loaded (%d section reads pending), going to %s",
+      tostring(oldID), totalTime - changeStamp, createdSinceChange, waiting, pendingCount, reads, tostring(newID))
   end
   local promoted = purgeQueue()                                    -- nothing stale waits behind new work
   if promoted and promoted > 0 and TUNING.logSettle then
@@ -1112,6 +1417,16 @@ end
 -- ---------------------------------------------------------------------------
 -- State reset
 -- ---------------------------------------------------------------------------
+-- The pool, resting and dropped-section state. Its own function: LuaJIT allows 60 upvalues per function and
+-- resetState is already near that.
+local function resetPoolState()
+  shellFree, shellFreeN, shellFields = {}, 0, {}
+  shellChecked, shellDisabled, shellBuildFails, shellBuildOff = false, false, 0, false
+  dormant, dormantOrder, doHead, doTail, dormantCount = {}, {}, 1, 0, 0
+  droppedSections, droppedObjects, droppedLast = 0, 0, nil
+  for k in pairs(shellStats) do shellStats[k] = 0 end
+end
+
 local function resetState()
   currentSectionID, activeSet = nil, {}
   sectionRead, sectionReading = {}, {}
@@ -1130,6 +1445,7 @@ local function resetState()
   seenShapes, shapeLive, recentFirstMs, idleFrameMs = {}, {}, nil, nil
   change, frameDeleteMs = newChange(), 0
   changeStamp, createdSinceChange, settled, settleSeconds, settlePeak = 0, 0, true, 0, 0
+  resetPoolState()                                             -- the runtime group (and its shells) was deleted before this
 end
 
 -- ---------------------------------------------------------------------------
@@ -1151,6 +1467,7 @@ function M.initialize(basePath)
     return false, tostring(err)
   end
   initialized = true
+  if readPresets().startup then M.loadPreset("startup") end
   local okShapes, errShapes = pcall(loadShapeList)
   if not okShapes then warm = newWarm(); logMsg("W", "shapes.json could not be read: %s", tostring(errShapes)) end
   logMsg("I", "initialized: %d sections, %d with streamed objects", #sectionOrder, (function()
@@ -1208,6 +1525,54 @@ function M.releaseObject(key, item)
   end
 end
 
+-- "current": create and delete every object. "shells": recycle parked shells. "resident": shells plus a resting
+-- state (see header). Switching to "current" deletes the pool; leaving "resident" parks (or deletes) the
+-- deactivated objects; objects already live are handled the way the new mode handles them.
+function M.setCreationMode(mode)
+  if mode ~= "current" and mode ~= "shells" and mode ~= "resident" then return false, "unknown creation mode: " .. tostring(mode) end
+  if mode ~= "current" and shellShapeMissing() then
+    recordFailure("shell pool not started: shellShape not found: " .. tostring(TUNING.shellShape))
+    return false, "shellShape not found"
+  end
+  local old = TUNING.creationMode
+  TUNING.creationMode = mode
+  shellChecked, shellDisabled, shellBuildFails, shellBuildOff = false, false, 0, false
+  if old == "resident" and mode ~= "resident" then releaseDormant(mode == "current") end
+  if mode == "current" then M.clearShellPool() end
+  logMsg("I", "creation mode: %s", mode)
+  return true
+end
+
+function M.getCreationMode() return TUNING.creationMode end
+
+-- Deletes every parked shell; returns how many.
+function M.clearShellPool()
+  local n = 0
+  for i = shellFreeN, 1, -1 do
+    local id = shellFree[i]
+    local obj = scenetree.findObjectById(id)
+    if obj then pcall(obj.delete, obj) end
+    shellFields[id] = nil
+    shellFree[i] = nil
+    n = n + 1
+  end
+  shellFreeN = 0
+  return n
+end
+
+-- Builds n parked shells at once (for tests and loading screens); returns how many were built.
+function M.buildShells(n)
+  local built = 0
+  local started = os.clock()
+  for _ = 1, n or 0 do
+    local ok, err = buildShell()
+    if not ok then recordFailure("buildShells stopped: " .. tostring(err)); break end
+    built = built + 1
+  end
+  shellStats.buildMs = shellStats.buildMs + (os.clock() - started) * 1000
+  return built
+end
+
 function M.setSuspended(flag) suspended = flag and true or false end
 function M.isSuspended() return suspended end
 
@@ -1221,6 +1586,92 @@ end
 function M.setTuning(values)
   for k, v in pairs(values or {}) do
     if TUNING[k] ~= nil then TUNING[k] = v end
+  end
+end
+
+-- Live tuning ---------------------------------------------------------------------------------------------
+local function presetPath() return levelRoot .. "/" .. PRESETS_JSON end
+
+readPresets = function()
+  local ok, data = pcall(jsonReadFile, presetPath())
+  return (ok and type(data) == "table") and data or {}
+end
+
+local NOT_TUNABLE = { levelRoot = true, runtimeGroupName = true }
+
+local function tunableValues()
+  local out = {}
+  for k, v in pairs(TUNING) do
+    local t = type(v)
+    if not NOT_TUNABLE[k] and (t == "number" or t == "boolean" or k == "creationMode" or k == "shellShape") then out[k] = v end
+  end
+  return out
+end
+
+function M.getDefaultTuning()
+  local copy = {}
+  for k, v in pairs(TUNING_DEFAULTS) do copy[k] = v end
+  return copy
+end
+
+local function applyValues(values)
+  local mode = nil
+  for k, v in pairs(values or {}) do
+    local want = TUNING_DEFAULTS[k]
+    if want ~= nil and not NOT_TUNABLE[k] and type(v) == type(want) then
+      if k == "creationMode" then mode = v else TUNING[k] = v end
+    end
+  end
+  if mode and mode ~= TUNING.creationMode then M.setCreationMode(mode) end
+end
+
+function M.resetTuning()
+  applyValues(TUNING_DEFAULTS)
+  logMsg("I", "tuning reset to the defaults")
+end
+
+function M.listPresets()
+  local names = {}
+  for name in pairs(readPresets()) do names[#names + 1] = name end
+  table.sort(names)
+  return names
+end
+
+function M.savePreset(name)
+  if type(name) ~= "string" or name == "" then return false, "no name" end
+  local presets = readPresets()
+  presets[name] = tunableValues()
+  local ok, err = pcall(function() return jsonWriteFile(presetPath(), presets, true) end)
+  if not ok then recordFailure("could not save preset " .. name .. ": " .. tostring(err)); return false, tostring(err) end
+  logMsg("I", "preset saved: %s", name)
+  return true
+end
+
+function M.loadPreset(name)
+  local values = readPresets()[name]
+  if type(values) ~= "table" then return false, "no such preset" end
+  applyValues(values)
+  logMsg("I", "preset loaded: %s", name)
+  return true
+end
+
+function M.deletePreset(name)
+  local presets = readPresets()
+  if presets[name] == nil then return false, "no such preset" end
+  presets[name] = nil
+  local ok = pcall(function() return jsonWriteFile(presetPath(), presets, true) end)
+  return ok
+end
+
+-- The current values as a Lua table, one line each, in the log (to paste back into TUNING).
+function M.printTuning()
+  local keys = {}
+  for k in pairs(tunableValues()) do keys[#keys + 1] = k end
+  table.sort(keys)
+  logMsg("I", "TUNING values:")
+  for _, k in ipairs(keys) do
+    local v = TUNING[k]
+    logMsg("I", "  %s = %s,", k, type(v) == "string" and string.format("%q", v) or tostring(v))
   end
 end
 
@@ -1450,6 +1901,22 @@ function M.getStatus()
     createdTotal = createdTotal, deletedTotal = deletedTotal,
     failureCount = failureCount,
     forceCollisionNone = TUNING.forceCollisionNone,
+    creationMode = TUNING.creationMode, shellPoolActive = (TUNING.creationMode == "shells" or TUNING.creationMode == "resident") and not shellDisabled,
+    shellsFree = shellFreeN, shellsBuilt = shellStats.built, shellTarget = TUNING.shellTarget,
+    shellsRecycled = shellStats.recycled, shellsFresh = shellStats.fresh, shellsParked = shellStats.parked,
+    shellRecycleAvgMs = shellStats.recycled > 0 and shellStats.recycleMs / shellStats.recycled or 0,
+    shellParkAvgMs = shellStats.parked > 0 and shellStats.parkMs / shellStats.parked or 0,
+    shellBuildMs = shellStats.buildMs, shellPeakLive = shellStats.peakLive,
+    residentActive = TUNING.creationMode == "resident" and not shellDisabled,
+    residentDormant = dormantCount, residentRevived = shellStats.revived, residentDeactivated = shellStats.deactivated,
+    residentEvicted = shellStats.evicted, residentMax = TUNING.residentMax, residentReserve = TUNING.residentReserve,
+    residentReviveAvgMs = shellStats.revived > 0 and shellStats.reviveMs / shellStats.revived or 0,
+    poolTotal = poolTotal(),
+    droppedSections = droppedSections, droppedObjects = droppedObjects, droppedLast = droppedLast,
+    changeResident = { revived = change.residentRevives, reviveMs = change.residentReviveMs,
+                       deactivated = change.residentDeacts, evicted = change.residentEvicts },
+    changeShells = { recycled = change.shellRecycles, recycleMs = change.shellRecycleMs, fresh = change.shellFresh,
+                     parked = change.shellParks, parkMs = change.shellParkMs },
   }
 end
 
@@ -1489,6 +1956,38 @@ function M.restartCacheWarm()
   warm.names, warm.bySection, warm.total, warm.loaded = names, bySection, total, total > 0
 end
 
+-- Builds parked shells ahead (TUNING.shellTarget) while nothing urgent is queued: a little per frame, never in a burst.
+local function shellBuildUpdate()
+  if shellBuildOff or TUNING.shellTarget <= 0 or pqHead <= pqTail or not shellMode() then return end
+  local started = os.clock()
+  local n = 0
+  while n < TUNING.shellBuildPerFrame and poolTotal() < TUNING.shellTarget do
+    local ok, err = buildShell()
+    if not ok then
+      shellBuildFails = shellBuildFails + 1
+      if shellBuildFails >= 3 then
+        shellBuildOff = true
+        recordFailure("building shells stopped after 3 failures (is shellShape " .. tostring(TUNING.shellShape) .. " there?): " .. tostring(err))
+      end
+      break
+    end
+    shellBuildFails = 0
+    n = n + 1
+    if (os.clock() - started) * 1000 >= TUNING.shellBuildBudgetMs then break end
+  end
+  shellStats.buildMs = shellStats.buildMs + (os.clock() - started) * 1000
+end
+
+-- Resident mode, idle frames only: keep residentReserve shells free and the pool at residentMax by evicting the oldest.
+local function residentTrim()
+  if not residentMode() or pqHead <= pqTail or dormantCount == 0 then return end
+  local total = poolTotal()
+  local over = total - TUNING.residentMax
+  local short = TUNING.residentReserve - shellFreeN
+  if over <= 0 and not (short > 0 and total >= TUNING.residentMax) then return end
+  evictOldest(math.min(dormantCount, 8, math.max(over, short, 1)))
+end
+
 function M.onUpdate(dtReal)
   if not initialized or suspended then return end
   totalTime = totalTime + (dtReal or 0)
@@ -1507,6 +2006,8 @@ function M.onUpdate(dtReal)
   feedQueue()
   processUnloads()                                   -- deletes first, within their share of the frame budget
   processLoads()                                     -- creates use what is left of it
+  shellBuildUpdate()                                 -- shell pool: build parked shells ahead, only while nothing urgent waits
+  residentTrim()
   if not settled then
     local workMs = (os.clock() - frameStarted) * 1000
     change.frames = change.frames + 1
@@ -1548,6 +2049,16 @@ function M.onUpdate(dtReal)
         logMsg("I", "  per create: createObject %.2f, setField %.2f, name %.2f, registerObject %.2f, group add %.2f ms; deleted %d in %.0f ms; section read max %.1f ms",
           c.objectMs / c.creates, c.fieldsMs / c.creates, c.nameMs / c.creates, c.registerMs / c.creates, c.groupMs / c.creates,
           c.deleted, c.deleteMs, timing.readMax)
+        if TUNING.creationMode == "resident" then
+          logMsg("I", "  resident: revived %d x %.3f ms, deactivated %d, evicted %d; dormant %d, free %d, pool %d of %d",
+            c.residentRevives, c.residentRevives > 0 and c.residentReviveMs / c.residentRevives or 0, c.residentDeacts,
+            c.residentEvicts, dormantCount, shellFreeN, poolTotal(), TUNING.residentMax)
+        end
+        if TUNING.creationMode ~= "current" then
+          logMsg("I", "  shells: recycled %d x %.3f ms, fresh %d, parked %d x %.3f ms; free %d, peak live %d, built ahead %d",
+            c.shellRecycles, c.shellRecycles > 0 and c.shellRecycleMs / c.shellRecycles or 0, c.shellFresh,
+            c.shellParks, c.shellParks > 0 and c.shellParkMs / c.shellParks or 0, shellFreeN, shellStats.peakLive, shellStats.built)
+        end
         logMsg("I", "  scene: live objects %d to %d (avg %.0f) while creating, registerObject trend %s, idle frame %s",
           c.liveMin or 0, c.liveMax, c.liveSum / c.creates,
           slope and string.format("%+.2f ms per 1000 live", slope) or "n/a (live count barely changed)",
