@@ -75,7 +75,7 @@
   writes), wanting it again revives it (unhide only), and only when the pool is at `residentMax` the oldest
   resting object is evicted and its shell reused; `residentReserve` keeps free shells ready by evicting in idle
   frames. Live tuning: sliders and checkboxes in the manager panel (applied at once through `setTuning`),
-  presets (`startup`, A, B, C) saved in `lua/carbon_stream/tuning_presets.json` (`startup` is applied at
+  presets (`startup`, A, B, C; since 0017 three per creation mode) saved in `lua/carbon_stream/tuning_presets.json` (`startup` is applied at
   initialize), `resetTuning`, `printTuning`. Dropped sections: a section change that happens before the
   previous one settled is logged (`dropped section <id>: left after ...`), counted in the panel and in
   `getStatus` (`droppedSections`, `droppedObjects`, `droppedLast`). Not validated in game. Still pending:
@@ -86,3 +86,11 @@
   (`tests/run_lua_tests_lupa.py`, `--lua54` for the other one), a Python test compiles every Lua file under
   LuaJIT, and a Lua test fails when any function gets above 56 upvalues. New module-level state belongs in a
   table or in a helper function, not in more locals read by the big functions.
+
+- 0017: tuning and measuring. One frame clock caps every streaming task by what is left of `frameBudgetMs` (reads, deletes,
+  creates, shell building, resident trim, cache warm-up); `shellBuildBudgetMs` and `cacheWarmCheckMs` became shares of
+  it (`shellBuildBudgetShare`, `cacheWarmCheckShare`, old presets are converted). `setTuning` validates and clamps and
+  remembers what changed; the panel is built from a schema (mode-aware rows, tooltips, any typed value, shares in ms of
+  the main budget, last-change line, per-task ms), three presets per creation mode, and a Purge button (+ release pool,
+  hold, reset statistics) with a verified report for repeatable camera-track runs. Offline: 502 Lua checks, 24 Python
+  tests. Not validated in game; the factory preset values are guesses.

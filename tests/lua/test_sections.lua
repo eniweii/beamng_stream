@@ -1176,6 +1176,7 @@ do
     TextDisabled = function(t) texts[#texts + 1] = t end,
     CollapsingHeader1 = function() return true end,
     TreeNode1 = function() return true end,
+    TreeNodeEx1 = function() return true end,
     RadioButton1 = function(label) return clicks[label] == true end,
     Button = function(label) return clicks[label] == true end,
     SliderInt = function(label, p) if sliders[label] then p[0] = sliders[label]; return true end return false end,
@@ -1185,8 +1186,8 @@ do
   ui_imgui = im
   local ui = H.load(repo .. "/lua/ge/extensions/nfsc/sectionManagerUi.lua")
   clicks["Resident##creation"] = true
-  sliders["Max creates per frame##tmaxCreatesPerFrame"] = 5
-  sliders["Look-ahead##tpredictionEnabled"] = false
+  sliders["Max creates per frame###tmaxCreatesPerFrame"] = 5
+  sliders["Look-ahead###tpredictionEnabled"] = false
   clicks["Save##pA"] = true
   ui.onUpdate()
   clicks, sliders = {}, {}
@@ -1194,7 +1195,7 @@ do
   eq(s.getCreationMode(), "resident", "32b: the radio switches the creation mode")
   eq(s.getTuning().maxCreatesPerFrame, 5, "32c: a slider changes the tuning at once")
   eq(s.getTuning().predictionEnabled, false, "32c: so does a checkbox")
-  eq(table.concat(s.listPresets(), ","), "A", "32d: the save button saves a preset")
+  eq(table.concat(s.listPresets(), ","), "resident/A", "32d: the save button saves the slot of the active mode")
   texts = {}
   ui.onUpdate()                                  -- the next frame shows the new mode
   local sawDropped, sawPool = false, false
@@ -1208,6 +1209,252 @@ do
   clicks = {}
   eq(s.getTuning().maxCreatesPerFrame, 16, "32f: reset to defaults")
   eq(s.getCreationMode(), "current", "32f: including the creation mode")
+  ui_imgui = nil
+  H.files = {}
+end
+
+-- 34. frame budget: every task is capped by the main budget and the shares follow it ------------------
+do
+  local s = fresh({ creationMode = "shells" })
+  settle(s, 5)
+  s.setTuning({ shellTarget = 50, frameBudgetMs = 0 })
+  settle(s, 10)
+  eq(s.getStatus().shellsBuilt, 0, "34a: with no frame budget no shell is built ahead")
+  s.setTuning({ frameBudgetMs = 16 })
+  settle(s, 10)
+  check(s.getStatus().shellsBuilt > 0, "34a: with a budget they are built")
+  s.setTuning({ frameBudgetMs = 20, shellBuildBudgetShare = 0.5, deleteBudgetShare = 0.25, cacheWarmCheckShare = 0.1 })
+  local caps = s.getStatus().frameBudget.capsMs
+  eq(caps.shells, 10, "34b: shell build cap = share x main budget")
+  eq(caps.deletes, 5, "34b: delete cap too")
+  eq(caps.warmCheck, 2, "34b: and the warm-up check")
+  s.setTuning({ frameBudgetMs = 8 })
+  caps = s.getStatus().frameBudget.capsMs
+  eq(caps.shells, 4, "34c: changing the main budget rescales the shell cap")
+  eq(caps.deletes, 2, "34c: and the delete cap")
+  -- section reads: the first always goes, more only while the frame has budget left
+  local r0 = fresh({ frameBudgetMs = 0, maxSectionReadsPerFrame = 8 })
+  H.tick(r0, 1, 0.016)
+  eq(r0.getStatus().queuedSectionReads, 1, "34d: a spent frame budget allows one section read per frame")
+  local r1 = fresh({ frameBudgetMs = 1000, maxSectionReadsPerFrame = 8 })
+  H.tick(r1, 1, 0.016)
+  eq(r1.getStatus().queuedSectionReads, 0, "34d: with budget all reads of the frame go")
+  local b = r1.getStatus().frameBudget
+  check(b.mainMs == 1000 and b.avgMs.reads >= 0 and b.lastMs.creates >= 0, "34e: the per-task timing is reported")
+end
+
+-- 35. tuning is checked, clamped and its changes are remembered --------------------------------------
+do
+  local s = fresh()
+  local rev = s.getTuningInfo().revision
+  local changed, rejected = s.setTuning({ maxCreatesPerFrame = 7.6, frameBudgetMs = 12, nonsense = 1, logSettle = "yes" })
+  eq(#changed, 2, "35a: two real changes")
+  eq(#rejected, 2, "35a: unknown key and wrong type are rejected")
+  eq(s.getTuning().maxCreatesPerFrame, 8, "35a: an integer setting is rounded")
+  local info = s.getTuningInfo()
+  eq(info.revision, rev + 1, "35b: the revision counts the change")
+  eq(info.last.source, "setTuning", "35b: and where it came from")
+  s.setTuning({ maxCreatesPerFrame = 0, deleteBudgetShare = 7, maxQueuedItems = -5 })
+  eq(s.getTuning().maxCreatesPerFrame, 1, "35c: a count cannot go below its hard minimum")
+  eq(s.getTuning().deleteBudgetShare, 1, "35c: a share cannot exceed the whole frame budget")
+  eq(s.getTuning().maxQueuedItems, 1, "35c: negative counts are clamped")
+  s.setTuning({ frameBudgetMs = 250.5, shellTarget = 99999 })
+  eq(s.getTuning().frameBudgetMs, 250.5, "35d: values far beyond the slider range are accepted")
+  eq(s.getTuning().shellTarget, 99999, "35d: also integers")
+  local none = s.setTuning({ frameBudgetMs = 250.5 })
+  eq(#none, 0, "35e: setting the same value changes nothing")
+  eq(s.getTuningInfo().revision, rev + 3, "35e: and does not bump the revision")
+  s.setTuning({ creationMode = "resident" })
+  eq(s.getCreationMode(), "resident", "35f: creationMode through setTuning goes through the mode switch")
+  check(s.getStatus().residentActive, "35f: so the resident state is really on")
+  -- presets saved before the budgets became shares are converted
+  H.files["levels/nfsc/lua/carbon_stream/tuning_presets.json"] = { old = { frameBudgetMs = 20, shellBuildBudgetMs = 5, cacheWarmCheckMs = 2 } }
+  check(s.loadPreset("old"), "35g: an old preset loads")
+  eq(s.getTuning().shellBuildBudgetShare, 0.25, "35g: shell build ms became a share of the budget saved with it")
+  eq(s.getTuning().cacheWarmCheckShare, 0.1, "35g: so did the warm-up check")
+  H.files = {}
+end
+
+-- 36. three presets per creation mode ------------------------------------------------------------------
+do
+  H.files = {}
+  local s = fresh()
+  local list = s.getModePresets("shells")
+  eq(#list, 3, "36a: three slots per mode")
+  eq(list[1].source, "factory", "36a: untouched slots hold factory values")
+  check(s.loadModePreset("shells", "B"), "36b: a factory slot loads")
+  eq(s.getCreationMode(), "shells", "36b: and sets its mode")
+  eq(s.getTuning().shellTarget, 3500, "36b: with its values")
+  eq(s.getTuning().predictionEnabled, true, "36b: settings the preset does not hold stay as they were")
+  local ok = s.saveModePreset("resident", "A")
+  check(not ok, "36c: only the active mode's slots can be saved")
+  s.setTuning({ frameBudgetMs = 11 })
+  check(s.saveModePreset("shells", "A"), "36d: save into the active mode")
+  eq(s.getModePresets("shells")[1].source, "saved", "36d: the slot shows as saved")
+  eq(s.getModePresets("resident")[1].source, "factory", "36d: other modes are independent")
+  eq(s.getModePresets("current")[1].source, "factory", "36d: all of them")
+  s.setTuning({ frameBudgetMs = 30 })
+  s.loadModePreset("shells", "A")
+  eq(s.getTuning().frameBudgetMs, 11, "36e: the saved values come back")
+  check(s.deleteModePreset("shells", "A"), "36f: delete returns the slot to factory")
+  eq(s.getModePresets("shells")[1].source, "factory", "36f: factory again")
+  check(not s.loadModePreset("shells", "Z"), "36g: unknown slot refused")
+  check(not s.loadModePreset("nope", "A"), "36g: unknown mode refused")
+  -- a flat A from before belongs to the mode it was saved in
+  H.files["levels/nfsc/lua/carbon_stream/tuning_presets.json"] = { A = { creationMode = "resident", residentMax = 777 } }
+  eq(s.getModePresets("resident")[1].source, "saved", "36h: an old flat slot shows in its own mode")
+  eq(s.getModePresets("current")[1].source, "factory", "36h: not in the others")
+  s.loadModePreset("resident", "A")
+  eq(s.getTuning().residentMax, 777, "36h: and loads")
+  H.files = {}
+end
+
+-- 37. purge ---------------------------------------------------------------------------------------------
+do
+  check(nfsc_sectionStreamer ~= nil, "37: setup")
+  -- current mode, in the middle of a load
+  local s, m = fresh({ maxCreatesPerFrame = 1 })
+  H.tick(s, 3, 0.016)
+  local mid = s.getStatus()
+  check(mid.liveObjectCount > 0 and mid.liveObjectCount < 9, "37a: a load is in progress")
+  local rep = s.purge({})
+  check(rep and rep.ok, "37a: the purge verifies clear: " .. (rep and table.concat(rep.problems, "; ") or "no report"))
+  eq(rep.removedLive, mid.liveObjectCount, "37a: every live object removed")
+  check(rep.cancelled.queued + rep.cancelled.pending > 0, "37a: waiting jobs were cancelled")
+  local st = s.getStatus()
+  eq(st.liveObjectCount, 0, "37b: nothing live")
+  eq(st.queuedObjectCount, 0, "37b: nothing queued")
+  eq(st.createdTotal, 0, "37b: statistics were reset")
+  eq(m.getStatus().managedObjectsLive, 0, "37b: the manager's bookkeeping is clear")
+  eq(rep.sceneObjects, 0, "37b: the engine's scene is clear")
+  settle(s, 40)
+  eq(s.getStatus().liveObjectCount, 9, "37c: without hold, streaming starts again from the camera, as after a level load")
+  -- hold: cancelled jobs cannot come back, nothing is created until resumed
+  H.tick(s, 1, 0.016)
+  local held = s.purge({ hold = true })
+  check(held.held and s.isSuspended(), "37d: hold suspends streaming")
+  settle(s, 30)
+  eq(s.getStatus().liveObjectCount, 0, "37d: nothing is created while held")
+  s.setSuspended(false)
+  settle(s, 40)
+  eq(s.getStatus().liveObjectCount, 9, "37d: resuming streams the camera's section")
+  -- shells: live objects are parked, a released pool is empty and the scene agrees
+  local t = fresh({ creationMode = "shells" })
+  settle(t, 10)
+  local kept = t.purge({})
+  check(kept.ok, "37e: shells purge verifies: " .. table.concat(kept.problems, "; "))
+  eq(kept.poolAfter.shellsFree, 9, "37e: the objects were parked")
+  eq(kept.sceneObjects, 9, "37e: the scene holds exactly the parked shells")
+  settle(t, 30)
+  check(t.getStatus().shellsRecycled > 0, "37e: the next load recycles them")
+  local rel = t.purge({ releasePool = true })
+  check(rel.ok, "37f: a released pool verifies: " .. table.concat(rel.problems, "; "))
+  eq(rel.poolAfter.shellsFree, 0, "37f: no parked shells")
+  eq(rel.sceneObjects, 0, "37f: and an empty scene")
+  -- resident
+  local r = fresh({ creationMode = "resident" })
+  settle(r, 10)
+  local rr = r.purge({})
+  check(rr.ok, "37g: resident purge verifies: " .. table.concat(rr.problems, "; "))
+  eq(rr.poolAfter.dormant, 9, "37g: the objects rest as deactivated")
+  local rr2 = r.purge({ releasePool = true })
+  check(rr2.ok and rr2.poolAfter.dormant == 0, "37g: released")
+  local u = nfsc_sectionStreamer
+  local before = u.getStatus().lastPurge
+  check(before ~= nil, "37h: the last purge is reported in the status")
+  eq(select("#", s.resetStats()), 0, "37i: resetStats works on its own")
+end
+
+-- 38. the panel builds itself from the schema and follows the mode -------------------------------------
+do
+  local s = fresh()
+  settle(s, 5)
+  local labels, tips, clicks, sliders, inputs, sliderVals = {}, {}, {}, {}, {}, {}
+  local function ptr(v) return { [0] = v } end
+  local im = setmetatable({
+    BoolPtr = ptr, IntPtr = ptr, FloatPtr = ptr,
+    Begin = function() return true end,
+    CollapsingHeader1 = function() return true end,
+    TreeNode1 = function() return true end,
+    TreeNodeEx1 = function() return true end,
+    RadioButton1 = function(label) return clicks[label] == true end,
+    Button = function(label) return clicks[label] == true end,
+    Checkbox = function(label, p) labels[#labels + 1] = label; if sliders[label] ~= nil then p[0] = sliders[label]; return true end return false end,
+    SliderInt = function(label, p) labels[#labels + 1] = label; sliderVals[label] = p[0]; if sliders[label] then p[0] = sliders[label]; return true end return false end,
+    SliderFloat = function(label, p) labels[#labels + 1] = label; sliderVals[label] = p[0]; if sliders[label] then p[0] = sliders[label]; return true end return false end,
+    InputInt = function(label, p) inputs[label] = "int"; if sliders[label] then p[0] = sliders[label]; return true end return false end,
+    InputFloat = function(label, p) inputs[label] = "float"; if sliders[label] then p[0] = sliders[label]; return true end return false end,
+    IsItemHovered = function() return true end,
+    GetFontSize = function() return 14 end,
+    TextUnformatted = function(t) tips[#tips + 1] = t end,
+  }, { __index = function() return function() return false end end })
+  ui_imgui = im
+  local ui = H.load(repo .. "/lua/ge/extensions/nfsc/sectionManagerUi.lua")
+  local function frame()
+    labels, tips = {}, {}
+    ui.onUpdate()
+  end
+  local function has(prefix)
+    for _, l in ipairs(labels) do if l:find(prefix, 1, true) then return true end end
+    return false
+  end
+  frame()
+  check(has("Max creates per frame"), "38a: a common setting shows in current mode")
+  check(not has("Pool size") and not has("Shells built ahead") and not has("Deactivate delay"), "38a: pool settings are hidden in current mode")
+  check(has("Unload cooldown"), "38a: the unload cooldown shows")
+  clicks["Shells##creation"] = true
+  frame(); clicks = {}
+  frame()
+  check(has("Shells built ahead") and has("Shell build share"), "38b: shell settings appear in shells mode")
+  check(not has("Pool size") and not has("Deactivate delay"), "38b: resident-only settings stay hidden")
+  clicks["Resident##creation"] = true
+  frame(); clicks = {}
+  frame()
+  check(has("Pool size") and has("Deactivate delay"), "38c: resident settings appear in resident mode")
+  check(not has("Unload cooldown"), "38c: the unload cooldown is hidden (resident uses its own delay)")
+  s.setTuning({ predictionEnabled = false })
+  frame()
+  check(not has("Look-ahead time"), "38d: a dependent setting hides while its switch is off")
+  s.setTuning({ predictionEnabled = true })
+  -- every shown setting has its tooltip
+  frame()
+  local joined = table.concat(tips, "\n")
+  local missing = {}
+  local tuning = s.getTuning()
+  for _, row in ipairs(s.getTuningSchema()) do
+    local applies = (not row.modes or row.modes[tuning.creationMode]) and (not row.requires or tuning[row.requires])
+    if applies and not joined:find(row.desc:sub(1, 40), 1, true) then missing[#missing + 1] = row.key end
+  end
+  eq(table.concat(missing, ","), "", "38e: every shown setting has its tooltip")
+  for _, row in ipairs(s.getTuningSchema()) do check(#row.desc > 20, "38e: " .. row.key .. " has a real description") end
+  -- shares are edited in ms of the main budget and follow it
+  s.setTuning({ frameBudgetMs = 16, deleteBudgetShare = 0.25 })
+  frame()
+  eq(sliderVals["Delete / park share###tdeleteBudgetShare"], 4, "38f: a share is shown in ms of the main budget")
+  s.setTuning({ frameBudgetMs = 8 })
+  frame()
+  eq(sliderVals["Delete / park share###tdeleteBudgetShare"], 2, "38f: it follows the main budget")
+  sliders["Delete / park share###tdeleteBudgetShare"] = 4
+  frame(); sliders = {}
+  eq(s.getTuning().deleteBudgetShare, 0.5, "38g: editing the ms stores the matching share")
+  -- typed values beyond the slider range are accepted, input boxes replace sliders in typing mode
+  sliders["Max creates per frame###tmaxCreatesPerFrame"] = 5000
+  frame(); sliders = {}
+  eq(s.getTuning().maxCreatesPerFrame, 5000, "38h: a value beyond the slider range is accepted")
+  frame()
+  frame()
+  eq(sliderVals["* Max creates per frame###tmaxCreatesPerFrame"], 5000, "38h: and shown")
+  sliders["Type values (input boxes instead of sliders)##ttyping"] = true
+  frame(); sliders = {}
+  frame()
+  check(inputs["* Max creates per frame###tmaxCreatesPerFrame"] == "int", "38i: typing mode uses input boxes (changed settings are starred)")
+  -- purge buttons
+  clicks["Purge scene"] = true
+  frame(); clicks = {}
+  eq(s.getStatus().liveObjectCount, 0, "38j: the purge button purges")
+  check(s.getStatus().lastPurge ~= nil, "38j: and the panel can show the result")
+  frame()
+  check(true, "38k: the panel draws after a purge")
   ui_imgui = nil
   H.files = {}
 end

@@ -87,6 +87,7 @@ local function newObject(class)
     H.created[name] = (H.created[name] or 0) + 1
   end
   function o:addObject(child) self.children[#self.children + 1] = child; child.parent = self end
+  function o:size() return #self.children end                         -- SimGroup size, used by the purge scene check
   function o:delete()
     if self.deleted then return end
     self.deleted = true

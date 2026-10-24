@@ -79,7 +79,7 @@ local TUNING = {
   maxCreatesPerFrame = 16,
   maxDeletesPerFrame = 256,
   frameBudgetMs = 16.0,           -- one budget for the whole frame: deletes first, creates get what is left
-  deleteBudgetShare = 0.25,       -- deletes may use at most this share of frameBudgetMs
+  deleteBudgetShare = 0.25,       -- deletes may use at most this share of frameBudgetMs (and never more than the frame has left)
   maxFirstUsePerFrame = 3,        -- new shapes (4-20 ms each) per frame; a later new shape waits for the next frame
   firstUseGuessMs = 6.0,          -- expected first-use cost until a real average exists
   currentSectionFirst = true,     -- objects of the section the camera is in (and the one streamed for) load before everything else
@@ -92,7 +92,7 @@ local TUNING = {
   cacheWarmPerFrame = 1,          -- shapes imported per frame; each one is a stall of its own import time
   cacheWarmGapSeconds = 0.25,     -- pause after every import (0 = back to back, for a loading screen)
   cacheWarmIdleSeconds = 1.0,     -- both load queues must have been empty this long before the lane starts
-  cacheWarmCheckMs = 1.0,         -- time per frame for skipping shapes that already have a .cdae
+  cacheWarmCheckShare = 0.0625,   -- share of frameBudgetMs per frame for skipping shapes that already have a .cdae (1 ms at 16)
   cacheWarmLogEvery = 100,        -- progress line after this many imports (0 = none)
   maxSectionReadsPerFrame = 1,
   maxQueuedItems = 512,           -- hard cap of the load queue; the rest waits in pending lists
@@ -119,12 +119,108 @@ local TUNING = {
   shellShape = "/levels/nfsc/Assets/Meshes/NFSC_DOT.dae",  -- shape of a parked shell (tiny, never drawn: parked shells are hidden)
   shellTarget = 0,                -- keep at least this many shells (free + in use); built ahead in the background. 0 = off
   shellBuildPerFrame = 8,         -- shells built ahead per frame ...
-  shellBuildBudgetMs = 2.0,       -- ... and at most this many ms of it
+  shellBuildBudgetShare = 0.125,  -- ... and at most this share of frameBudgetMs of it (2 ms at 16), and never more than the frame has left
 }
 
 local TUNING_DEFAULTS = {}
 for k, v in pairs(TUNING) do TUNING_DEFAULTS[k] = v end
 local readPresets                      -- defined with the tuning API further down
+
+-- Tuning schema: one row per setting the panel can show (the panel builds itself from it).
+--   kind     "float", "int", "bool" or "share" (a part 0..1 of frameBudgetMs; the panel shows the ms it is worth)
+--   min/max  slider range;  lo/hi  hard limits setTuning enforces (numbers: lo defaults to 0, shares: 0..1)
+--   modes    creation modes the setting does something in (nil = all);  requires  a bool setting that must be on
+--   desc     the tooltip text: what it does and what raising or lowering it changes
+local tun = {}                          -- tuning schema, presets, change tracking and helpers: one local
+do
+local SHELL_MODES = { shells = true, resident = true }
+tun.schema = {
+  { key = "frameBudgetMs", group = "Frame budget", label = "Frame budget (ms)", kind = "float", min = 1, max = 50,
+    desc = "Time one frame may spend on streaming: section reads, deletes, creates and shell building together. Every task below is capped by what is left of it. Higher: sections settle sooner but frames run longer. Lower: smoother frames, slower loading." },
+  { key = "deleteBudgetShare", group = "Frame budget", label = "Delete / park share", kind = "share", min = 0.05, max = 1,
+    desc = "Largest part of the frame budget that deleting (or parking / deactivating) objects may use. Deletes run first, creates get the rest. Lower: more time for creates, but objects wait longer to be removed. Higher: the unload backlog clears faster and loading slows." },
+  { key = "shellBuildBudgetShare", group = "Frame budget", label = "Shell build share", kind = "share", min = 0.01, max = 1, modes = SHELL_MODES,
+    desc = "Largest part of the frame budget for building parked shells ahead (see Shells built ahead). It runs after the loads and only takes what they left, so a busy frame builds none. Higher: the pool fills sooner but idle frames get longer." },
+  { key = "maxCreatesPerFrame", group = "Section loading", label = "Max creates per frame", kind = "int", min = 1, max = 256, lo = 1,
+    desc = "Hard cap on objects created per frame, on top of the time budget. Higher: faster loading when objects are cheap, bigger frame spikes when they are not. Lower: steadier frames, slower loading." },
+  { key = "maxDeletesPerFrame", group = "Section loading", label = "Max deletes per frame", kind = "int", min = 1, max = 2048, lo = 1,
+    desc = "Hard cap on objects deleted (or parked) per frame, on top of the delete share. Lower: a long unload trails over more frames; higher: it finishes sooner, in a bigger spike." },
+  { key = "maxFirstUsePerFrame", group = "Section loading", label = "Max first uses per frame", kind = "int", min = 1, max = 16, lo = 1,
+    desc = "How many never-used shapes may be created per frame. A first use loads the mesh and can cost 4-100 ms (a COLLADA import when there is no .cdae yet). Lower: fewer big stalls in one frame, new shapes appear later." },
+  { key = "firstUseGuessMs", group = "Section loading", label = "First use guess (ms)", kind = "float", min = 1, max = 40,
+    desc = "Expected cost of a first use until a real average exists. A new shape is only started when this much budget is left. Higher: more cautious, shapes wait for a quieter frame. Lower: shapes start earlier and may overrun the budget." },
+  { key = "maxSectionReadsPerFrame", group = "Section loading", label = "Section reads per frame", kind = "int", min = 1, max = 8, lo = 1,
+    desc = "Section files read per frame. A read is a JSON parse and cannot be split. Higher: sections get their data sooner, with a heavier frame. A second read only starts while the frame budget has time left." },
+  { key = "maxQueuedItems", group = "Section loading", label = "Load queue cap", kind = "int", min = 64, max = 4096, lo = 1,
+    desc = "Most objects held in the load queue; the rest wait in per-section lists. Higher: the queue holds more at once and reorders less often. Lower: the order follows the camera more closely." },
+
+  { key = "unloadCooldown", group = "Unloading", label = "Unload cooldown (s)", kind = "float", min = 0, max = 10, modes = { current = true, shells = true },
+    desc = "Seconds an object that no active section wants survives before it is deleted or parked. Higher: going back to a section you just left is instant, more objects stay in memory. Lower: memory is freed sooner." },
+  { key = "residentCooldown", group = "Unloading", label = "Deactivate delay (s)", kind = "float", min = 0, max = 10, modes = { resident = true },
+    desc = "Seconds before an unwanted object is deactivated (hidden, kept bound to its shape and fields). Deactivating is cheap, so 0 is normal. Higher: the object stays drawn a little longer after the camera leaves." },
+
+  { key = "shellTarget", group = "Shell pool", label = "Shells built ahead", kind = "int", min = 0, max = 30000, modes = SHELL_MODES,
+    desc = "Keep at least this many shells (free + in use), built in the background while nothing urgent is queued. 0 = build on demand. Near the peak live count (about 3200 seen) avoids creating during loads; each hidden shell costs a little every frame." },
+  { key = "shellBuildPerFrame", group = "Shell pool", label = "Shells per frame", kind = "int", min = 1, max = 64, lo = 1, modes = SHELL_MODES,
+    desc = "Most shells built ahead per frame, within the shell build share. Higher: the pool fills in fewer frames. Lower: gentler on frame time." },
+
+  { key = "residentMax", group = "Resident pool", label = "Pool size", kind = "int", min = 500, max = 30000, lo = 1, modes = { resident = true },
+    desc = "Most objects held at once (live + deactivated + free). Beyond it the oldest deactivated object is evicted and its shell reused. Higher: more sections stay instantly revivable, more RAM. Lower: more evictions and re-fills. Near 1.2 x the peak live count is a start." },
+  { key = "residentReserve", group = "Resident pool", label = "Free reserve", kind = "int", min = 0, max = 2000, modes = { resident = true },
+    desc = "Free shells kept ready by evicting in idle frames. 0 = evict only when a load needs a shell. Higher: loads rarely have to evict mid-frame, but fewer objects stay resident." },
+
+  { key = "currentSectionFirst", group = "Look-ahead and order", label = "Current section first", kind = "bool",
+    desc = "Objects of the camera's section (and the one being streamed for) load before everything else. Off: strict distance bands only." },
+  { key = "predictionEnabled", group = "Look-ahead and order", label = "Look-ahead", kind = "bool",
+    desc = "Switch to the section ahead before the camera crosses the border, from the camera velocity. On: the next section starts loading earlier. Off: loading starts at the border." },
+  { key = "predictionSeconds", group = "Look-ahead and order", label = "Look-ahead time (s)", kind = "float", min = 0, max = 5, requires = "predictionEnabled",
+    desc = "How far ahead (in seconds of travel, capped at 100 m) the look-ahead point lies. Higher: earlier loading, more wrong guesses on turns. Lower: later switches." },
+
+  { key = "cacheWarm", group = "Cache warm-up", label = "Cache warm-up lane", kind = "bool",
+    desc = "While nothing is queued, import shapes that have no .cdae yet, one at a time, so later first uses are cache reads. Each import is a stall of its own length." },
+  { key = "cacheWarmPerFrame", group = "Cache warm-up", label = "Imports per frame", kind = "int", min = 1, max = 4, lo = 1, requires = "cacheWarm",
+    desc = "Shapes imported per frame. Each one stalls the frame for its import time. Higher: the cache fills sooner with longer stalls. A second import is skipped once the frame budget is spent." },
+  { key = "cacheWarmGapSeconds", group = "Cache warm-up", label = "Gap after an import (s)", kind = "float", min = 0, max = 2, requires = "cacheWarm",
+    desc = "Pause after every import. Higher: stalls are spread out. 0 = back to back, for a loading screen." },
+  { key = "cacheWarmIdleSeconds", group = "Cache warm-up", label = "Idle before it starts (s)", kind = "float", min = 0, max = 5, requires = "cacheWarm",
+    desc = "Both load queues must have been empty this long before the lane starts. Higher: it stays out of the way after every section change." },
+  { key = "cacheWarmCheckShare", group = "Cache warm-up", label = "Skip-check share", kind = "share", min = 0.01, max = 1, requires = "cacheWarm",
+    desc = "Part of the frame budget the lane may spend looking for shapes that already have a .cdae (skipping is cheap but there are about 30k shapes). Higher: the scan finishes sooner, with a heavier idle frame." },
+
+  { key = "forceCollisionNone", group = "Other", label = "Collision off", kind = "bool",
+    desc = "Created objects get no collision. On is the current test policy: collision is its own system, deferred." },
+  { key = "logSettle", group = "Other", label = "Log settled sections", kind = "bool",
+    desc = "Write a timing block to the log when the load of a section change has finished." },
+  { key = "probeOnSettle", group = "Other", label = "Probe after settle", kind = "bool", requires = "logSettle",
+    desc = "After a settle, time a few test creates and log them next to the real averages. Diagnostic only; it adds a little work to that frame." },
+}
+tun.byKey = {}
+for _, row in ipairs(tun.schema) do tun.byKey[row.key] = row end
+
+-- Three presets per creation mode. Until the user saves a slot, it holds these values (only budget and pool
+-- settings; everything else keeps its current value). Starting points, not measured results.
+tun.slots = { "A", "B", "C" }
+tun.factory = {
+  current = {
+    A = { label = "Gentle", values = { frameBudgetMs = 8, deleteBudgetShare = 0.25, maxCreatesPerFrame = 4, maxFirstUsePerFrame = 1, unloadCooldown = 2 } },
+    B = { label = "Balanced", values = { frameBudgetMs = 16, deleteBudgetShare = 0.25, maxCreatesPerFrame = 16, maxFirstUsePerFrame = 3, unloadCooldown = 2 } },
+    C = { label = "Fast", values = { frameBudgetMs = 24, deleteBudgetShare = 0.5, maxCreatesPerFrame = 64, maxFirstUsePerFrame = 8, unloadCooldown = 1 } },
+  },
+  shells = {
+    A = { label = "Gentle", values = { frameBudgetMs = 8, deleteBudgetShare = 0.25, maxCreatesPerFrame = 8, maxFirstUsePerFrame = 1, unloadCooldown = 2, shellTarget = 0, shellBuildPerFrame = 4, shellBuildBudgetShare = 0.1 } },
+    B = { label = "Balanced", values = { frameBudgetMs = 16, deleteBudgetShare = 0.25, maxCreatesPerFrame = 32, maxFirstUsePerFrame = 3, unloadCooldown = 2, shellTarget = 3500, shellBuildPerFrame = 8, shellBuildBudgetShare = 0.125 } },
+    C = { label = "Fast", values = { frameBudgetMs = 24, deleteBudgetShare = 0.5, maxCreatesPerFrame = 128, maxFirstUsePerFrame = 8, unloadCooldown = 1, shellTarget = 4000, shellBuildPerFrame = 16, shellBuildBudgetShare = 0.2 } },
+  },
+  resident = {
+    A = { label = "Gentle", values = { frameBudgetMs = 8, deleteBudgetShare = 0.25, maxCreatesPerFrame = 8, maxFirstUsePerFrame = 1, residentCooldown = 0, residentMax = 3800, residentReserve = 0, shellBuildBudgetShare = 0.1 } },
+    B = { label = "Balanced", values = { frameBudgetMs = 16, deleteBudgetShare = 0.25, maxCreatesPerFrame = 32, maxFirstUsePerFrame = 3, residentCooldown = 0, residentMax = 6000, residentReserve = 200, shellBuildBudgetShare = 0.125 } },
+    C = { label = "Fast", values = { frameBudgetMs = 24, deleteBudgetShare = 0.5, maxCreatesPerFrame = 128, maxFirstUsePerFrame = 8, residentCooldown = 0, residentMax = 9000, residentReserve = 500, shellBuildBudgetShare = 0.2 } },
+  },
+}
+
+-- What changed in the tuning and when: the panel shows it so a change can be checked, not assumed.
+tun.state = { revision = 0, last = nil, log = {} }
+end
 
 local SUPPORTED_SCHEMA = 2
 local SECTIONS_JSON = "lua/sections.json"
@@ -182,7 +278,28 @@ end
 local change = newChange()                -- everything since the last section change
 local split = { objectMs = 0, fieldsMs = 0, registerMs = 0, groupMs = 0, nameMs = 0, live = 0 }
 local idleFrameMs = nil              -- moving average of the frame time while nothing is loading   -- cost of the last create
-local frameStart, frameDeleteMs = 0, 0
+local frameDeleteMs = 0
+-- One clock for the whole frame: every task is capped by what is left of frameBudgetMs at the moment it starts.
+local fb = {
+  start = 0,                                                       -- os.clock() when this frame's streaming work began
+  ms = { reads = 0, deletes = 0, creates = 0, shells = 0, warm = 0 },      -- ms each task used in the last frame
+  avg = { reads = 0, deletes = 0, creates = 0, shells = 0, warm = 0 },     -- the same as a moving average (0.9 / 0.1)
+}
+
+function fb.remaining() return TUNING.frameBudgetMs - (os.clock() - fb.start) * 1000 end
+
+-- min(share of the main budget, what the frame has left); 0 when the frame is already spent.
+function fb.cap(share)
+  local cap = TUNING.frameBudgetMs * share
+  local left = fb.remaining()
+  if left < cap then cap = left end
+  return cap > 0 and cap or 0
+end
+
+function fb.record(name, ms)
+  fb.ms[name] = ms
+  fb.avg[name] = fb.avg[name] * 0.9 + ms * 0.1
+end
 local changeStamp, createdSinceChange, settled, settleSeconds, settlePeak = 0, 0, true, 0, 0
 local createdTotal, deletedTotal, failureCount, verified = 0, 0, 0, 0
 local failures = {}
@@ -977,7 +1094,8 @@ end
 
 local function processSectionReads()
   local reads = 0
-  while srHead <= srTail and reads < TUNING.maxSectionReadsPerFrame and pendingCount < TUNING.maxPendingRecords do
+  while srHead <= srTail and reads < TUNING.maxSectionReadsPerFrame and pendingCount < TUNING.maxPendingRecords
+        and (reads == 0 or fb.remaining() > 0) do      -- the first read always goes, more only while the budget lasts
     local id = sectionReadQueue[srHead]
     sectionReadQueue[srHead] = nil
     srHead = srHead + 1
@@ -1033,7 +1151,7 @@ end
 
 local function processLoads()
   local started = os.clock()
-  local budget = TUNING.frameBudgetMs - frameDeleteMs    -- creates get what the deletes left
+  local budget = fb.remaining()                      -- creates get what reads and deletes left of the frame
   local made, firstUse, skipped = 0, 0, 0
   while (pqHead <= pqTail or lqHead <= lqTail) and made < TUNING.maxCreatesPerFrame and skipped < SKIP_CAP do
     local fromUrgent = pqHead <= pqTail
@@ -1137,7 +1255,7 @@ end
 
 local function processUnloads()
   local started = os.clock()
-  local limit = TUNING.frameBudgetMs * TUNING.deleteBudgetShare
+  local limit = fb.cap(TUNING.deleteBudgetShare)
   local removed = 0
   while uqHead <= uqTail and removed < TUNING.maxDeletesPerFrame do
     local entry = unloadQueue[uqHead]
@@ -1379,9 +1497,12 @@ local function cacheWarmUpdate(dt)
     warm.gap = warm.gap - dt
     if warm.gap > 0 then return end
   end
+  local checkMs = fb.cap(TUNING.cacheWarmCheckShare)
+  if checkMs <= 0 then return end                                 -- the frame is already spent
   if warm.nearFor ~= currentSectionID then warmRefreshNear() end
   local imports, mark = 0, os.clock()
   while imports < math.max(1, TUNING.cacheWarmPerFrame) do
+    if imports > 0 and fb.remaining() <= 0 then break end     -- an import is a stall of its own: no second one in a spent frame
     local idx = warmNextCandidate()
     if not idx then
       warm.finished, warm.current = true, nil
@@ -1410,7 +1531,7 @@ local function cacheWarmUpdate(dt)
       warm.gap = TUNING.cacheWarmGapSeconds
       mark = os.clock()
     end
-    if (os.clock() - mark) * 1000 >= TUNING.cacheWarmCheckMs then break end   -- the time cap is for the skipping
+    if (os.clock() - mark) * 1000 >= checkMs then break end       -- the time cap is for the skipping
   end
 end
 
@@ -1427,23 +1548,30 @@ local function resetPoolState()
   for k in pairs(shellStats) do shellStats[k] = 0 end
 end
 
-local function resetState()
+-- Drops every job and the section selection: queues, pending lists, held-back items, section reads, unloads.
+-- Nothing that was queued can create an object afterwards; the next frame looks the camera's section up again.
+local function clearWork()
   currentSectionID, activeSet = nil, {}
   sectionRead, sectionReading = {}, {}
   sectionReadQueue, srHead, srTail = {}, 1, 0
   loadQueue, lqHead, lqTail, queuedKeys = {}, 1, 0, {}
   priQueue, pqHead, pqTail, promotedTotal = {}, 1, 0, 0
   pending, pendingCount, deferred = {}, 0, {}
-  staleDiscarded, queueHighWater, createdLastFrame, createdPeakFrame = 0, 0, 0, 0
-  live, liveBySection, liveCount = {}, {}, 0
   pendingUnload, unloadQueue, uqHead, uqTail = {}, {}, 1, 0
   selectTimer = 1e9                                                -- look up at once after a reset
-  camPos, camVel.x, camVel.y = nil, 0, 0
   cameraSectionID, predictedSectionID, aheadCandidate, aheadTime = nil, nil, nil, 0
   feedOrder, priorityTimer = {}, 0
+end
+
+local function resetState()
+  clearWork()
+  staleDiscarded, queueHighWater, createdLastFrame, createdPeakFrame = 0, 0, 0, 0
+  live, liveBySection, liveCount = {}, {}, 0
+  camPos, camVel.x, camVel.y = nil, 0, 0
   for k in pairs(timing) do timing[k] = 0 end
   seenShapes, shapeLive, recentFirstMs, idleFrameMs = {}, {}, nil, nil
   change, frameDeleteMs = newChange(), 0
+  for k in pairs(fb.ms) do fb.ms[k], fb.avg[k] = 0, 0 end
   changeStamp, createdSinceChange, settled, settleSeconds, settlePeak = 0, 0, true, 0, 0
   resetPoolState()                                             -- the runtime group (and its shells) was deleted before this
 end
@@ -1485,6 +1613,91 @@ function M.reset()
   destroyRuntimeGroup()
   resetState()
   if initialized then ensureRuntimeGroup() end
+end
+
+-- Counters and timings back to zero (tuning, pool contents and live objects are not touched), so a measurement starts clean.
+function M.resetStats()
+  staleDiscarded, queueHighWater, createdLastFrame, createdPeakFrame, promotedTotal = 0, 0, 0, 0, 0
+  for k in pairs(timing) do timing[k] = 0 end
+  change, frameDeleteMs = newChange(), 0
+  for k in pairs(fb.ms) do fb.ms[k], fb.avg[k] = 0, 0 end
+  changeStamp, createdSinceChange, settled, settleSeconds, settlePeak = totalTime, 0, true, 0, 0
+  createdTotal, deletedTotal, failureCount, failures = 0, 0, 0, {}
+  droppedSections, droppedObjects, droppedLast = 0, 0, nil
+  for k in pairs(shellStats) do shellStats[k] = 0 end
+  shellStats.peakLive = liveCount
+  logMsg("I", "statistics reset (tuning and pool unchanged)")
+end
+
+-- Objects in the runtime group according to the engine, nil when the engine gives no way to count them.
+local function sceneCount()
+  local g = runtimeGroup
+  if not g then return 0 end
+  local ok, n = pcall(function() return g:size() end)
+  if ok and type(n) == "number" then return n end
+  ok, n = pcall(function() return #g:getObjects() end)
+  if ok and type(n) == "number" then return n end
+  return nil
+end
+
+-- Empties the scene for a repeatable measurement (camera track, empty canvas):
+--   1. every queued job is cancelled first (load queues, pending lists, held-back items, section reads, unloads), so
+--      nothing can create an object afterwards;
+--   2. every live object is removed the way the creation mode removes one (deleted, parked or deactivated);
+--   3. releasePool = true also deletes the parked shells and the deactivated (resident) objects;
+--   4. the section selection is cleared, so streaming starts from nothing at the camera's position, as after a level
+--      load; hold = true keeps it suspended until M.setSuspended(false) (move the camera, then resume);
+--   5. statistics are reset unless keepStats = true.
+-- Returns a report: what was cancelled and removed, and the result of a bookkeeping and scene check.
+function M.purge(opts)
+  opts = opts or {}
+  if not initialized then return nil, "streamer not initialized" end
+  local started = os.clock()
+  local before = {
+    live = liveCount, queued = math.max(0, lqTail - lqHead + 1) + math.max(0, pqTail - pqHead + 1), pending = pendingCount,
+    reads = math.max(0, srTail - srHead + 1), unloads = math.max(0, uqTail - uqHead + 1),
+    dormant = dormantCount, shellsFree = shellFreeN, deferred = 0,
+  }
+  for _, list in pairs(deferred) do before.deferred = before.deferred + #list end
+  clearWork()                                                      -- 1. cancel everything that is waiting
+  local keys = {}
+  for key in pairs(live) do keys[#keys + 1] = key end
+  for i = 1, #keys do deleteLive(keys[i]) end                      -- 2. one pass over the live objects
+  local released = { dormant = 0, shells = 0 }
+  if opts.releasePool then                                         -- 3.
+    released.dormant = releaseDormant(true)
+    released.shells = M.clearShellPool()
+  end
+  if not opts.keepStats then M.resetStats() end                    -- 5.
+  suspended = opts.hold and true or false                          -- 4.
+  local report = {
+    cancelled = before, removedLive = #keys, released = released, mode = TUNING.creationMode,
+    poolAfter = { dormant = dormantCount, shellsFree = shellFreeN }, held = suspended, ms = (os.clock() - started) * 1000,
+    problems = {},
+  }
+  local problems = report.problems                                 -- verification: bookkeeping, then the engine's scene
+  local function check(ok, what) if not ok then problems[#problems + 1] = what end end
+  check(liveCount == 0 and next(live) == nil, "live table not empty")
+  check(next(liveBySection) == nil or (function() for _, b in pairs(liveBySection) do if next(b) then return false end end return true end)(), "per-section live lists not empty")
+  check(lqHead > lqTail and pqHead > pqTail, "load queues not empty")
+  check(pendingCount == 0 and next(pending) == nil and next(deferred) == nil, "pending or held-back items remain")
+  check(srHead > srTail and next(sectionReading) == nil, "section reads remain")
+  check(next(pendingUnload) == nil and uqHead > uqTail and next(queuedKeys) == nil, "unload or queue-key bookkeeping not empty")
+  check(next(activeSet) == nil and currentSectionID == nil, "section selection not cleared")
+  if opts.releasePool then check(dormantCount == 0 and shellFreeN == 0, "pool not empty after release") end
+  report.sceneObjects = sceneCount()
+  report.sceneExpected = dormantCount + shellFreeN
+  if report.sceneObjects and report.sceneObjects ~= report.sceneExpected then
+    problems[#problems + 1] = string.format("runtime group holds %d objects, bookkeeping expects %d (pool)", report.sceneObjects, report.sceneExpected)
+  end
+  report.ok = #problems == 0
+  logMsg(report.ok and "I" or "W", "purge (%s%s): cancelled %d queued, %d pending, %d held back, %d section reads, %d unloads; removed %d live objects%s in %.0f ms; pool now %d deactivated + %d free; scene %s; %s%s",
+    report.mode, opts.releasePool and ", pool released" or "", before.queued, before.pending, before.deferred, before.reads, before.unloads,
+    report.removedLive, opts.releasePool and string.format(" and released %d deactivated + %d parked", released.dormant, released.shells) or "", report.ms,
+    dormantCount, shellFreeN, report.sceneObjects and tostring(report.sceneObjects) .. " objects" or "count n/a",
+    report.ok and "verified clear" or "CHECK FAILED: " .. table.concat(problems, "; "), suspended and "; streaming held" or "")
+  tun.state.purge = report
+  return report
 end
 
 -- fn(item) -> false holds an object back (see header). Pass nil to create everything again.
@@ -1583,12 +1796,6 @@ function M.getTuning()
   return copy
 end
 
-function M.setTuning(values)
-  for k, v in pairs(values or {}) do
-    if TUNING[k] ~= nil then TUNING[k] = v end
-  end
-end
-
 -- Live tuning ---------------------------------------------------------------------------------------------
 local function presetPath() return levelRoot .. "/" .. PRESETS_JSON end
 
@@ -1614,20 +1821,112 @@ function M.getDefaultTuning()
   return copy
 end
 
-local function applyValues(values)
-  local mode = nil
-  for k, v in pairs(values or {}) do
-    local want = TUNING_DEFAULTS[k]
-    if want ~= nil and not NOT_TUNABLE[k] and type(v) == type(want) then
-      if k == "creationMode" then mode = v else TUNING[k] = v end
+-- The panel builds itself from this (read only).
+function M.getTuningSchema() return tun.schema end
+function M.getCreationModes() return { "current", "shells", "resident" } end
+
+function tun.fmt(v)
+  if type(v) == "number" then return string.format("%.4g", v) end
+  return tostring(v)
+end
+
+-- Presets saved before the budgets became shares of the frame: ms -> share of the frame budget they were saved with.
+function tun.migrate(values)
+  local out = {}
+  for k, v in pairs(values or {}) do out[k] = v end
+  local main = type(out.frameBudgetMs) == "number" and out.frameBudgetMs or TUNING.frameBudgetMs
+  for old, new in pairs({ shellBuildBudgetMs = "shellBuildBudgetShare", cacheWarmCheckMs = "cacheWarmCheckShare" }) do
+    local ms = out[old]
+    out[old] = nil
+    if ms ~= nil and out[new] == nil and type(ms) == "number" and main > 0 then out[new] = ms / main end
+  end
+  return out
+end
+
+-- Applies values with checks: unknown keys and wrong types are rejected, numbers are held to the hard limits of
+-- their schema row (integers rounded), creationMode goes through setCreationMode. Returns the list of changes
+-- { key, old, new } and the list of rejections { key, why }; both are remembered for the panel.
+function tun.apply(values, source)
+  local data = tun.migrate(values)
+  local keys = {}
+  for k in pairs(data) do keys[#keys + 1] = k end
+  table.sort(keys)
+  local changed, rejected, mode = {}, {}, nil
+  for _, k in ipairs(keys) do
+    local v, want, row = data[k], TUNING_DEFAULTS[k], tun.byKey[k]
+    if want == nil or NOT_TUNABLE[k] then
+      rejected[#rejected + 1] = { key = k, why = "unknown setting" }
+    elseif type(v) ~= type(want) then
+      rejected[#rejected + 1] = { key = k, why = "expected " .. type(want) }
+    elseif type(v) == "number" and (v ~= v or v == math.huge or v == -math.huge) then
+      rejected[#rejected + 1] = { key = k, why = "not a finite number" }
+    elseif k == "creationMode" then
+      mode = v
+    else
+      if type(v) == "number" then
+        local lo, hi = 0, nil
+        if row then
+          lo = row.lo or 0
+          hi = row.hi or (row.kind == "share" and 1 or nil)
+          if row.kind == "int" then v = math.floor(v + 0.5) end
+        end
+        if v < lo then v = lo end
+        if hi and v > hi then v = hi end
+      end
+      local old = TUNING[k]
+      if old ~= v then
+        TUNING[k] = v
+        changed[#changed + 1] = { key = k, old = old, new = v }
+      end
     end
   end
-  if mode and mode ~= TUNING.creationMode then M.setCreationMode(mode) end
+  if mode and mode ~= TUNING.creationMode then
+    local old = TUNING.creationMode
+    local ok, err = M.setCreationMode(mode)
+    if ok then changed[#changed + 1] = { key = "creationMode", old = old, new = mode }
+    else rejected[#rejected + 1] = { key = "creationMode", why = tostring(err) } end
+  end
+  if #changed > 0 then tun.state.revision = tun.state.revision + 1 end
+  if #changed > 0 or #rejected > 0 or source:find("^preset") or source == "reset" then
+    local now = os.clock()
+    tun.state.last = { source = source, time = now, changed = changed, rejected = rejected, revision = tun.state.revision }
+    for _, c in ipairs(changed) do
+      local log = tun.state.log
+      log[#log + 1] = { time = now, source = source, key = c.key, old = c.old, new = c.new }
+      if #log > 16 then table.remove(log, 1) end
+    end
+  end
+  return changed, rejected
+end
+
+-- Values to apply from the console or code. quiet = true (the panel) skips the log lines: the panel shows the change itself.
+-- Returns the list of changes and the list of rejections.
+function M.setTuning(values, quiet)
+  local changed, rejected = tun.apply(values or {}, quiet and "panel" or "setTuning")
+  if not quiet then
+    for _, c in ipairs(changed) do logMsg("I", "tuning: %s %s -> %s", c.key, tun.fmt(c.old), tun.fmt(c.new)) end
+    for _, r in ipairs(rejected) do logMsg("W", "tuning: %s not applied (%s)", r.key, r.why) end
+  end
+  return changed, rejected
+end
+
+-- Revision (counts every real change), the last change and the recent changes, for the panel or the console.
+function M.getTuningInfo()
+  local recent = {}
+  for i, e in ipairs(tun.state.log) do recent[i] = e end
+  return { revision = tun.state.revision, last = tun.state.last, recent = recent, now = os.clock() }
+end
+
+function tun.defaults()
+  local out = {}
+  for k, v in pairs(TUNING_DEFAULTS) do if not NOT_TUNABLE[k] then out[k] = v end end
+  return out
 end
 
 function M.resetTuning()
-  applyValues(TUNING_DEFAULTS)
-  logMsg("I", "tuning reset to the defaults")
+  local changed = tun.apply(tun.defaults(), "reset")
+  logMsg("I", "tuning reset to the defaults (%d values changed)", #changed)
+  return #changed
 end
 
 function M.listPresets()
@@ -1637,12 +1936,18 @@ function M.listPresets()
   return names
 end
 
+function tun.write(presets)
+  local ok, err = pcall(function() return jsonWriteFile(presetPath(), presets, true) end)
+  if not ok then recordFailure("could not write the presets: " .. tostring(err)); return false, tostring(err) end
+  return true
+end
+
 function M.savePreset(name)
   if type(name) ~= "string" or name == "" then return false, "no name" end
   local presets = readPresets()
   presets[name] = tunableValues()
-  local ok, err = pcall(function() return jsonWriteFile(presetPath(), presets, true) end)
-  if not ok then recordFailure("could not save preset " .. name .. ": " .. tostring(err)); return false, tostring(err) end
+  local ok, err = tun.write(presets)
+  if not ok then return false, err end
   logMsg("I", "preset saved: %s", name)
   return true
 end
@@ -1650,8 +1955,8 @@ end
 function M.loadPreset(name)
   local values = readPresets()[name]
   if type(values) ~= "table" then return false, "no such preset" end
-  applyValues(values)
-  logMsg("I", "preset loaded: %s", name)
+  local changed, rejected = tun.apply(values, "preset " .. tostring(name))
+  logMsg("I", "preset loaded: %s (%d values changed, %d not applied)", name, #changed, #rejected)
   return true
 end
 
@@ -1659,8 +1964,72 @@ function M.deletePreset(name)
   local presets = readPresets()
   if presets[name] == nil then return false, "no such preset" end
   presets[name] = nil
-  local ok = pcall(function() return jsonWriteFile(presetPath(), presets, true) end)
-  return ok
+  return tun.write(presets)
+end
+
+-- Presets per creation mode: three slots (A, B, C) for each of current, shells and resident, stored as "<mode>/<slot>".
+-- A slot nobody saved holds its factory values; a flat A/B/C from before is used for the mode it was saved in.
+function tun.validSlot(mode, slot)
+  if not tun.factory[mode] then return false, "unknown creation mode: " .. tostring(mode) end
+  if not tun.factory[mode][slot] then return false, "unknown preset slot: " .. tostring(slot) end
+  return true
+end
+
+function tun.resolve(presets, mode, slot)
+  local saved = presets[mode .. "/" .. slot]
+  if type(saved) == "table" then return saved, "saved" end
+  local legacy = presets[slot]
+  if type(legacy) == "table" and (legacy.creationMode or "current") == mode then return legacy, "saved" end
+  local values = { creationMode = mode }
+  for k, v in pairs(tun.factory[mode][slot].values) do values[k] = v end
+  return values, "factory"
+end
+
+-- { slot, label, source = "saved" | "factory" } for the three slots of a mode.
+function M.getModePresets(mode)
+  local out = {}
+  if not tun.factory[mode] then return out end
+  local presets = readPresets()
+  for _, slot in ipairs(tun.slots) do
+    local _, source = tun.resolve(presets, mode, slot)
+    out[#out + 1] = { slot = slot, label = tun.factory[mode][slot].label, source = source }
+  end
+  return out
+end
+
+function M.loadModePreset(mode, slot)
+  local ok, err = tun.validSlot(mode, slot)
+  if not ok then return false, err end
+  local values, source = tun.resolve(readPresets(), mode, slot)
+  local name = mode .. "/" .. slot
+  local changed, rejected = tun.apply(values, "preset " .. name .. " (" .. source .. ")")
+  logMsg("I", "preset loaded: %s (%s, %d values changed, %d not applied)", name, source, #changed, #rejected)
+  return true, #changed
+end
+
+function M.saveModePreset(mode, slot)
+  local ok, err = tun.validSlot(mode, slot)
+  if not ok then return false, err end
+  if mode ~= TUNING.creationMode then return false, "the active creation mode is " .. TUNING.creationMode end
+  local presets = readPresets()
+  presets[mode .. "/" .. slot] = tunableValues()
+  local saved, why = tun.write(presets)
+  if not saved then return false, why end
+  logMsg("I", "preset saved: %s/%s", mode, slot)
+  return true
+end
+
+-- Back to the factory values: removes the saved slot (and a flat A/B/C that stood in for it).
+function M.deleteModePreset(mode, slot)
+  local ok, err = tun.validSlot(mode, slot)
+  if not ok then return false, err end
+  local presets = readPresets()
+  local key, removed = mode .. "/" .. slot, false
+  if presets[key] ~= nil then presets[key] = nil; removed = true end
+  local legacy = presets[slot]
+  if type(legacy) == "table" and (legacy.creationMode or "current") == mode then presets[slot] = nil; removed = true end
+  if not removed then return false, "nothing saved in this slot" end
+  return tun.write(presets)
 end
 
 -- The current values as a Lua table, one line each, in the log (to paste back into TUNING).
@@ -1912,6 +2281,14 @@ function M.getStatus()
     residentEvicted = shellStats.evicted, residentMax = TUNING.residentMax, residentReserve = TUNING.residentReserve,
     residentReviveAvgMs = shellStats.revived > 0 and shellStats.reviveMs / shellStats.revived or 0,
     poolTotal = poolTotal(),
+    frameBudget = {
+      mainMs = TUNING.frameBudgetMs,
+      lastMs = { reads = fb.ms.reads, deletes = fb.ms.deletes, creates = fb.ms.creates, shells = fb.ms.shells, warm = fb.ms.warm },
+      avgMs = { reads = fb.avg.reads, deletes = fb.avg.deletes, creates = fb.avg.creates, shells = fb.avg.shells, warm = fb.avg.warm },
+      capsMs = { deletes = TUNING.frameBudgetMs * TUNING.deleteBudgetShare, shells = TUNING.frameBudgetMs * TUNING.shellBuildBudgetShare,
+                 warmCheck = TUNING.frameBudgetMs * TUNING.cacheWarmCheckShare },
+    },
+    tuningRevision = tun.state.revision, lastPurge = tun.state.purge,
     droppedSections = droppedSections, droppedObjects = droppedObjects, droppedLast = droppedLast,
     changeResident = { revived = change.residentRevives, reviveMs = change.residentReviveMs,
                        deactivated = change.residentDeacts, evicted = change.residentEvicts },
@@ -1959,6 +2336,8 @@ end
 -- Builds parked shells ahead (TUNING.shellTarget) while nothing urgent is queued: a little per frame, never in a burst.
 local function shellBuildUpdate()
   if shellBuildOff or TUNING.shellTarget <= 0 or pqHead <= pqTail or not shellMode() then return end
+  local limit = fb.cap(TUNING.shellBuildBudgetShare)
+  if limit <= 0 then return end                       -- the loads used the frame: no shells built ahead this frame
   local started = os.clock()
   local n = 0
   while n < TUNING.shellBuildPerFrame and poolTotal() < TUNING.shellTarget do
@@ -1973,14 +2352,14 @@ local function shellBuildUpdate()
     end
     shellBuildFails = 0
     n = n + 1
-    if (os.clock() - started) * 1000 >= TUNING.shellBuildBudgetMs then break end
+    if (os.clock() - started) * 1000 >= limit then break end
   end
   shellStats.buildMs = shellStats.buildMs + (os.clock() - started) * 1000
 end
 
 -- Resident mode, idle frames only: keep residentReserve shells free and the pool at residentMax by evicting the oldest.
 local function residentTrim()
-  if not residentMode() or pqHead <= pqTail or dormantCount == 0 then return end
+  if not residentMode() or pqHead <= pqTail or dormantCount == 0 or fb.remaining() <= 0 then return end
   local total = poolTotal()
   local over = total - TUNING.residentMax
   local short = TUNING.residentReserve - shellFreeN
@@ -1990,6 +2369,7 @@ end
 
 function M.onUpdate(dtReal)
   if not initialized or suspended then return end
+  fb.start = os.clock()
   totalTime = totalTime + (dtReal or 0)
   updateCamera(dtReal or 0)
   priorityTimer = priorityTimer + (dtReal or 0)
@@ -2002,12 +2382,20 @@ function M.onUpdate(dtReal)
     if dt > 0 and dt < 0.5 then idleFrameMs = idleFrameMs and (idleFrameMs * 0.98 + dt * 1000 * 0.02) or dt * 1000 end
   end
   local frameStarted = os.clock()
+  local t0 = os.clock()
   processSectionReads()
   feedQueue()
+  local t1 = os.clock()
+  fb.record("reads", (t1 - t0) * 1000)
   processUnloads()                                   -- deletes first, within their share of the frame budget
+  local t2 = os.clock()
+  fb.record("deletes", (t2 - t1) * 1000)
   processLoads()                                     -- creates use what is left of it
+  local t3 = os.clock()
+  fb.record("creates", (t3 - t2) * 1000)
   shellBuildUpdate()                                 -- shell pool: build parked shells ahead, only while nothing urgent waits
   residentTrim()
+  fb.record("shells", (os.clock() - t3) * 1000)
   if not settled then
     local workMs = (os.clock() - frameStarted) * 1000
     change.frames = change.frames + 1
@@ -2017,7 +2405,9 @@ function M.onUpdate(dtReal)
     change.dtSum = change.dtSum + dt
     if dt > change.dtMax then change.dtMax = dt end
   end
+  local tw = os.clock()
   cacheWarmUpdate(dtReal or 0)                       -- idle lane: only while nothing is queued
+  fb.record("warm", (os.clock() - tw) * 1000)
   if not settled and M.isIdle() then
     settled = true
     settleSeconds = totalTime - changeStamp

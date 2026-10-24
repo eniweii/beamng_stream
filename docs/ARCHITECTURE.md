@@ -91,7 +91,7 @@ flowchart LR
   collision forced off again, one `postApply`, `hidden = false`; the manager then applies its own
   visibility. `shellFields[id]` remembers the field names per object.
 - Build-ahead: `shellTarget > 0` tops the pool up (free + live) at `shellBuildPerFrame` /
-  `shellBuildBudgetMs` per frame, only while the urgent queue is empty; three failures in a row stop it
+  `shellBuildBudgetShare` x `frameBudgetMs` per frame (never more than the frame has left), only while the urgent queue is empty; three failures in a row stop it
   and are logged once. `buildShells(n)` builds n at once; `clearShellPool()` deletes the parked ones.
 - A TSStatic cannot be registered without a shape (probe: refused), which is why parked shells show a tiny
   shape. Every registered object costs a little per frame even when hidden (about 0.1 us each in the
@@ -110,11 +110,31 @@ flowchart LR
   `liveCount + dormantCount + free >= residentMax`, and in idle frames (`residentTrim`) to keep
   `residentReserve` shells free. `residentCooldown` (default 0) replaces `unloadCooldown` in this mode.
   Leaving the mode parks (to "shells") or deletes (to "current") the resting objects.
-- Tuning API: `getTuning`, `getDefaultTuning`, `setTuning`, `resetTuning`, `savePreset/loadPreset/deletePreset/
-  listPresets` (file `lua/carbon_stream/tuning_presets.json`, wrong types and unknown keys are ignored),
-  `printTuning` (values as Lua lines in the log). A preset called `startup` is applied at initialize.
-  The panel (`nfsc_sectionManagerUi`) has a collapsible Tuning section built from a table of rows; if an imgui
-  call is missing in the engine the section turns itself off with one log line.
+- Frame budget: one clock per frame (`fb`). Every task is capped by `min(its share x frameBudgetMs, what the frame
+  has left)`: section reads (the first always goes, more only while budget is left), deletes
+  (`deleteBudgetShare`), creates (what reads and deletes left), shell building (`shellBuildBudgetShare`), resident
+  trim and the cache warm-up (`cacheWarmCheckShare`; no second import in a spent frame). Task budgets are shares, so
+  they follow `frameBudgetMs`. A frame always makes progress (one read, one create). An indivisible engine call (first
+  use, COLLADA import) can still overrun it. `getStatus().frameBudget` has the last/average ms per task and the caps.
+- Tuning API: `getTuning`, `getDefaultTuning`, `getTuningSchema` (one row per setting: group, label, kind, slider range,
+  hard limits, creation modes it applies in, parent switch, tooltip text), `setTuning(values, quiet)` (rejects unknown
+  keys and wrong types, enforces the hard limits, rounds integers, routes `creationMode` through `setCreationMode`;
+  returns the changes and rejections), `getTuningInfo` (revision, last change, recent changes), `resetTuning`,
+  `printTuning`. Presets: `savePreset/loadPreset/deletePreset/listPresets` (any name, `startup` is applied at
+  initialize) and three slots A/B/C per creation mode (`getModePresets`, `loadModePreset`, `saveModePreset`,
+  `deleteModePreset`; stored as `<mode>/<slot>`; an unsaved slot holds untested factory values, a flat A/B/C from
+  before counts for the mode it was saved in). Presets saved with `shellBuildBudgetMs` / `cacheWarmCheckMs` are
+  converted to shares. File: `lua/carbon_stream/tuning_presets.json`.
+  The panel (`nfsc_sectionManagerUi`) builds its Tuning section from the schema: only the settings that do something
+  in the active creation mode (and whose parent switch is on) are shown, every row has a tooltip, changed rows are
+  starred, shares are edited in ms of the main budget, typed values beyond a slider's range are accepted, and the last
+  change is shown. If an imgui call is missing in the engine the section turns itself off with one log line
+  (tooltips switch off on their own).
+- Purge: `purge{releasePool, hold, keepStats}` cancels every queued job (`clearWork`), removes the live objects the way
+  the creation mode does (delete / park / deactivate), optionally deletes the parked shells and deactivated objects,
+  clears the section selection (streaming starts again from the camera unless `hold`, which suspends it until
+  `setSuspended(false)`), resets the statistics, and verifies the bookkeeping and the runtime group's object count
+  (when the engine lets it count). `resetStats()` zeroes counters and timings only.
 - Dropped sections: `setCurrentSection` checks `settled` before it starts the next change; if the previous
   change had not settled it counts a dropped section and logs what was still missing (queued objects, waiting
   records, section reads, objects created, seconds in the section).
