@@ -1186,14 +1186,14 @@ do
   ui_imgui = im
   local ui = H.load(repo .. "/lua/ge/extensions/nfsc/sectionManagerUi.lua")
   clicks["Resident##creation"] = true
-  sliders["Max creates per frame###tmaxCreatesPerFrame"] = 5
+  sliders["Max refills per frame###tmaxRefillsPerFrame"] = 5
   sliders["Look-ahead###tpredictionEnabled"] = false
   clicks["Save##pA"] = true
   ui.onUpdate()
   clicks, sliders = {}, {}
   check(ui ~= nil, "32a: the panel loads")
   eq(s.getCreationMode(), "resident", "32b: the radio switches the creation mode")
-  eq(s.getTuning().maxCreatesPerFrame, 5, "32c: a slider changes the tuning at once")
+  eq(s.getTuning().maxRefillsPerFrame, 5, "32c: a slider changes the tuning at once")
   eq(s.getTuning().predictionEnabled, false, "32c: so does a checkbox")
   eq(table.concat(s.listPresets(), ","), "resident/A", "32d: the save button saves the slot of the active mode")
   texts = {}
@@ -1438,16 +1438,16 @@ do
   frame(); sliders = {}
   eq(s.getTuning().deleteBudgetShare, 0.5, "38g: editing the ms stores the matching share")
   -- typed values beyond the slider range are accepted, input boxes replace sliders in typing mode
-  sliders["Max creates per frame###tmaxCreatesPerFrame"] = 5000
+  sliders["Max refills per frame###tmaxRefillsPerFrame"] = 5000
   frame(); sliders = {}
-  eq(s.getTuning().maxCreatesPerFrame, 5000, "38h: a value beyond the slider range is accepted")
+  eq(s.getTuning().maxRefillsPerFrame, 5000, "38h: a value beyond the slider range is accepted")
   frame()
   frame()
-  eq(sliderVals["* Max creates per frame###tmaxCreatesPerFrame"], 5000, "38h: and shown")
+  eq(sliderVals["* Max refills per frame###tmaxRefillsPerFrame"], 5000, "38h: and shown")
   sliders["Type values (input boxes instead of sliders)##ttyping"] = true
   frame(); sliders = {}
   frame()
-  check(inputs["* Max creates per frame###tmaxCreatesPerFrame"] == "int", "38i: typing mode uses input boxes (changed settings are starred)")
+  check(inputs["* Max refills per frame###tmaxRefillsPerFrame"] == "int", "38i: typing mode uses input boxes (changed settings are starred)")
   -- purge buttons
   clicks["Purge scene"] = true
   frame(); clicks = {}
@@ -1495,6 +1495,49 @@ do
   s.setTuning({ testingMode = false })
   H.tick(s, 2, 0.1)
   eq(s.getStatus().diagnostics, nil, "39: detailed status is gated off when Testing Mode is disabled")
+end
+
+-- 40. patch 0018/0019: run statistics, same-shape reuse counters, cost-class caps --------------------
+do
+  local s = fresh({ creationMode = "resident" })
+  settle(s, 5)
+  local r = s.getRunStats()
+  eq(r.paths["pool-empty-fresh-object"].n, 9, "40a: the first nine came in through fresh creates")
+  eq(r.paths["resident-revive"].n, 0, "40a: no revive yet")
+  check(r.frames > 0 and r.idleFrames > 0, "40a: frames counted, some of them idle")
+  check(r.settles >= 1, "40a: a settle was recorded")
+  H.cam = { x = 4100, y = -320, z = 0 }
+  settle(s, 5)
+  H.cam = { x = 3950, y = -200, z = 0 }
+  settle(s, 5)
+  r = s.getRunStats()
+  local back = r.paths["resident-revive"].n + r.paths["resident-same-shape-reuse"].n
+  check(back >= 6, "40b: the six that rested came back by revive or same-shape reuse (" .. back .. ")")
+  eq(r.paths["pool-empty-fresh-object"].n, 10, "40b: nine plus the rock were fresh, the way back needed no further fresh create")
+  eq(s.getStatus().run.creates, r.creates, "40b: getStatus carries the run")
+  local before = #H.logs
+  s.logRunSummary()
+  local found = false
+  for i = before + 1, #H.logs do if H.logs[i]:find("RUN SUMMARY", 1, true) then found = true end end
+  check(found, "40c: the run summary is logged")
+  s.resetStats()
+  r = s.getRunStats()
+  eq(r.creates + r.frames + r.settles, 0, "40d: reset statistics zeroes the run")
+end
+do
+  -- 40e: the expensive path has its own cap; the cheap path is not held back by it
+  local s = fresh({ creationMode = "resident", maxRefillsPerFrame = 1, maxCheapPerFrame = 100, frameBudgetMs = 1000 })
+  settle(s, 1)
+  check(s.getRunStats().costlyCapHits > 0, "40e: a refill cap of 1 was hit")
+  settle(s, 20)
+  eq(s.getStatus().liveObjectCount, 9, "40e: everything still loads, over more frames")
+  H.cam = { x = 4100, y = -320, z = 0 }
+  settle(s, 5)
+  H.cam = { x = 3950, y = -200, z = 0 }
+  local capsBefore = s.getRunStats().costlyCapHits
+  settle(s, 3)
+  eq(s.getStatus().liveObjectCount, 9, "40e: the returning section is back fast, the refill cap does not hold revives")
+  eq(s.getRunStats().costlyCapHits, capsBefore, "40e: and it did not touch the refill cap")
 end
 
 -- 33. LuaJIT: no function may get near the 60 upvalue limit ------------------------------------------

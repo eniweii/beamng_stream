@@ -271,6 +271,9 @@ local function drawPurge(st)
   im.SameLine()
   if im.Button("Reset statistics") then nfsc_sectionStreamer.resetStats() end
   tip("Zero the counters and timings without touching tuning, pool or live objects.")
+  im.SameLine()
+  if im.Button("Log run summary") then nfsc_sectionStreamer.logRunSummary() end
+  tip("Write one block to the log for everything since the last Reset statistics or Purge: how objects came back (revive, same-shape reuse, refill, fresh), how busy and how idle the streamer was, time to idle per section, dropped sections.")
   local p = st.lastPurge
   if p then
     im.TextDisabled(string.format("Last purge (%s): cancelled %d queued, %d pending, %d held back; removed %d live%s; pool %d deactivated + %d free; scene %s; %.0f ms%s",
@@ -318,6 +321,19 @@ function M.onUpdate()
     im.Text(string.format("Resident: revived %d (avg %.3f ms), deactivated %d, evicted %d, pool cap %d, free reserve %d",
       st.residentRevived or 0, st.residentReviveAvgMs or 0, st.residentDeactivated or 0, st.residentEvicted or 0,
       st.residentMax or 0, st.residentReserve or 0))
+  end
+  local wa = st.warmAll
+  if wa and (wa.enabled or wa.held > 0) then
+    im.Text(string.format("Everything is warm: %s %d of %d meshes held (avg %.2f ms, max %.0f ms)%s",
+      wa.releasing and "releasing," or (wa.complete and "ON," or "filling,"), wa.held, wa.total, wa.avgMs, wa.maxMs,
+      wa.failed > 0 and string.format(", %d failed", wa.failed) or ""))
+  end
+  local run = st.run
+  if run and st.residentActive then
+    local p = run.paths
+    im.Text(string.format("Run: revive %d, same-shape %d, refill %d (avg %.3f ms), fresh %d    asleep %.0f%% (idle frame %.3f ms)    caps hit: cheap %d, refill %d",
+      p["resident-revive"].n, p["resident-same-shape-reuse"].n, p["shell-refill"].n, p["shell-refill"].avgMs,
+      p["pool-empty-fresh-object"].n, run.sleepShare * 100, run.idleAvgMs, run.cheapCapHits, run.costlyCapHits))
   end
   im.Text(string.format("Dropped sections: %d (%d objects were still missing when the camera left)", st.droppedSections or 0, st.droppedObjects or 0))
   local d = st.droppedLast
