@@ -1459,6 +1459,44 @@ do
   H.files = {}
 end
 
+-- 39. Testing Mode stall diagnostics ---------------------------------------------------------------
+do
+  local s = fresh({ testingMode = true, cacheWarm = false, probeOnSettle = false, logSettle = false })
+  H.tick(s, 6, 0.1)
+  local st = s.getStatus()
+  local d = st.diagnostics
+  check(d ~= nil and d.enabled, "39: Testing Mode exposes diagnostic status")
+  check(d and d.frames > 0, "39: diagnostic frame samples were collected")
+  check(d and d.stageStats.selection ~= nil, "39: section selection has its own stage timing")
+  check(d and d.stageStats.section_reads ~= nil, "39: section reads are separated from queue feeding")
+  check(d and d.stageStats.queue_feed ~= nil, "39: queue feeding has its own stage timing")
+  check(d and d.lastFrame and d.lastFrame.poolEnd ~= nil, "39: frame report records pool composition")
+  if d and d.lastFrame and d.lastFrame.poolEnd then
+    local p = d.lastFrame.poolEnd
+    eq(p.total, p.live + p.dormant + p.free, "39: pool total reconciles with mutually exclusive categories")
+  end
+  check(d and (d.clockSource == "os.clockhp" or d.clockSource == "os.clock (fallback)"), "39: diagnostic reports the selected timer")
+
+  -- Synthetic slow operations exercise aggregation and bounded top-N storage, without relying on
+  -- the machine speed of the offline mock to generate a naturally slow engine API call.
+  local diag = s.stallDiagnostics
+  for i = 1, 20 do
+    diag:recordOperation("synthetic-test", i + 2, st.currentSectionID, "unit-test-key", "unit-test-shape.dae", "resident-revive", i + 1, "synthetic API elapsed")
+  end
+  local section = diag:summary(st.currentSectionID)
+  eq(section.operations["synthetic-test"].count, 20, "39: operation counts aggregate")
+  check(#section.topOps <= diag.topLimit, "39: detailed outliers remain top-N bounded")
+  eq(section.topOps[1].ms, 22, "39: top-N keeps the slowest operation")
+  eq(section.topOps[1].apiMs, 21, "39: top operation retains API elapsed time")
+  local logsBefore = #H.logs
+  s.logDiagnosticSummary(st.currentSectionID)
+  check(#H.logs > logsBefore, "39: diagnostic report writes a summary to the log")
+
+  s.setTuning({ testingMode = false })
+  H.tick(s, 2, 0.1)
+  eq(s.getStatus().diagnostics, nil, "39: detailed status is gated off when Testing Mode is disabled")
+end
+
 -- 33. LuaJIT: no function may get near the 60 upvalue limit ------------------------------------------
 -- BeamNG runs LuaJIT, which refuses to load a file with a function that has more than 60 upvalues (a local
 -- that a function reads or assigns counts). Lua 5.4 allows 255, so only a LuaJIT run can show it.

@@ -71,6 +71,290 @@
 
 local M = {}
 
+-- Bounded, opt-in stall diagnostics. Detailed work is only sampled while Testing Mode is enabled.
+-- os.clockhp is preferred when this GE-Lua runtime exposes it; every timing site below uses the
+-- same seconds-based source. Backwards jumps are counted and clamped in the diagnostic accumulator.
+local STALL = {
+  enabled = false,
+  slowMs = 2.0,
+  spikeMs = 25.0,
+  topLimit = 12,
+  recentLimit = 64,
+  clockSource = type(os.clockhp) == "function" and "os.clockhp" or "os.clock (fallback)",
+}
+M.stallDiagnostics = STALL
+
+function STALL:now()
+  local fn = type(os.clockhp) == "function" and os.clockhp or os.clock
+  local value = fn()
+  if type(value) ~= "number" then value = os.clock() end
+  if self.lastClock and value < self.lastClock then
+    self.clockRegressions = (self.clockRegressions or 0) + 1
+    return self.lastClock
+  end
+  self.lastClock = value
+  return value
+end
+
+function STALL:newStats()
+  return {
+    frames = 0, totalMs = 0, maxFrameMs = 0, worstFrame = nil,
+    spikes = 0, overruns = 0, totalOverrunMs = 0, unattributedMs = 0,
+    backlogGrowthFrames = 0, poolMismatchFrames = 0,
+    stageStats = {}, operations = {}, topOps = {},
+    poolActivity = { built = 0, recycled = 0, fresh = 0, evicted = 0, revived = 0, deactivated = 0, parked = 0 },
+  }
+end
+
+function STALL:reset()
+  self.global = self:newStats()
+  self.sections = {}
+  self.current = nil
+  self.lastFrame = nil
+  self.spikes = {}
+  self.frameId = 0
+  self.clockRegressions = 0
+  self.lastClock = nil
+  self.stageBookkeepingUs = nil
+end
+
+function STALL:sectionStats(section)
+  local key = tostring(section == nil and "none" or section)
+  local stats = self.sections[key]
+  if not stats then
+    stats = self:newStats()
+    self.sections[key] = stats
+  end
+  return stats, key
+end
+
+function STALL:pushTop(list, entry, limit)
+  local at = #list + 1
+  for i = 1, #list do
+    if entry.ms > list[i].ms then at = i; break end
+  end
+  if at > limit then return end
+  table.insert(list, at, entry)
+  if #list > limit then table.remove(list) end
+end
+
+function STALL:recordOperationStats(stats, kind, ms)
+  local item = stats.operations[kind]
+  if not item then item = { count = 0, totalMs = 0, maxMs = 0, slowCount = 0 }; stats.operations[kind] = item end
+  item.count = item.count + 1
+  item.totalMs = item.totalMs + ms
+  if ms > item.maxMs then item.maxMs = ms end
+  if ms >= self.slowMs then item.slowCount = item.slowCount + 1 end
+end
+
+function STALL:recordOperation(kind, ms, section, object, shape, path, apiMs, scope)
+  if not self.enabled or type(ms) ~= "number" then return end
+  self:recordOperationStats(self.global, kind, ms)
+  local sectionStats = self:sectionStats(section)
+  self:recordOperationStats(sectionStats, kind, ms)
+  if ms < self.slowMs then return end
+
+  local pct = apiMs and ms > 0 and math.max(0, math.min(100, apiMs / ms * 100)) or nil
+  local entry = {
+    kind = kind, ms = ms, section = tostring(section == nil and "none" or section),
+    object = tostring(object or "?"), shape = tostring(shape or "?"), path = tostring(path or "n/a"),
+    apiMs = apiMs, outsideApiMs = apiMs and math.max(0, ms - apiMs) or nil,
+    apiPercent = pct, scope = scope or "elapsed operation time",
+    dominant = pct and pct >= 70 and "engine/API-call elapsed dominant"
+      or (pct and "mixed elapsed time" or (scope or "streamer-side or mixed elapsed time")),
+  }
+  self:pushTop(self.global.topOps, entry, self.topLimit)
+  self:pushTop(sectionStats.topOps, entry, math.min(self.topLimit, 8))
+  if self.current then
+    self.current.slowCount = self.current.slowCount + 1
+    self:pushTop(self.current.slowOps, entry, 5)
+  end
+end
+
+function STALL:beginFrame(context)
+  if not self.enabled then return nil end
+  context = context or {}
+  self.frameId = self.frameId + 1
+  self.current = {
+    id = self.frameId, started = context.started or self:now(), sectionStart = context.section,
+    budgetMs = context.budgetMs or 0, queueStart = context.queue, poolStart = context.pool,
+    stages = {}, stageCounts = {}, slowOps = {}, slowCount = 0,
+  }
+  return self.current
+end
+
+function STALL:beginStage(name)
+  if not self.enabled or not self.current then return nil end
+  return self:now()
+end
+
+function STALL:endStage(name, started, itemCount)
+  if not self.enabled or not self.current or not started then return 0 end
+  local ms = math.max(0, (self:now() - started) * 1000)
+  self.current.stages[name] = ms
+  self.current.stageCounts[name] = itemCount or 0
+  return ms
+end
+
+function STALL:addFrameStats(stats, frame)
+  stats.frames = stats.frames + 1
+  stats.totalMs = stats.totalMs + frame.totalMs
+  stats.unattributedMs = stats.unattributedMs + frame.unattributedMs
+  if frame.totalMs > stats.maxFrameMs then
+    stats.maxFrameMs, stats.worstFrame = frame.totalMs, frame
+  end
+  if frame.isSpike then stats.spikes = stats.spikes + 1 end
+  if frame.overrunMs > 0 then
+    stats.overruns = stats.overruns + 1
+    stats.totalOverrunMs = stats.totalOverrunMs + frame.overrunMs
+  end
+  if frame.backlogGrowth then stats.backlogGrowthFrames = stats.backlogGrowthFrames + 1 end
+  if frame.poolMismatch then stats.poolMismatchFrames = stats.poolMismatchFrames + 1 end
+  for name, ms in pairs(frame.stages) do
+    local stage = stats.stageStats[name]
+    if not stage then stage = { count = 0, totalMs = 0, maxMs = 0, items = 0 }; stats.stageStats[name] = stage end
+    stage.count = stage.count + 1
+    stage.totalMs = stage.totalMs + ms
+    stage.items = stage.items + (frame.stageCounts[name] or 0)
+    if ms > stage.maxMs then stage.maxMs = ms end
+  end
+  for name, count in pairs(frame.poolActivity) do stats.poolActivity[name] = (stats.poolActivity[name] or 0) + count end
+end
+
+function STALL:endFrame(context)
+  if not self.enabled or not self.current then return nil end
+  context = context or {}
+  local frame = self.current
+  frame.totalMs = math.max(0, (self:now() - frame.started) * 1000)
+  frame.sectionEnd = context.section
+  frame.queueEnd = context.queue
+  frame.poolEnd = context.pool
+  frame.work = context.work or {}
+  frame.remainingMs = context.remainingMs
+  frame.consumedMs = frame.budgetMs - (frame.remainingMs or (frame.budgetMs - frame.totalMs))
+  frame.overrunMs = math.max(0, frame.consumedMs - frame.budgetMs)
+  frame.isSpike = frame.totalMs >= self.spikeMs
+  local stageSum = 0
+  for _, ms in pairs(frame.stages) do stageSum = stageSum + ms end
+  frame.unattributedMs = math.max(0, frame.totalMs - stageSum)
+  frame.backlogGrowth = frame.queueStart and frame.queueEnd
+    and (frame.queueEnd.backlog or 0) > (frame.queueStart.backlog or 0) or false
+  frame.poolMismatch = false
+  if frame.poolStart and frame.poolEnd then
+    local startSum = (frame.poolStart.live or 0) + (frame.poolStart.dormant or 0) + (frame.poolStart.free or 0)
+    local endSum = (frame.poolEnd.live or 0) + (frame.poolEnd.dormant or 0) + (frame.poolEnd.free or 0)
+    frame.poolMismatch = startSum ~= (frame.poolStart.total or startSum) or endSum ~= (frame.poolEnd.total or endSum)
+    frame.poolActivity = {}
+    for _, name in ipairs({ "built", "recycled", "fresh", "evicted", "revived", "deactivated", "parked" }) do
+      frame.poolActivity[name] = (frame.poolEnd[name] or 0) - (frame.poolStart[name] or 0)
+    end
+  else
+    frame.poolActivity = {}
+  end
+
+  local sectionStats = self:sectionStats(frame.sectionEnd ~= nil and frame.sectionEnd or frame.sectionStart)
+  self:addFrameStats(self.global, frame)
+  self:addFrameStats(sectionStats, frame)
+  self.lastFrame = frame
+  if frame.isSpike then
+    self.spikes[#self.spikes + 1] = frame
+    if #self.spikes > self.recentLimit then table.remove(self.spikes, 1) end
+  end
+  self.current = nil
+  return frame
+end
+
+function STALL:calibrate()
+  -- This only estimates the cost of recording a stage pair; it is not a full profiler-overhead benchmark.
+  local previous = self.current
+  self.current = { stages = {}, stageCounts = {}, slowOps = {}, slowCount = 0 }
+  local n, start = 100, self:now()
+  for _ = 1, n do
+    local mark = self:beginStage("__calibration")
+    self:endStage("__calibration", mark, 0)
+  end
+  local elapsed = math.max(0, self:now() - start)
+  self.current = previous
+  self.stageBookkeepingUs = elapsed * 1000000 / n
+end
+
+function STALL:setEnabled(flag)
+  flag = flag and true or false
+  if flag == self.enabled then return end
+  self.enabled = flag
+  if flag then
+    self:reset()
+    self:calibrate()
+  end
+end
+
+function STALL:summary(section)
+  local stats = section ~= nil and self.sections[tostring(section)] or self.global
+  if not stats then stats = self:newStats() end
+  local stages = {}
+  for name, item in pairs(stats.stageStats) do
+    stages[name] = {
+      count = item.count, avgMs = item.count > 0 and item.totalMs / item.count or 0,
+      maxMs = item.maxMs, items = item.items,
+    }
+  end
+  local operations = {}
+  for name, item in pairs(stats.operations) do
+    operations[name] = {
+      count = item.count, totalMs = item.totalMs,
+      avgMs = item.count > 0 and item.totalMs / item.count or 0,
+      maxMs = item.maxMs, slowCount = item.slowCount,
+    }
+  end
+  local last = self.lastFrame
+  return {
+    enabled = self.enabled, scope = section ~= nil and ("section " .. tostring(section)) or "run",
+    clockSource = self.clockSource, clockRegressions = self.clockRegressions or 0,
+    stageBookkeepingEstimateUs = self.stageBookkeepingUs,
+    frames = stats.frames, avgFrameMs = stats.frames > 0 and stats.totalMs / stats.frames or 0,
+    worstFrameMs = stats.maxFrameMs, worstFrame = stats.worstFrame,
+    spikeCount = stats.spikes, overrunFrames = stats.overruns,
+    totalOverrunMs = stats.totalOverrunMs, avgUnattributedMs = stats.frames > 0 and stats.unattributedMs / stats.frames or 0,
+    backlogGrowthFrames = stats.backlogGrowthFrames, poolMismatchFrames = stats.poolMismatchFrames,
+    stageStats = stages, operations = operations, topOps = stats.topOps,
+    poolActivity = stats.poolActivity, lastFrame = last, recentSpikes = self.spikes,
+  }
+end
+
+function STALL:logFrame(frame, logger)
+  local q0, q1 = frame.queueStart or {}, frame.queueEnd or {}
+  local p0, p1 = frame.poolStart or {}, frame.poolEnd or {}
+  local stages = frame.stages or {}
+  local kind = frame.isSpike and "SPIKE" or "BUDGET OVERRUN"
+  logger("W", "TEST frame #%d %s: %.2f ms; budget %.2f, consumed %.2f, remaining %.2f, overrun %.2f ms; section %s -> %s",
+    frame.id, kind, frame.totalMs, frame.budgetMs, frame.consumedMs, frame.remainingMs or 0, frame.overrunMs,
+    tostring(frame.sectionStart or "none"), tostring(frame.sectionEnd or "none"))
+  logger("W", "  stages ms: selection %.2f, section-read %.2f, queue-feed %.2f, unload %.2f, load %.2f, shell-build %.2f, resident-trim %.2f, cache-warm %.2f, settle/probe %.2f, unattributed %.2f",
+    stages.selection or 0, stages.section_reads or 0, stages.queue_feed or 0, stages.unloads or 0,
+    stages.loads or 0, stages.shell_build or 0, stages.resident_trim or 0, stages.cache_warm or 0,
+    stages.settle_report or 0, frame.unattributedMs or 0)
+  local activity = frame.poolActivity or {}
+  logger("W", "  queue backlog %d -> %d (queued %d -> %d, pending records %d -> %d, reads %d -> %d, deferred %d -> %d); work reads %d, queued %+d, unload %d, create %d, skipped %d, shells %d, evicted %d, warmed %d, stale-drop %+d",
+    q0.backlog or 0, q1.backlog or 0, q0.queued or 0, q1.queued or 0, q0.pending or 0, q1.pending or 0,
+    q0.reads or 0, q1.reads or 0, q0.deferred or 0, q1.deferred or 0,
+    frame.work.reads or 0, frame.work.queued or 0, frame.work.deletes or 0, frame.work.creates or 0,
+    frame.work.skipped or 0, frame.work.shells or 0, frame.work.evicted or 0, frame.work.warmed or 0,
+    (q1.staleDiscarded or 0) - (q0.staleDiscarded or 0))
+  logger("W", "  pool live %d -> %d, deactivated %d -> %d, free %d -> %d, total %d -> %d, cap %s; deltas recycled %+d, fresh %+d, built %+d, revived %+d, evicted %+d; category sum %s",
+    p0.live or 0, p1.live or 0, p0.dormant or 0, p1.dormant or 0, p0.free or 0, p1.free or 0,
+    p0.total or 0, p1.total or 0, tostring(p1.cap or "n/a"), activity.recycled or 0, activity.fresh or 0,
+    activity.built or 0, activity.revived or 0, activity.evicted or 0, frame.poolMismatch and "MISMATCH" or "matches tracked total")
+  for i = 1, math.min(3, #(frame.slowOps or {})) do
+    local op = frame.slowOps[i]
+    logger("W", "  slow op %d: %s %.2f ms; section %s; object %s; shape %s; path %s; API %.2f ms, outside-API %.2f ms; %s",
+      i, op.kind, op.ms, op.section, op.object, op.shape, op.path,
+      op.apiMs or 0, op.outsideApiMs or op.ms, op.dominant or op.scope)
+  end
+end
+
+STALL:reset()
+
+
 -- ---------------------------------------------------------------------------
 -- Tuning (override at runtime with M.setTuning{...})
 -- ---------------------------------------------------------------------------
@@ -87,6 +371,7 @@ local TUNING = {
   probeCount = 20,                -- test objects per probe pass when it runs by itself
   skipNameLookup = false,         -- true: name every object "nfsc_<key>" without the scenetree.findObject duplicate check
   stallLogMs = 100,               -- a single create or cache import slower than this is logged at once (shape, kind)
+  testingMode = false,            -- detailed bounded frame/stall diagnostics; off by default
   logEmptySettles = false,        -- true: also print the settled line of a change that created nothing
   cacheWarm = true,               -- idle-time warm-up of the .cdae shape cache (see header)
   cacheWarmPerFrame = 1,          -- shapes imported per frame; each one is a stall of its own import time
@@ -191,6 +476,8 @@ tun.schema = {
     desc = "Created objects get no collision. On is the current test policy: collision is its own system, deferred." },
   { key = "logSettle", group = "Other", label = "Log settled sections", kind = "bool",
     desc = "Write a timing block to the log when the load of a section change has finished." },
+  { key = "testingMode", group = "Other", label = "Testing Mode", kind = "bool",
+    desc = "Enable bounded per-frame stage timings, slow-operation traces, pool/queue deltas and spike summaries. Adds a small amount of timing/bookkeeping work; turn off for normal play." },
   { key = "probeOnSettle", group = "Other", label = "Probe after settle", kind = "bool", requires = "logSettle",
     desc = "After a settle, time a few test creates and log them next to the real averages. Diagnostic only; it adds a little work to that frame." },
 }
@@ -276,7 +563,7 @@ local function newChange()
            dist = { { n = 0, ms = 0 }, { n = 0, ms = 0 }, { n = 0, ms = 0 } }, nameMs = 0, liveSum = 0, liveMin = nil, liveMax = 0, rn = 0, rx = 0, ry = 0, rxx = 0, rxy = 0 }   -- r*: regression sums of registerObject ms over live count   -- shapes: name -> { n, ms, max, first, reload }
 end
 local change = newChange()                -- everything since the last section change
-local split = { objectMs = 0, fieldsMs = 0, registerMs = 0, groupMs = 0, nameMs = 0, live = 0 }
+local split = { objectMs = 0, fieldsMs = 0, registerMs = 0, groupMs = 0, nameMs = 0, live = 0, path = "new-object" }
 local idleFrameMs = nil              -- moving average of the frame time while nothing is loading   -- cost of the last create
 local frameDeleteMs = 0
 -- One clock for the whole frame: every task is capped by what is left of frameBudgetMs at the moment it starts.
@@ -745,9 +1032,10 @@ local function releaseDormant(deleteThem)
   return n
 end
 
-local function createStreamedObject(item, nameOverride)
+local function createStreamedObject(item, nameOverride, diag)
   local shape = item.shapeName
   if type(shape) ~= "string" or shape == "" then return nil, "missing shapeName" end
+  split.diagRegisterMs = nil
   local pooled = nameOverride == nil and shellMode()      -- probe objects (named) always take the plain path
   if pooled then
     local ta = os.clock()
@@ -756,6 +1044,8 @@ local function createStreamedObject(item, nameOverride)
       if back then
         local ms = (os.clock() - ta) * 1000
         split.objectMs, split.fieldsMs, split.registerMs, split.groupMs, split.nameMs, split.live = 0, 0, 0, 0, 0, liveCount
+        split.path = "resident-revive"
+        if diag then diag:recordOperation("resident-revive", ms, currentSectionID, item.__streamKey or item.name, shape, split.path, nil, "resident revive elapsed; includes lookup and unhide") end
         shellStats.revived, shellStats.reviveMs = shellStats.revived + 1, shellStats.reviveMs + ms
         change.residentRevives, change.residentReviveMs = change.residentRevives + 1, change.residentReviveMs + ms
         return back
@@ -766,6 +1056,8 @@ local function createStreamedObject(item, nameOverride)
     if shell then
       local ms = (os.clock() - ta) * 1000
       split.objectMs, split.fieldsMs, split.registerMs, split.groupMs, split.nameMs, split.live = 0, ms, 0, 0, 0, liveCount
+      split.path = "shell-refill"
+      if diag then diag:recordOperation("shell-refill", ms, currentSectionID, item.__streamKey or item.name, shape, split.path, nil, "field reset/refill, postApply and unhide elapsed; mixed engine/Lua scope") end
       shellStats.recycled, shellStats.recycleMs = shellStats.recycled + 1, shellStats.recycleMs + ms
       change.shellRecycles, change.shellRecycleMs = change.shellRecycles + 1, change.shellRecycleMs + ms
       return shell
@@ -774,10 +1066,15 @@ local function createStreamedObject(item, nameOverride)
     change.shellFresh = change.shellFresh + 1
   end
   local applied = pooled and {} or nil
+  split.path = pooled and "pool-empty-fresh-object" or "new-object"
+  local diagCreateObjectStart = diag and diag:now()
   local t0 = os.clock()
   local obj = createObject("TSStatic")
-  if not obj then return nil, "createObject(TSStatic) returned nil" end
+  local diagCreateObjectMs = diag and ((diag:now() - diagCreateObjectStart) * 1000)
   local t1 = os.clock()
+  if diag then diag:recordOperation("createObject", diagCreateObjectMs, currentSectionID, item.__streamKey or item.name, shape, split.path, diagCreateObjectMs, "createObject API elapsed") end
+  if not obj then return nil, "createObject(TSStatic) returned nil" end
+  local diagFieldsStart = diag and diag:now()
   pcall(obj.setField, obj, "shapeName", 0, shape)
   for field, value in pairs(item) do
     if field ~= "shapeName" and not RESERVED[field] then
@@ -793,9 +1090,18 @@ local function createStreamedObject(item, nameOverride)
     pcall(obj.setField, obj, "decalType", 0, "None")
   end
   local t2 = os.clock()
+  if diag then diag:recordOperation("field-application", (diag:now() - diagFieldsStart) * 1000, currentSectionID, item.__streamKey or item.name, shape, split.path, nil, "fieldText formatting + setField API calls; mixed elapsed scope") end
+  local diagNameStart = diag and diag:now()
   local wantedName = nameOverride or (pooled and shellName() or runtimeName(item, item.__streamKey or "x"))
   local tn = os.clock()
+  if diag then diag:recordOperation("name-prepare", (diag:now() - diagNameStart) * 1000, currentSectionID, item.__streamKey or wantedName, shape, split.path, nil, "streamer-side name generation elapsed") end
+  local diagRegisterStart = diag and diag:now()
   local ok, err = pcall(obj.registerObject, obj, wantedName)
+  if diag then
+    local ms = (diag:now() - diagRegisterStart) * 1000
+    split.diagRegisterMs = ms
+    diag:recordOperation("registerObject", ms, currentSectionID, item.__streamKey or wantedName, shape, split.path, ms, "registerObject API elapsed; includes engine work invoked synchronously")
+  end
   if ok and err == false then ok, err = false, "the engine refused it (returned false)" end
   if not ok then
     pcall(obj.delete, obj)
@@ -805,6 +1111,7 @@ local function createStreamedObject(item, nameOverride)
   local group = ensureRuntimeGroup()
   pcall(group.addObject, group, obj)
   local t4 = os.clock()
+  if diag then diag:recordOperation("group-add", (t4 - t3) * 1000, currentSectionID, item.__streamKey or wantedName, shape, split.path, (t4 - t3) * 1000, "SimGroup.addObject API elapsed") end
   if applied then shellFields[obj:getID()] = applied end
   split.objectMs, split.fieldsMs, split.registerMs, split.groupMs =
     (t1 - t0) * 1000, (t2 - t1) * 1000, (t3 - tn) * 1000, (t4 - t3) * 1000
@@ -851,7 +1158,7 @@ local function unregisterLive(key)
   return entry
 end
 
-local function deleteLive(key)
+local function deleteLive(key, diag)
   local entry = unregisterLive(key)
   if not entry then return end
   notify("onObjectDeleted", key)
@@ -867,7 +1174,11 @@ local function deleteLive(key)
     end
   end
   local obj = scenetree.findObjectById(entry.id)
-  if obj then pcall(obj.delete, obj) end
+  if obj then
+    local deleteStart = diag and diag:now()
+    pcall(obj.delete, obj)
+    if diag then local ms = (diag:now() - deleteStart) * 1000; diag:recordOperation("object-delete-api", ms, currentSectionID, key, entry.shape, "delete", ms, "object.delete API elapsed") end
+  end
 end
 
 -- ---------------------------------------------------------------------------
@@ -1092,7 +1403,7 @@ local function scheduleUnload(key)
   unloadQueue[uqTail] = { key = key, stamp = totalTime }
 end
 
-local function processSectionReads()
+local function processSectionReads(diag)
   local reads = 0
   while srHead <= srTail and reads < TUNING.maxSectionReadsPerFrame and pendingCount < TUNING.maxPendingRecords
         and (reads == 0 or fb.remaining() > 0) do      -- the first read always goes, more only while the budget lasts
@@ -1103,8 +1414,10 @@ local function processSectionReads()
       reads = reads + 1
       local entry = sectionIndex[id]
       local readStart = os.clock()
+      local diagReadStart = diag and diag:now()
       local ok, data = pcall(jsonReadFile, entry.file)
       local readMs = (os.clock() - readStart) * 1000
+      if diag then diag:recordOperation("section-json-read", (diag:now() - diagReadStart) * 1000, id, entry.file, nil, "section-read", nil, "jsonReadFile elapsed; file I/O + JSON decoding, mixed scope") end
       timing.reads, timing.readMs = timing.reads + 1, timing.readMs + readMs
       if readMs > timing.readMax then timing.readMax = readMs end
       if ok and type(data) == "table" and type(data.objects) == "table" then
@@ -1117,6 +1430,7 @@ local function processSectionReads()
     sectionReading[id] = nil
   end
   if srHead > srTail then sectionReadQueue, srHead, srTail = {}, 1, 0 end
+  return reads
 end
 
 -- Expected cost of creating the first instance of a shape (real average once there is one).
@@ -1149,7 +1463,7 @@ local function expectedFirstMs()
   return recentFirstMs or TUNING.firstUseGuessMs
 end
 
-local function processLoads()
+local function processLoads(diag)
   local started = os.clock()
   local budget = fb.remaining()                      -- creates get what reads and deletes left of the frame
   local made, firstUse, skipped = 0, 0, 0
@@ -1181,8 +1495,10 @@ local function processLoads()
         firstKind = (cached == true and "cached") or (cached == false and "import") or "unknown"
       end
       local createStart = os.clock()
-      local obj, err = createStreamedObject(item)
+      local diagCreateStart = diag and diag:now()
+      local obj, err = createStreamedObject(item, nil, diag)
       local createMs = (os.clock() - createStart) * 1000
+      if diag then diag:recordOperation("create-total", (diag:now() - diagCreateStart) * 1000, currentSectionID, key, shape, split.path, split.diagRegisterMs, "whole streamed-create elapsed; API time is nested registerObject only for new objects; remainder is not pure Lua CPU") end
       if createMs >= TUNING.stallLogMs then
         logMsg("W", "slow create: %s %.0f ms (%s), section %s", shape and shortShapeName(shape) or "?", createMs,
           isFirst and ("first use, " .. firstKind) or (isWarm and "warm" or "reload"), tostring(currentSectionID))
@@ -1251,9 +1567,10 @@ local function processLoads()
   if made > createdPeakFrame then createdPeakFrame = made end
   timing.frameLast = (os.clock() - started) * 1000
   if timing.frameLast > timing.framePeak then timing.framePeak = timing.frameLast end
+  return made, skipped
 end
 
-local function processUnloads()
+local function processUnloads(diag)
   local started = os.clock()
   local limit = fb.cap(TUNING.deleteBudgetShare)
   local removed = 0
@@ -1268,7 +1585,9 @@ local function processUnloads()
     elseif totalTime - entry.stamp >= (residentMode() and TUNING.residentCooldown or TUNING.unloadCooldown) then
       pendingUnload[key] = nil
       unloadQueue[uqHead] = nil; uqHead = uqHead + 1
-      deleteLive(key)
+      local deleteStart = diag and diag:now()
+      deleteLive(key, diag)
+      if diag then diag:recordOperation("delete-live-total", (diag:now() - deleteStart) * 1000, currentSectionID, key, nil, "unload", nil, "deleteLive bookkeeping plus deactivation/delete elapsed") end
       removed = removed + 1
       if (os.clock() - started) * 1000 >= limit then break end
     else
@@ -1278,6 +1597,7 @@ local function processUnloads()
   if uqHead > uqTail then unloadQueue, uqHead, uqTail = {}, 1, 0 end
   frameDeleteMs = (os.clock() - started) * 1000
   change.deleted, change.deleteMs = change.deleted + removed, change.deleteMs + frameDeleteMs
+  return removed
 end
 
 -- ---------------------------------------------------------------------------
@@ -1452,8 +1772,9 @@ end
 
 -- Creates one hidden TSStatic of the shape below the camera and deletes it in the same call: the engine
 -- imports the COLLADA and writes the .cdae, nothing is drawn and nothing stays in memory.
-local function warmImport(idx, name)
+local function warmImport(idx, name, diag)
   warm.current = name
+  local diagStarted = diag and diag:now()
   local started = os.clock()
   local cam = core_camera and core_camera.getPosition and core_camera.getPosition()
   local pos = cam and string.format("%.3f %.3f %.3f", cam.x, cam.y, cam.z - 800) or "0 0 -800"
@@ -1465,11 +1786,14 @@ local function warmImport(idx, name)
     pcall(obj.setField, obj, "position", 0, pos)
     pcall(obj.setField, obj, "collisionType", 0, "None")
     pcall(obj.setField, obj, "decalType", 0, "None")
+    local registerStart = diag and diag:now()
     local okc, res = pcall(obj.registerObject, obj, "")
+    if diag then local ms = (diag:now() - registerStart) * 1000; diag:recordOperation("cache-warm-registerObject", ms, currentSectionID, name, name, "cache-warm", ms, "registerObject API elapsed inside cache warm import") end
     ok = okc and res ~= false
     pcall(obj.delete, obj)
   end
   local ms = (os.clock() - started) * 1000
+  if diag then diag:recordOperation("cache-warm-total", (diag:now() - diagStarted) * 1000, currentSectionID, name, name, "cache-warm-fresh", nil, "whole hidden import lifecycle; includes create, fields, register and delete") end
   if ok then
     warmMark(idx, true)
     warm.imported = warm.imported + 1
@@ -1488,7 +1812,7 @@ local function warmImport(idx, name)
   if ms >= TUNING.stallLogMs then logMsg("W", "slow cache warm import: %s %.0f ms", shortShapeName(name), ms) end
 end
 
-local function cacheWarmUpdate(dt)
+local function cacheWarmUpdate(dt, diag)
   if not TUNING.cacheWarm or not warm.loaded or warm.finished or suspended or not initialized then return end
   if not M.isIdle() then warm.idle = 0; return end                -- the section streamer has work: it goes first
   warm.idle = warm.idle + dt
@@ -1526,7 +1850,7 @@ local function cacheWarmUpdate(dt)
       warmMark(idx, true)
       warm.hadCdae = warm.hadCdae + 1
     else
-      warmImport(idx, name)
+      warmImport(idx, name, diag)
       imports = imports + 1
       warm.gap = TUNING.cacheWarmGapSeconds
       mark = os.clock()
@@ -1626,6 +1950,7 @@ function M.resetStats()
   droppedSections, droppedObjects, droppedLast = 0, 0, nil
   for k in pairs(shellStats) do shellStats[k] = 0 end
   shellStats.peakLive = liveCount
+  if M.stallDiagnostics then M.resetDiagnostics() end
   logMsg("I", "statistics reset (tuning and pool unchanged)")
 end
 
@@ -1896,6 +2221,7 @@ function tun.apply(values, source)
       if #log > 16 then table.remove(log, 1) end
     end
   end
+  if M.stallDiagnostics then M.stallDiagnostics:setEnabled(TUNING.testingMode) end
   return changed, rejected
 end
 
@@ -2106,7 +2432,7 @@ end
 -- (unnamed, named with the duplicate check timed on its own, unnamed again to expose order/warm-up
 -- effects), logs the averages with the first and last quarter of each pass, and deletes them again.
 -- It blocks the game for a moment (count x about 5 ms per pass).
-local function runProbe(shapeName, count, auto)
+local function runProbe(shapeName, count, auto, diag)
   if not initialized then return nil, "the streamer is not initialized (is the level loaded?)" end
   count = math.max(4, math.min(tonumber(count) or 40, 200))
   if not shapeName then
@@ -2135,8 +2461,11 @@ local function runProbe(shapeName, count, auto)
         lookupMs[i] = (os.clock() - a) * 1000
       end
       local a = os.clock()
+      local diagRegStart = diag and diag:now()
       local okc, res = pcall(obj.registerObject, obj, name)
+      local diagRegMs = diag and ((diag:now() - diagRegStart) * 1000)
       regMs[i] = (os.clock() - a) * 1000
+      if diag then diag:recordOperation("probe-registerObject", diagRegMs, currentSectionID, name ~= "" and name or ("unnamed-" .. label .. "-" .. i), shapeName, "settle-probe-" .. label, diagRegMs, "registerObject API elapsed during settle probe; includes pcall and synchronous engine call") end
       -- registered for real? refused (false), or not findable afterwards (by name, or by a non-zero id)
       local found = okc and res ~= false
       if found and named then found = scenetree.findObject(name) ~= nil end
@@ -2175,9 +2504,14 @@ local function runProbe(shapeName, count, auto)
     if not item then return end
     local objs, totalMs, regMs, failed = {}, 0, 0, 0
     for i = 1, count do
+      local diagCreateStart = diag and diag:now()
       local a = os.clock()
-      local obj = createStreamedObject(item, "nfsc_probe_real_" .. i)
-      totalMs = totalMs + (os.clock() - a) * 1000
+      local probeName = "nfsc_probe_real_" .. i
+      local obj = createStreamedObject(item, probeName, diag)
+      local diagCreateMs = diag and ((diag:now() - diagCreateStart) * 1000)
+      local createMs = (os.clock() - a) * 1000
+      totalMs = totalMs + createMs
+      if diag then diag:recordOperation("probe-create-total", diagCreateMs, currentSectionID, probeName, shapeName, "settle-probe-real", obj and split.diagRegisterMs or nil, "real-field probe create elapsed; includes nested registerObject API call") end
       if obj then
         objs[#objs + 1] = obj
         regMs = regMs + split.registerMs
@@ -2199,8 +2533,8 @@ local function runProbe(shapeName, count, auto)
     pass("unnamed", false)
     realPass()
   else
-    pass("unnamed", false)
     pass("named", true)
+    pass("unnamed", false)
     pass("unnamed2", false)
     realPass()
   end
@@ -2281,6 +2615,7 @@ function M.getStatus()
     residentEvicted = shellStats.evicted, residentMax = TUNING.residentMax, residentReserve = TUNING.residentReserve,
     residentReviveAvgMs = shellStats.revived > 0 and shellStats.reviveMs / shellStats.revived or 0,
     poolTotal = poolTotal(),
+    diagnostics = TUNING.testingMode and M.stallDiagnostics:summary() or nil,
     frameBudget = {
       mainMs = TUNING.frameBudgetMs,
       lastMs = { reads = fb.ms.reads, deletes = fb.ms.deletes, creates = fb.ms.creates, shells = fb.ms.shells, warm = fb.ms.warm },
@@ -2295,6 +2630,42 @@ function M.getStatus()
     changeShells = { recycled = change.shellRecycles, recycleMs = change.shellRecycleMs, fresh = change.shellFresh,
                      parked = change.shellParks, parkMs = change.shellParkMs },
   }
+end
+
+function M.resetDiagnostics()
+  M.stallDiagnostics:reset()
+  if TUNING.testingMode then M.stallDiagnostics:calibrate() end
+end
+
+function M.logDiagnosticSummary(section)
+  local s = M.stallDiagnostics:summary(section)
+  logMsg("I", "STALL diagnostics (%s): clock %s, frames %d, avg %.2f ms, worst %.2f ms, spikes %d (>= %.1f ms), budget overruns %d (%.2f ms total), queue-growth frames %d, pool mismatches %d, clock regressions %d",
+    s.scope, s.clockSource, s.frames, s.avgFrameMs, s.worstFrameMs, s.spikeCount, M.stallDiagnostics.spikeMs,
+    s.overrunFrames, s.totalOverrunMs, s.backlogGrowthFrames, s.poolMismatchFrames, s.clockRegressions)
+  logMsg("I", "  timing scope: total frame begins before section selection and ends after cache-warm and settle/probe work; operation time is elapsed time, not pure Lua CPU; profiler Lua/LuaGC remains the CPU-side cross-check")
+  logMsg("I", "  instrument estimate: stage begin/end pair %.2f us (microbenchmark only, not total instrumentation overhead); avg unassigned frame time %.2f ms",
+    s.stageBookkeepingEstimateUs or 0, s.avgUnattributedMs)
+  local names = { "selection", "section_reads", "queue_feed", "unloads", "loads", "shell_build", "resident_trim", "cache_warm", "settle_report" }
+  for _, name in ipairs(names) do
+    local stage = s.stageStats[name]
+    if stage then logMsg("I", "  stage %-14s avg %.2f ms, max %.2f ms, work items %d", name, stage.avgMs, stage.maxMs, stage.items) end
+  end
+  logMsg("I", "  operation rows are overlapping scopes where noted (for example create-total contains registerObject); do not add nested totals together")
+  local opNames = { "create-total", "registerObject", "createObject", "field-application", "shell-refill", "resident-revive", "delete-live-total", "object-delete-api", "section-json-read", "cache-warm-total", "cache-warm-registerObject", "shell-construction", "probe-registerObject", "probe-create-total" }
+  for _, name in ipairs(opNames) do
+    local op = s.operations[name]
+    if op then logMsg("I", "  op %-22s count %d, total %.2f ms, avg %.3f ms, max %.2f ms, >=slow threshold %d", name, op.count, op.totalMs, op.avgMs, op.maxMs, op.slowCount) end
+  end
+  local p = s.poolActivity or {}
+  logMsg("I", "  pool activity: built %d, shell reuse %d, fresh/refill %d, resident revived %d, evicted %d, deactivated %d, parked %d",
+    p.built or 0, p.recycled or 0, p.fresh or 0, p.revived or 0, p.evicted or 0, p.deactivated or 0, p.parked or 0)
+  for i = 1, math.min(5, #(s.topOps or {})) do
+    local op = s.topOps[i]
+    logMsg("I", "  slow op %d: %s %.2f ms; section %s; object %s; shape %s; path %s; API %.2f ms, outside-API %.2f ms; %s",
+      i, op.kind, op.ms, op.section, op.object, op.shape, op.path,
+      op.apiMs or 0, op.outsideApiMs or op.ms, op.dominant or op.scope)
+  end
+  if s.worstFrame then M.stallDiagnostics:logFrame(s.worstFrame, logMsg) end
 end
 
 function M.getFailures() return failures end
@@ -2334,14 +2705,16 @@ function M.restartCacheWarm()
 end
 
 -- Builds parked shells ahead (TUNING.shellTarget) while nothing urgent is queued: a little per frame, never in a burst.
-local function shellBuildUpdate()
-  if shellBuildOff or TUNING.shellTarget <= 0 or pqHead <= pqTail or not shellMode() then return end
+local function shellBuildUpdate(diag)
+  if shellBuildOff or TUNING.shellTarget <= 0 or pqHead <= pqTail or not shellMode() then return 0 end
   local limit = fb.cap(TUNING.shellBuildBudgetShare)
-  if limit <= 0 then return end                       -- the loads used the frame: no shells built ahead this frame
+  if limit <= 0 then return 0 end                       -- the loads used the frame: no shells built ahead this frame
   local started = os.clock()
   local n = 0
   while n < TUNING.shellBuildPerFrame and poolTotal() < TUNING.shellTarget do
+    local buildStart = diag and diag:now()
     local ok, err = buildShell()
+    if diag then diag:recordOperation("shell-construction", (diag:now() - buildStart) * 1000, currentSectionID, "nfsc_shell_" .. tostring(shellSerial), TUNING.shellShape, "pool-build", nil, "shell constructor and registration elapsed; mixed engine/Lua scope") end
     if not ok then
       shellBuildFails = shellBuildFails + 1
       if shellBuildFails >= 3 then
@@ -2355,21 +2728,43 @@ local function shellBuildUpdate()
     if (os.clock() - started) * 1000 >= limit then break end
   end
   shellStats.buildMs = shellStats.buildMs + (os.clock() - started) * 1000
+  return n
 end
 
 -- Resident mode, idle frames only: keep residentReserve shells free and the pool at residentMax by evicting the oldest.
 local function residentTrim()
-  if not residentMode() or pqHead <= pqTail or dormantCount == 0 or fb.remaining() <= 0 then return end
+  if not residentMode() or pqHead <= pqTail or dormantCount == 0 or fb.remaining() <= 0 then return 0 end
   local total = poolTotal()
   local over = total - TUNING.residentMax
   local short = TUNING.residentReserve - shellFreeN
-  if over <= 0 and not (short > 0 and total >= TUNING.residentMax) then return end
-  evictOldest(math.min(dormantCount, 8, math.max(over, short, 1)))
+  if over <= 0 and not (short > 0 and total >= TUNING.residentMax) then return 0 end
+  return evictOldest(math.min(dormantCount, 8, math.max(over, short, 1)))
 end
 
 function M.onUpdate(dtReal)
   if not initialized or suspended then return end
   fb.start = os.clock()
+  local frameStarted = fb.start
+  local diag = TUNING.testingMode and M.stallDiagnostics or nil
+  local sectionBefore = currentSectionID
+  if diag then
+    local deferredN = 0
+    for _, list in pairs(deferred) do deferredN = deferredN + #list end
+    local queuedN = math.max(0, lqTail - lqHead + 1) + math.max(0, pqTail - pqHead + 1)
+    local poolN = poolTotal()
+    diag:beginFrame({
+      started = diag:now(), section = currentSectionID, budgetMs = TUNING.frameBudgetMs,
+      queue = { urgent = math.max(0, pqTail - pqHead + 1), load = math.max(0, lqTail - lqHead + 1),
+        queued = queuedN, pending = pendingCount, reads = math.max(0, srTail - srHead + 1),
+        unloads = math.max(0, uqTail - uqHead + 1), deferred = deferredN, backlog = queuedN + pendingCount + deferredN + math.max(0, srTail - srHead + 1),
+        staleDiscarded = staleDiscarded, droppedObjects = droppedObjects, deferredFirst = change.deferredFirst },
+      pool = { live = liveCount, dormant = dormantCount, free = shellFreeN, total = poolN,
+        cap = residentMode() and TUNING.residentMax or nil, mode = TUNING.creationMode,
+        built = shellStats.built, recycled = shellStats.recycled, fresh = shellStats.fresh, evicted = shellStats.evicted,
+        revived = shellStats.revived, deactivated = shellStats.deactivated, parked = shellStats.parked },
+    })
+  end
+  local selectionStart = diag and diag:beginStage("selection")
   totalTime = totalTime + (dtReal or 0)
   updateCamera(dtReal or 0)
   priorityTimer = priorityTimer + (dtReal or 0)
@@ -2377,24 +2772,39 @@ function M.onUpdate(dtReal)
     priorityTimer = 0
     rebuildFeedOrder()
   end
+  if diag then diag:endStage("selection", selectionStart, currentSectionID ~= sectionBefore and 1 or 0) end
   if settled and M.isIdle() then
     local dt = dtReal or 0
     if dt > 0 and dt < 0.5 then idleFrameMs = idleFrameMs and (idleFrameMs * 0.98 + dt * 1000 * 0.02) or dt * 1000 end
   end
-  local frameStarted = os.clock()
   local t0 = os.clock()
-  processSectionReads()
+  local readStageStart = diag and diag:beginStage("section_reads")
+  local readCount = processSectionReads(diag)
+  if diag then diag:endStage("section_reads", readStageStart, readCount) end
+  local queuedBefore = queueLength()
+  local queueStageStart = diag and diag:beginStage("queue_feed")
   feedQueue()
+  local queuedAfter = queueLength()
+  local queuedCount = math.max(0, queuedAfter - queuedBefore)
+  if diag then diag:endStage("queue_feed", queueStageStart, queuedCount) end
   local t1 = os.clock()
   fb.record("reads", (t1 - t0) * 1000)
-  processUnloads()                                   -- deletes first, within their share of the frame budget
+  local unloadStageStart = diag and diag:beginStage("unloads")
+  local unloadCount = processUnloads(diag)               -- deletes first, within their share of the frame budget
+  if diag then diag:endStage("unloads", unloadStageStart, unloadCount) end
   local t2 = os.clock()
   fb.record("deletes", (t2 - t1) * 1000)
-  processLoads()                                     -- creates use what is left of it
+  local loadStageStart = diag and diag:beginStage("loads")
+  local createCount, skippedCount = processLoads(diag)  -- creates use what is left of it
+  if diag then diag:endStage("loads", loadStageStart, createCount); diag.current.workSkipped = skippedCount end
   local t3 = os.clock()
   fb.record("creates", (t3 - t2) * 1000)
-  shellBuildUpdate()                                 -- shell pool: build parked shells ahead, only while nothing urgent waits
-  residentTrim()
+  local shellStageStart = diag and diag:beginStage("shell_build")
+  local shellsBuilt = shellBuildUpdate(diag)             -- idle shell construction, limited by remaining budget
+  if diag then diag:endStage("shell_build", shellStageStart, shellsBuilt) end
+  local trimStageStart = diag and diag:beginStage("resident_trim")
+  local evictedCount = residentTrim()
+  if diag then diag:endStage("resident_trim", trimStageStart, evictedCount) end
   fb.record("shells", (os.clock() - t3) * 1000)
   if not settled then
     local workMs = (os.clock() - frameStarted) * 1000
@@ -2406,15 +2816,20 @@ function M.onUpdate(dtReal)
     if dt > change.dtMax then change.dtMax = dt end
   end
   local tw = os.clock()
-  cacheWarmUpdate(dtReal or 0)                       -- idle lane: only while nothing is queued
+  local warmBefore = warm.processed
+  local warmStageStart = diag and diag:beginStage("cache_warm")
+  cacheWarmUpdate(dtReal or 0, diag)                  -- idle lane: only while nothing is queued
+  local warmedCount = warm.processed - warmBefore
+  if diag then diag:endStage("cache_warm", warmStageStart, warmedCount) end
   fb.record("warm", (os.clock() - tw) * 1000)
+  local settleStageStart = diag and diag:beginStage("settle_report")
   if not settled and M.isIdle() then
     settled = true
     settleSeconds = totalTime - changeStamp
     if settleSeconds > settlePeak then settlePeak = settleSeconds end
     if TUNING.logSettle and (createdSinceChange > 0 or TUNING.logEmptySettles) then
       local c = change
-      logMsg("I", "section %s settled: %d objects in %.2f s (%.0f/s), %d frames, %.1f fps (worst frame %.0f ms), streaming %.1f ms/frame (peak %.0f ms)",
+      logMsg("I", "section %s settled: %d objects in %.2f s (%.0f/s), %d frames, %.1f fps (worst frame %.0f ms), core streaming %.1f ms/frame (peak %.0f ms; excludes cache-warm and settle/probe work)",
         tostring(currentSectionID), createdSinceChange, settleSeconds,
         settleSeconds > 0 and createdSinceChange / settleSeconds or 0,
         c.frames, c.dtSum > 0 and c.frames / c.dtSum or 0, c.dtMax * 1000, c.frames > 0 and c.workMs / c.frames or 0, c.workMax)
@@ -2467,7 +2882,7 @@ function M.onUpdate(dtReal)
             if not best or cost.n > best.n or (cost.n == best.n and name < bestName) then bestName, best = name, cost end
           end
           if bestName then
-            local ok, results, why = pcall(runProbe, bestName, TUNING.probeCount, true)
+            local ok, results, why = pcall(runProbe, bestName, TUNING.probeCount, true, diag)
             if not ok then
               logMsg("E", "probe after settle failed: %s", tostring(results))
             elseif not results then
@@ -2483,6 +2898,33 @@ function M.onUpdate(dtReal)
           end
         end
       end
+    end
+  end
+  if diag then diag:endStage("settle_report", settleStageStart, 0) end
+  if diag then
+    local deferredAfter = 0
+    for _, list in pairs(deferred) do deferredAfter = deferredAfter + #list end
+    local queuedEnd = math.max(0, lqTail - lqHead + 1) + math.max(0, pqTail - pqHead + 1)
+    local poolEnd = poolTotal()
+    local frameReport = diag:endFrame({
+      section = currentSectionID, remainingMs = fb.remaining(),
+      queue = { urgent = math.max(0, pqTail - pqHead + 1), load = math.max(0, lqTail - lqHead + 1),
+        queued = queuedEnd, pending = pendingCount, reads = math.max(0, srTail - srHead + 1),
+        unloads = math.max(0, uqTail - uqHead + 1), deferred = deferredAfter,
+        backlog = queuedEnd + pendingCount + deferredAfter + math.max(0, srTail - srHead + 1), staleDiscarded = staleDiscarded,
+        droppedObjects = droppedObjects, deferredFirst = change.deferredFirst },
+      pool = { live = liveCount, dormant = dormantCount, free = shellFreeN, total = poolEnd,
+        cap = residentMode() and TUNING.residentMax or nil, mode = TUNING.creationMode,
+        built = shellStats.built, recycled = shellStats.recycled, fresh = shellStats.fresh, evicted = shellStats.evicted,
+        revived = shellStats.revived, deactivated = shellStats.deactivated, parked = shellStats.parked },
+      work = { reads = readCount, queued = queuedCount, deletes = unloadCount, creates = createCount,
+        skipped = skippedCount, shells = shellsBuilt, evicted = evictedCount, warmed = warmedCount },
+    })
+    if frameReport and (frameReport.isSpike or frameReport.overrunMs >= 3.0) then
+      logMsg("W", "TEST frame #%d %s: %.2f ms; budget %.2f, consumed %.2f, remaining %.2f, overrun %.2f ms; section %s -> %s (details retained; use Print run + section stall report)",
+        frameReport.id, frameReport.isSpike and "SPIKE" or "BUDGET OVERRUN", frameReport.totalMs,
+        frameReport.budgetMs, frameReport.consumedMs, frameReport.remainingMs or 0, frameReport.overrunMs,
+        tostring(frameReport.sectionStart or "none"), tostring(frameReport.sectionEnd or "none"))
     end
   end
 end

@@ -213,6 +213,13 @@ local function drawTuning(st)
     local mode = tuning.creationMode or "current"
     drawChangeInfo()
     drawBudgetUse(st)
+    if tuning.testingMode and st.diagnostics then
+      local d = st.diagnostics
+      im.TextDisabled(string.format("STALL diagnostics: %d frames, avg %.1f ms, worst %.1f ms, spikes %d, budget overruns %d, clock %s",
+        d.frames or 0, d.avgFrameMs or 0, d.worstFrameMs or 0, d.spikeCount or 0, d.overrunFrames or 0, tostring(d.clockSource)))
+      if im.Button("Print run + section stall report") then streamer.logDiagnosticSummary(); streamer.logDiagnosticSummary(st.currentSectionID) end
+      tip("Print the current section's bounded stage summary and slowest operations to the game log. Use Reset statistics before each repeatable camera-track run.")
+    end
     if not typingPtr then typingPtr = im.BoolPtr(false) end
     im.Checkbox("Type values (input boxes instead of sliders)##ttyping", typingPtr)
     tip("Input boxes take any number. With sliders, Ctrl+click a slider to type one: values beyond the slider range are accepted and the range grows to fit. Hard limits (for example a share cannot exceed the whole frame budget) are enforced by the streamer.")
