@@ -46,7 +46,9 @@
 -- related sections first, then the rest of shapes.json, skips shapes whose .cdae already exists
 -- (FS:fileExists) and imports the others one at a time, cacheWarmGapSeconds apart: a hidden TSStatic
 -- below the camera, created and deleted in the same call, so it is never drawn and keeps no memory. The
--- .cdae on disk is the progress record. Without FS:fileExists or shapes.json the lane stays off.
+-- .cdae on disk is the progress record. Without FS:fileExists the lane stays off. Shape names come from
+-- shapes.json (builder output); when the pack has none, hold.scanUpdate reads every section file in idle time
+-- and builds the same index from the shapeName fields (the game loads <shape>.cdae by itself).
 -- getCacheWarmStatus() feeds a progress display.
 --
 -- "Everything is warm" (TUNING.warmAll, a test mode): the streamer holds every shape of shapes.json with one hidden
@@ -389,6 +391,7 @@ local TUNING = {
   cacheWarmIdleSeconds = 1.0,     -- both load queues must have been empty this long before the lane starts
   cacheWarmCheckShare = 0.0625,   -- share of frameBudgetMs per frame for skipping shapes that already have a .cdae (1 ms at 16)
   cacheWarmLogEvery = 100,        -- progress line after this many imports (0 = none)
+  shapeIndexBudgetShare = 0.25,   -- share of frameBudgetMs per frame for reading section files into the shape index (one file always goes)
   warmAll = false,                -- "Everything is warm" test mode: hold every mesh with one hidden object each (see header)
   warmAllPerFrame = 8,            -- meshes held per frame while the lane runs
   warmAllBudgetShare = 0.5,       -- share of frameBudgetMs per frame for holding (a first import can still run longer)
@@ -491,8 +494,11 @@ tun.schema = {
   { key = "cacheWarmCheckShare", group = "Cache warm-up", label = "Skip-check share", kind = "share", min = 0.01, max = 1, requires = "cacheWarm",
     desc = "Part of the frame budget the lane may spend looking for shapes that already have a .cdae (skipping is cheap but there are about 30k shapes). Higher: the scan finishes sooner, with a heavier idle frame." },
 
+  { key = "shapeIndexBudgetShare", group = "Cache warm-up", label = "Shape index share", kind = "share", min = 0.05, max = 4,
+    desc = "Only used when the pack has no shapes.json: part of the frame budget the shape index may spend per frame reading section files (one file is always read per idle frame). Higher: the index is ready sooner, with longer idle frames." },
+
   { key = "warmAll", group = "Everything is warm", label = "Everything is warm", kind = "bool",
-    desc = "Test mode: keep every mesh of shapes.json loaded by holding it with one hidden object each (about 30k, RAM only, nothing drawn). Then no mesh is ever loaded while streaming, so a run measures object work only: registerObject, field writes, hide/unhide, shell retargets. Starts while nothing is queued; Off releases the meshes. Purge and mode switches leave them alone. The hidden objects cost the engine a little every frame, the same in every mode." },
+    desc = "Test mode: keep every mesh used by the streamed sections loaded by holding it with one hidden object each (about 30k, RAM only, nothing drawn). Then no mesh is ever loaded while streaming, so a run measures object work only: registerObject, field writes, hide/unhide, shell retargets. Starts while nothing is queued; Off releases the meshes. Purge and mode switches leave them alone. The hidden objects cost the engine a little every frame, the same in every mode." },
   { key = "warmAllPerFrame", group = "Everything is warm", label = "Meshes held per frame", kind = "int", min = 1, max = 64, lo = 1, requires = "warmAll",
     desc = "Most shapes held in one frame. Each one is a mesh load (about 1 to 2 ms from the .cdae cache, 5 ms or more when it must be imported first). Higher: warm sooner, longer frames while it runs. Lower: gentler." },
   { key = "warmAllBudgetShare", group = "Everything is warm", label = "Frame share for holding", kind = "share", min = 0.05, max = 4, requires = "warmAll",
@@ -619,7 +625,7 @@ end
 -- streamer was and how long it slept. One table, so the big functions do not read more locals.
 local function newRun(stamp)
   local r = { stamp = stamp or 0, frames = 0, busy = 0, busyMs = 0, busyMax = 0, idle = 0, idleMs = 0, idleMax = 0,
-              warmFrames = 0, warmMs = 0, settles = 0, settleSum = 0, settleMax = 0, capHits = { cheap = 0, costly = 0 }, paths = {} }
+              warmFrames = 0, warmMs = 0, coldFrames = 0, settles = 0, settleSum = 0, settleMax = 0, capHits = { cheap = 0, costly = 0 }, paths = {} }
   r.order = { "resident-revive", "resident-same-shape-reuse", "shell-refill", "pool-empty-fresh-object", "new-object" }
   for _, name in ipairs(r.order) do r.paths[name] = { n = 0, ms = 0, max = 0 } end
   return r
@@ -627,7 +633,9 @@ end
 local run = newRun(0)
 -- Everything-warm: state and lane functions in one table (the main chunk is close to Lua's 200 locals limit).
 local hold = { shape = {}, ids = {}, held = 0, cursor = 1, failed = 0, ms = 0, max = 0, maxShape = nil, group = nil,
-               idle = 0, seconds = 0, complete = false }
+               idle = 0, seconds = 0, complete = false,
+               runSeconds = 0, phase = "off", slow = {},                   -- progress readout: time spent holding, lane phase, slowest loads
+               kind = { cached = { n = 0, ms = 0 }, import = { n = 0, ms = 0 }, unknown = { n = 0, ms = 0 } } }   -- .cdae existed / had to be imported / unknown
 local changeStamp, createdSinceChange, settled, settleSeconds, settlePeak = 0, 0, true, 0, 0
 local createdTotal, deletedTotal, failureCount, verified = 0, 0, 0, 0
 local failures = {}
@@ -1869,7 +1877,8 @@ local function newWarm()
   return { loaded = false, names = {}, bySection = {}, total = 0, done = {}, processed = 0,
            near = {}, nearPos = 1, nearFor = false, cursor = 1, idle = 0, gap = 0,
            hadCdae = 0, imported = 0, failed = 0, skipped = 0, importMs = 0, importMax = 0, importMaxShape = nil,
-           current = nil, finished = false }
+           current = nil, finished = false,
+           phase = "waiting: idle timer", runSeconds = 0, slow = {}, scan = nil }      -- progress readout: lane phase, time spent running, slowest imports
 end
 local warm = newWarm()
 
@@ -1877,7 +1886,13 @@ local function loadShapeList()
   warm = newWarm()
   local data = jsonReadFile(levelRoot .. "/" .. SHAPES_JSON)
   if type(data) ~= "table" or type(data.shapes) ~= "table" then
-    logMsg("I", "no %s: the shape cache warm-up is off (rebuild with the current builder)", SHAPES_JSON)
+    local ids = {}
+    for id in pairs(sectionIndex) do ids[#ids + 1] = id end
+    table.sort(ids)
+    if #ids == 0 then logMsg("I", "no %s and no streamed sections: the shape cache warm-up is off", SHAPES_JSON); return end
+    warm.scan = { ids = ids, pos = 1, perSection = {}, counts = {}, unique = 0, files = 0, failed = 0, records = 0,
+                  ms = 0, runSeconds = 0, idle = 0, done = false }
+    logMsg("I", "no %s: shape names are indexed from the %d section files while nothing is queued", SHAPES_JSON, #ids)
     return
   end
   warm.names, warm.total = data.shapes, #data.shapes
@@ -1956,6 +1971,7 @@ local function warmImport(idx, name, diag)
     warm.imported = warm.imported + 1
     warm.importMs = warm.importMs + ms
     if ms > warm.importMax then warm.importMax, warm.importMaxShape = ms, name end
+    hold.noteSlow(warm.slow, name, ms, "import")
     if TUNING.cacheWarmLogEvery > 0 and warm.imported % TUNING.cacheWarmLogEvery == 0 then
       logMsg("I", "cache warm: %d of %d shapes done (%d already had a .cdae, %d imported now, %d failed), import avg %.1f ms, max %.0f ms (%s)",
         warm.processed, warm.total, warm.hadCdae, warm.imported, warm.failed, warm.importMs / warm.imported,
@@ -1970,10 +1986,17 @@ local function warmImport(idx, name, diag)
 end
 
 local function cacheWarmUpdate(dt, diag)
-  if not TUNING.cacheWarm or TUNING.warmAll or not warm.loaded or warm.finished or suspended or not initialized then return end
-  if not M.isIdle() then warm.idle = 0; return end                -- the section streamer has work: it goes first
+  if not TUNING.cacheWarm or TUNING.warmAll or not warm.loaded or warm.finished or suspended or not initialized then
+    warm.phase = warm.finished and "finished" or (TUNING.warmAll and "replaced by Everything is warm")
+      or (not TUNING.cacheWarm and "off") or (suspended and "suspended")
+      or ((warm.scan and not warm.scan.done) and "indexing shape names") or (not warm.loaded and "unavailable") or "starting"
+    return
+  end
+  if not M.isIdle() then warm.idle = 0; warm.phase = "waiting: sections are streaming"; return end   -- the section streamer has work: it goes first
   warm.idle = warm.idle + dt
-  if warm.idle < TUNING.cacheWarmIdleSeconds then return end
+  if warm.idle < TUNING.cacheWarmIdleSeconds then warm.phase = "waiting: idle timer"; return end
+  warm.phase = "running"
+  warm.runSeconds = warm.runSeconds + dt
   if warm.gap > 0 then
     warm.gap = warm.gap - dt
     if warm.gap > 0 then return end
@@ -1986,7 +2009,7 @@ local function cacheWarmUpdate(dt, diag)
     if imports > 0 and fb.remaining() <= 0 then break end     -- an import is a stall of its own: no second one in a spent frame
     local idx = warmNextCandidate()
     if not idx then
-      warm.finished, warm.current = true, nil
+      warm.finished, warm.current, warm.phase = true, nil, "finished"
       logMsg("I", "cache warm finished: %d shapes (%d already had a .cdae, %d imported now, %d failed, %d skipped), import avg %.1f ms",
         warm.total, warm.hadCdae, warm.imported, warm.failed, warm.skipped,
         warm.imported > 0 and warm.importMs / warm.imported or 0)
@@ -2022,6 +2045,87 @@ end
 function hold.reset()
   hold.shape, hold.ids, hold.held, hold.cursor, hold.failed = {}, {}, 0, 1, 0
   hold.ms, hold.max, hold.maxShape, hold.group, hold.idle, hold.seconds, hold.complete = 0, 0, nil, nil, 0, 0, false
+  hold.runSeconds, hold.phase, hold.slow = 0, "off", {}
+  hold.kind = { cached = { n = 0, ms = 0 }, import = { n = 0, ms = 0 }, unknown = { n = 0, ms = 0 } }
+end
+
+-- Keeps the 10 slowest loads of a lane (shape, ms, kind), slowest first.
+function hold.noteSlow(list, name, ms, kind)
+  local n = #list
+  if n >= 10 and ms <= list[n].ms then return end
+  list[n + 1] = { name = name, ms = ms, kind = kind }
+  table.sort(list, function(a, b) return a.ms > b.ms end)
+  if #list > 10 then list[#list] = nil end
+end
+
+-- The section files are read once, one per idle frame within shapeIndexBudgetShare, and every shapeName is collected.
+-- Result: the same lists shapes.json holds (every unique shape once, widest use first, per-section positions).
+function hold.scanFinish(sc)
+  local counts, names = sc.counts, {}
+  for name in pairs(counts) do names[#names + 1] = name end
+  table.sort(names, function(a, b)
+    if counts[a] ~= counts[b] then return counts[a] > counts[b] end
+    return a < b
+  end)
+  local position = {}
+  for i = 1, #names do position[names[i]] = i end
+  local bySection = {}
+  for id, list in pairs(sc.perSection) do
+    local out = {}
+    for i = 1, #list do out[i] = position[list[i]] end
+    table.sort(out)
+    bySection[id] = out
+  end
+  warm.names, warm.total, warm.bySection, warm.loaded = names, #names, bySection, #names > 0
+  sc.done, sc.perSection, sc.counts = true, nil, nil               -- the working tables are no longer needed
+  logMsg("I", "shape index built: %d unique shapes from %d section files (%d records, %d unreadable), %.1f s of reads in %.0f s of idle time",
+    #names, sc.files, sc.records, sc.failed, sc.ms / 1000, sc.runSeconds)
+end
+
+-- Returns how many section files it read this frame.
+function hold.scanUpdate(dt)
+  local sc = warm.scan
+  if not sc or sc.done or suspended or not initialized then return 0 end
+  if not (TUNING.cacheWarm or TUNING.warmAll) then return 0 end      -- nobody needs the names yet
+  if not M.isIdle() then sc.idle = 0; return 0 end                   -- the section streamer goes first
+  sc.idle = sc.idle + dt
+  if sc.idle < TUNING.cacheWarmIdleSeconds then return 0 end
+  sc.runSeconds = sc.runSeconds + dt
+  local limit = fb.cap(TUNING.shapeIndexBudgetShare)
+  local started, n = os.clock(), 0
+  while sc.pos <= #sc.ids do
+    if n > 0 and (os.clock() - started) * 1000 >= limit then break end
+    local id = sc.ids[sc.pos]
+    sc.pos = sc.pos + 1
+    local t0 = os.clock()
+    local ok, data = pcall(jsonReadFile, sectionIndex[id].file)
+    n, sc.files = n + 1, sc.files + 1
+    if ok and type(data) == "table" and type(data.objects) == "table" then
+      local seen, list = {}, {}
+      for i = 1, #data.objects do
+        local rec = data.objects[i]
+        local shape = type(rec) == "table" and rec.shapeName or nil
+        if type(shape) == "string" and shape ~= "" then
+          sc.records = sc.records + 1
+          if not seen[shape] then
+            seen[shape] = true
+            list[#list + 1] = shape
+            if not sc.counts[shape] then sc.unique = sc.unique + 1 end
+            sc.counts[shape] = (sc.counts[shape] or 0) + 1
+          end
+        end
+      end
+      sc.perSection[id] = list
+    else
+      sc.failed = sc.failed + 1
+      if sc.failed <= 5 then logMsg("W", "shape index: could not read section file %s", tostring(sectionIndex[id].file)) end
+    end
+    local ms = (os.clock() - t0) * 1000
+    sc.ms = sc.ms + ms
+    if ms >= TUNING.stallLogMs then logMsg("W", "slow shape index read: section %s %.0f ms", tostring(id), ms) end
+  end
+  if sc.pos > #sc.ids then hold.scanFinish(sc) end
+  return n
 end
 
 function hold.ensureGroup()
@@ -2042,6 +2146,8 @@ end
 function hold.add(name)
   local group = hold.ensureGroup()
   if not group then return false end
+  local cached = shapeCached(name)                              -- asked before the load: afterwards the .cdae exists either way
+  local kind = cached == true and "cached" or (cached == false and "import" or "unknown")
   local cam = core_camera and core_camera.getPosition and core_camera.getPosition()
   local pos = cam and string.format("%.3f %.3f %.3f", cam.x, cam.y, cam.z - 800) or "0 0 -800"
   local started = os.clock()
@@ -2066,6 +2172,9 @@ function hold.add(name)
   local ms = (os.clock() - started) * 1000
   if ok then
     hold.ms = hold.ms + ms
+    local k = hold.kind[kind]
+    k.n, k.ms = k.n + 1, k.ms + ms
+    hold.noteSlow(hold.slow, name, ms, kind)
     if ms > hold.max then hold.max, hold.maxShape = ms, name end
     if TUNING.warmAllLogEvery > 0 and hold.held % TUNING.warmAllLogEvery == 0 then
       logMsg("I", "everything warm: %d of %d meshes held (%d failed), avg %.2f ms, max %.0f ms (%s)",
@@ -2100,24 +2209,33 @@ end
 -- The lane, once per frame. Returns how many meshes it held.
 function hold.update(dt)
   if not TUNING.warmAll then
+    hold.phase = hold.held > 0 and "releasing" or "off"
     if hold.held > 0 or hold.group then hold.release(512) end
     return 0
   end
-  if suspended or not initialized or warm.total <= 0 or hold.complete then return 0 end
+  if suspended or not initialized or warm.total <= 0 or hold.complete then
+    hold.phase = hold.complete and "complete" or (not initialized and "starting") or (suspended and "suspended")
+      or ((warm.scan and not warm.scan.done) and "waiting: indexing shape names") or "no shape names"
+    return 0
+  end
   hold.seconds = hold.seconds + dt
-  if not M.isIdle() then hold.idle = 0; return 0 end             -- the section streamer goes first
+  if not M.isIdle() then hold.idle = 0; hold.phase = "waiting: sections are streaming"; return 0 end   -- the section streamer goes first
   hold.idle = hold.idle + dt
-  if hold.idle < TUNING.cacheWarmIdleSeconds then return 0 end
+  if hold.idle < TUNING.cacheWarmIdleSeconds then hold.phase = "waiting: idle timer"; return 0 end
   local limit = fb.cap(TUNING.warmAllBudgetShare)
-  if limit <= 0 then return 0 end
+  if limit <= 0 then hold.phase = "waiting: frame budget spent"; return 0 end
+  hold.phase = "holding"
+  hold.runSeconds = hold.runSeconds + dt
   local started, made = os.clock(), 0
   while made < TUNING.warmAllPerFrame do
     if made > 0 and (os.clock() - started) * 1000 >= limit then break end
     local idx = hold.cursor
     if idx > warm.total then
-      hold.complete = true
-      logMsg("I", "everything warm: all %d meshes held (%d failed), avg %.2f ms per mesh, %.0f s", hold.held, hold.failed,
-        hold.held > 0 and hold.ms / hold.held or 0, hold.seconds)
+      hold.complete, hold.phase = true, "complete"
+      logMsg("I", "everything warm: all %d meshes held (%d failed), avg %.2f ms per mesh, %.0f s (%.0f s of it holding)", hold.held, hold.failed,
+        hold.held > 0 and hold.ms / hold.held or 0, hold.seconds, hold.runSeconds)
+      logMsg("I", "everything warm: %d already had a .cdae (%.0f ms), %d imported now (%.0f ms), %d unknown (%.0f ms)",
+        hold.kind.cached.n, hold.kind.cached.ms, hold.kind.import.n, hold.kind.import.ms, hold.kind.unknown.n, hold.kind.unknown.ms)
       break
     end
     hold.cursor = idx + 1
@@ -2842,7 +2960,7 @@ function M.getRunStats()
     frames = r.frames, busyFrames = r.busy, busyAvgMs = r.busy > 0 and r.busyMs / r.busy or 0, busyMaxMs = r.busyMax,
     idleFrames = r.idle, idleAvgMs = r.idle > 0 and r.idleMs / r.idle or 0, idleMaxMs = r.idleMax,
     sleepShare = r.frames > 0 and r.idle / r.frames or 0,
-    warmFrames = r.warmFrames, warmMs = r.warmMs,
+    warmFrames = r.warmFrames, warmMs = r.warmMs, coldFrames = r.coldFrames,
     settles = r.settles, settleAvgSeconds = r.settles > 0 and r.settleSum / r.settles or 0, settleMaxSeconds = r.settleMax,
     cheapCapHits = r.capHits.cheap, costlyCapHits = r.capHits.costly,
   }
@@ -2854,8 +2972,33 @@ function M.logRunSummary()
   logMsg("I", "RUN SUMMARY: %.1f s, mode %s, %d creates, %d dropped sections (%d objects), %d failures; peak live %d, pool %d (%d live, %d dormant, %d free), built %d",
     r.seconds, tostring(TUNING.creationMode), r.creates, droppedSections, droppedObjects, failureCount,
     shellStats.peakLive, poolTotal(), liveCount, dormantCount, shellFreeN, shellStats.built)
+  local si = M.getShapeIndexStatus()
+  if si.state == "scanning" or si.state == "done" then
+    logMsg("I", "  shape index (no shapes.json): %s, %d of %d section files, %d unique shapes, %d unreadable, %.1f s reading", si.state, si.files, si.total,
+      si.unique, si.failed, si.readSeconds)
+  end
   local wa = M.getWarmAllStatus()
-  logMsg("I", "  everything warm: %s", wa.enabled and string.format("ON, %d of %d meshes held%s", wa.held, wa.total, wa.complete and "" or " (NOT complete)") or "off")
+  local function slowText(list)
+    local out = {}
+    for i = 1, math.min(5, #list) do out[i] = string.format("%s %.0f ms (%s)", shortShapeName(list[i].name), list[i].ms, list[i].kind) end
+    return #out > 0 and table.concat(out, ", ") or "none"
+  end
+  if wa.enabled then
+    local valid = wa.complete and r.coldFrames == 0
+    logMsg("I", "  everything warm: ON (%s), %d of %d meshes held%s, %d failed; %d of %d frames of this run came before every mesh was held -> object-cost comparison %s",
+      wa.phase, wa.held, wa.total, wa.complete and "" or " (NOT complete)", wa.failed, r.coldFrames, r.frames, valid and "VALID" or "NOT valid")
+    local k = wa.kind
+    logMsg("I", "  mesh holds: %d already had a .cdae (avg %.2f ms), %d imported now (avg %.1f ms, %.0f s in total), %d unknown (avg %.2f ms); slowest: %s",
+      k.cached.n, k.cached.n > 0 and k.cached.ms / k.cached.n or 0, k.import.n, k.import.n > 0 and k.import.ms / k.import.n or 0, k.import.ms / 1000,
+      k.unknown.n, k.unknown.n > 0 and k.unknown.ms / k.unknown.n or 0, slowText(wa.slow))
+  else
+    logMsg("I", "  everything warm: off (meshes load while streaming; object-cost comparison does not apply)")
+    local cw = M.getCacheWarmStatus()
+    if cw.enabled then
+      logMsg("I", "  cache warm lane: %s, %d of %d shapes done (%d already had a .cdae, %d imported now, %d failed, %d skipped), import avg %.1f ms, max %.0f ms; slowest: %s",
+        cw.phase, cw.processed, cw.total, cw.alreadyCached, cw.imported, cw.failed, cw.skipped, cw.importAvgMs, cw.importMaxMs, slowText(cw.slow))
+    end
+  end
   local function line(label, name)
     local p = r.paths[name]
     logMsg("I", "  %-26s %6d x avg %.3f ms, max %.1f ms, %.0f ms total (%.0f%% of creates)", label, p.n, p.avgMs, p.maxMs, p.totalMs,
@@ -2912,7 +3055,7 @@ function M.getStatus()
     changeWorkPeakMs = change.workMax,
     changeFirstUseSplit = { import = { n = change.importN, ms = change.importMs }, cached = { n = change.hitN, ms = change.hitMs },
                             unknown = { n = change.unkN, ms = change.unkMs } },
-    cacheWarm = M.getCacheWarmStatus(), warmAll = M.getWarmAllStatus(),
+    cacheWarm = M.getCacheWarmStatus(), warmAll = M.getWarmAllStatus(), shapeIndex = M.getShapeIndexStatus(),
     changeDeferredFirstUse = change.deferredFirst,
     changeFirstUse = change.firsts, changeReload = change.reloads, changeWarm = change.warms,
     changeReloadAvgMs = change.reloads > 0 and change.reloadMs / change.reloads or 0,
@@ -3016,10 +3159,24 @@ function M.getCacheWarmStatus()
     importAvgMs = imported > 0 and warm.importMs / imported or 0, importMaxMs = warm.importMax,
     importMaxShape = warm.importMaxShape, current = warm.current,
     nearQueued = math.max(0, #warm.near - warm.nearPos + 1),
+    phase = warm.phase, runSeconds = warm.runSeconds, importSeconds = warm.importMs / 1000, slow = warm.slow,
+    -- remaining shapes at the pace so far (skipping a cached shape is cheap, an import is not: only a rough guide)
+    etaSeconds = (warm.processed > 0 and warm.runSeconds > 0) and (warm.total - warm.processed) * warm.runSeconds / warm.processed or nil,
   }
 end
 
 function M.setCacheWarm(flag) TUNING.cacheWarm = flag and true or false end
+
+-- The shape index: "file" (shapes.json), "scanning" / "done" (built from the section files) or "none".
+function M.getShapeIndexStatus()
+  local sc = warm.scan
+  if not sc then return { state = warm.loaded and "file" or "none", unique = warm.total, files = 0, total = 0, failed = 0, records = 0, seconds = 0, readSeconds = 0 } end
+  return {
+    state = sc.done and "done" or "scanning", files = sc.files, total = #sc.ids, failed = sc.failed, records = sc.records,
+    unique = sc.unique, seconds = sc.runSeconds, readSeconds = sc.ms / 1000,
+    etaSeconds = (not sc.done and sc.files > 0 and sc.runSeconds > 0) and (#sc.ids - sc.files) * sc.runSeconds / sc.files or nil,
+  }
+end
 
 -- Progress of the everything-warm mode (panel line, console check).
 function M.getWarmAllStatus()
@@ -3028,6 +3185,10 @@ function M.getWarmAllStatus()
     remaining = math.max(0, warm.total - hold.held - hold.failed), complete = hold.complete,
     releasing = not TUNING.warmAll and hold.held > 0, avgMs = hold.held > 0 and hold.ms / hold.held or 0,
     maxMs = hold.max, maxShape = hold.maxShape, seconds = hold.seconds,
+    phase = hold.phase, runSeconds = hold.runSeconds, slow = hold.slow, kind = hold.kind,
+    -- true once every mesh is held: object-cost runs only compare cleanly from then on
+    measurable = TUNING.warmAll and hold.complete,
+    etaSeconds = (hold.held > 0 and hold.runSeconds > 0) and math.max(0, warm.total - hold.held - hold.failed) * hold.runSeconds / hold.held or nil,
   }
 end
 
@@ -3035,9 +3196,9 @@ function M.setWarmAll(flag) TUNING.warmAll = flag and true or false end
 
 -- Forgets what the lane has checked (after .cdae files were deleted, say) and starts over.
 function M.restartCacheWarm()
-  local names, bySection, total = warm.names, warm.bySection, warm.total
+  local names, bySection, total, scan = warm.names, warm.bySection, warm.total, warm.scan
   warm = newWarm()
-  warm.names, warm.bySection, warm.total, warm.loaded = names, bySection, total, total > 0
+  warm.names, warm.bySection, warm.total, warm.loaded, warm.scan = names, bySection, total, total > 0, scan
 end
 
 -- Builds parked shells ahead (TUNING.shellTarget) while nothing urgent is queued: a little per frame, never in a burst.
@@ -3145,6 +3306,7 @@ function M.onUpdate(dtReal)
   do
     local coreMs = (os.clock() - frameStarted) * 1000       -- reads, unloads, loads, shell build and trim; not the warm lane
     run.frames = run.frames + 1
+    if not hold.complete then run.coldFrames = run.coldFrames + 1 end      -- frames before every mesh was held (Everything is warm)
     if readCount > 0 or unloadCount > 0 or createCount > 0 or shellsBuilt > 0 or evictedCount > 0 then
       run.busy, run.busyMs = run.busy + 1, run.busyMs + coreMs
       if coreMs > run.busyMax then run.busyMax = coreMs end
@@ -3165,9 +3327,10 @@ function M.onUpdate(dtReal)
   local tw = os.clock()
   local warmBefore = warm.processed
   local warmStageStart = diag and diag:beginStage("cache_warm")
+  local scanned = hold.scanUpdate(dtReal or 0)         -- shape index from the section files (only without shapes.json)
   cacheWarmUpdate(dtReal or 0, diag)                  -- idle lane: only while nothing is queued
   local heldNow = hold.update(dtReal or 0)             -- everything-warm lane (the cache warm lane stands down)
-  local warmedCount = warm.processed - warmBefore + heldNow
+  local warmedCount = warm.processed - warmBefore + heldNow + scanned
   if diag then diag:endStage("cache_warm", warmStageStart, warmedCount) end
   fb.record("warm", (os.clock() - tw) * 1000)
   if warmedCount > 0 then run.warmFrames, run.warmMs = run.warmFrames + 1, run.warmMs + fb.ms.warm end

@@ -86,3 +86,16 @@
   (`tests/run_lua_tests_lupa.py`, `--lua54` for the other one), a Python test compiles every Lua file under
   LuaJIT, and a Lua test fails when any function gets above 56 upvalues. New module-level state belongs in a
   table or in a helper function, not in more locals read by the big functions.
+- 0018: resident mode, same-shape reuse. Deactivated objects are indexed by shape (`dormantByShape`), so a load whose
+  own key has no resting object can take a resting object of the same shape (key differs): no `shapeName` write, no
+  `registerObject`, only the other fields and `postApply`. Counters `residentShapeReuses` / `residentShapeReuseAvgMs`
+  (status, settled log). In game (camera track, aggressive settings): 0 dropped sections over a drive; about a quarter
+  of the creates were same-shape reuses.
+- 0019: run statistics and cost classes. `getRunStats()` / `logRunSummary()` (panel button "Log run summary") cover
+  everything since Reset statistics or Purge: creates per path (revive, same-shape reuse, refill = shape change, fresh
+  = registerObject, plain), busy and idle streamer frames (idle frame cost, share asleep), time to idle per section,
+  cache-warm time, per-frame cap hits. Resident mode now caps the two cost classes separately: `maxCheapPerFrame`
+  (revive and same-shape reuse, about 0.01 ms each) and `maxRefillsPerFrame` (shell refill with a shape change,
+  about 1 ms or more); `maxCreatesPerFrame` applies to current and shells only. The queue stays in order: at the head
+  of the queue a capped class stops the frame's creates. A fresh create while a pool is active is flagged in the
+  summary (pool too small or not built yet). Not validated in game.

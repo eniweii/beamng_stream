@@ -299,6 +299,83 @@ local function drawOverrideList(label, names)
   end
 end
 
+-- Mesh warm-up readout: which lane is on, what it is doing right now, how far it got, how long it will take.
+local function duration(sec)
+  if not sec then return "unknown" end
+  sec = math.floor(sec + 0.5)
+  if sec >= 3600 then return string.format("%d h %02d min", math.floor(sec / 3600), math.floor((sec % 3600) / 60)) end
+  if sec >= 60 then return string.format("%d min %02d s", math.floor(sec / 60), sec % 60) end
+  return string.format("%d s", sec)
+end
+
+local function textBar(done, total)
+  local frac = total > 0 and math.max(0, math.min(1, done / total)) or 0
+  local n = math.floor(frac * 30 + 0.5)
+  return string.format("[%s%s] %.1f%%", string.rep("#", n), string.rep("-", 30 - n), frac * 100)
+end
+
+local function drawSlowList(label, list)
+  if not list or #list == 0 then return end
+  if im.TreeNode1(label) then
+    for i, e in ipairs(list) do
+      im.Text(string.format("%2d. %s    %.0f ms    %s", i, (e.name:match("([^/\\]+)$") or e.name), e.ms, e.kind))
+    end
+    im.TreePop()
+  end
+end
+
+local function drawMeshWarm(st)
+  local wa, cw, si = st.warmAll, st.cacheWarm, st.shapeIndex
+  if si and si.state == "scanning" and ((wa and wa.enabled) or (cw and cw.enabled)) then
+    im.Text("Mesh warm-up: indexing shape names from the section files (no shapes.json)")
+    im.Text(textBar(si.files, si.total) .. string.format("   %d of %d section files, %d unique shapes so far%s", si.files, si.total, si.unique,
+      si.failed > 0 and string.format(", %d unreadable", si.failed) or ""))
+    im.Text(string.format("Reading for %s (waiting not counted)    ETA: %s", duration(si.seconds), duration(si.etaSeconds)))
+    im.TextDisabled("The index is read while nothing is queued, one section file per frame. The warm-up starts when it is done.")
+    return
+  end
+  if si and si.state == "done" then
+    im.TextDisabled(string.format("Shape index: %d unique shapes from %d section files (read in %s)", si.unique, si.files, duration(si.readSeconds)))
+  end
+  if wa and (wa.enabled or wa.held > 0) then
+    local k = wa.kind
+    im.Text("Mesh warm-up (Everything is warm): " .. tostring(wa.phase))
+    local done = wa.held + wa.failed
+    im.Text(textBar(done, wa.total) .. string.format("   %d of %d meshes held%s", wa.held, wa.total,
+      wa.failed > 0 and string.format(", %d failed", wa.failed) or ""))
+    tip("Every mesh used by the streamed sections is held by one hidden object each, so no mesh is loaded while streaming. The lane only works while nothing is queued, so 'waiting' phases are normal during streaming.")
+    im.Text(string.format("Already had a .cdae: %d (avg %.2f ms)    Imported now: %d (avg %.1f ms, %s in total)    Unknown: %d",
+      k.cached.n, k.cached.n > 0 and k.cached.ms / k.cached.n or 0, k.import.n, k.import.n > 0 and k.import.ms / k.import.n or 0,
+      duration(k.import.ms / 1000), k.unknown.n))
+    im.Text(string.format("Holding for %s (waiting not counted)    ETA while holding: %s    slowest so far: %.0f ms",
+      duration(wa.runSeconds), wa.complete and "done" or duration(wa.etaSeconds), wa.maxMs or 0))
+    if wa.complete then
+      im.Text("Object-cost measurements: VALID, every mesh is held")
+    elseif wa.releasing then
+      im.Text("Releasing the held meshes")
+    else
+      im.Text(string.format("Object-cost measurements: NOT valid yet, %d meshes still to load", math.max(0, wa.remaining or 0)))
+    end
+    drawSlowList("Slowest mesh holds##warmallslow", wa.slow)
+  elseif cw and (cw.enabled or cw.finished) then
+    im.Text("Mesh warm-up (cache lane): " .. tostring(cw.phase))
+    if cw.available then
+      im.Text(textBar(cw.processed, cw.total) .. string.format("   %d of %d shapes checked%s", cw.processed, cw.total,
+        cw.failed > 0 and string.format(", %d failed", cw.failed) or ""))
+      im.Text(string.format("Already had a .cdae: %d    Imported now: %d (avg %.1f ms, max %.0f ms, %s in total)    Skipped: %d",
+        cw.alreadyCached, cw.imported, cw.importAvgMs, cw.importMaxMs, duration(cw.importSeconds), cw.skipped))
+      im.Text(string.format("Running for %s (waiting not counted)    ETA: %s (rough: cached shapes are skipped fast, imports are slow)",
+        duration(cw.runSeconds), cw.finished and "done" or duration(cw.etaSeconds)))
+      im.TextDisabled("This lane only builds .cdae files, nothing stays loaded: a first use afterwards is a cache read, not an import. Turn on Everything is warm to hold the meshes.")
+      drawSlowList("Slowest imports##cachewarmslow", cw.slow)
+    else
+      im.TextDisabled("Unavailable: no shape names or no FS:fileExists in this build (see the log)")
+    end
+  else
+    im.TextDisabled("Mesh warm-up: off (Cache warm-up lane and Everything is warm are both off)")
+  end
+end
+
 function M.onUpdate()
   if not nfsc_sectionStreamer or not nfsc_sectionManager then return end
   im.Begin("Section Manager", windowOpen)
@@ -322,12 +399,7 @@ function M.onUpdate()
       st.residentRevived or 0, st.residentReviveAvgMs or 0, st.residentDeactivated or 0, st.residentEvicted or 0,
       st.residentMax or 0, st.residentReserve or 0))
   end
-  local wa = st.warmAll
-  if wa and (wa.enabled or wa.held > 0) then
-    im.Text(string.format("Everything is warm: %s %d of %d meshes held (avg %.2f ms, max %.0f ms)%s",
-      wa.releasing and "releasing," or (wa.complete and "ON," or "filling,"), wa.held, wa.total, wa.avgMs, wa.maxMs,
-      wa.failed > 0 and string.format(", %d failed", wa.failed) or ""))
-  end
+  drawMeshWarm(st)
   local run = st.run
   if run and st.residentActive then
     local p = run.paths
