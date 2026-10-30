@@ -40,24 +40,21 @@
 -- Exported transforms are applied exactly as exported: position, rotationEuler and scale
 -- are written with setField as space-joined text, the same way every other field is.
 --
--- Shape cache warm-up (idle lane): BeamNG builds <shape>.cdae from the .dae the first time a shape is
--- used ("Importing COLLADA..."), inside the registerObject call, which cannot be split across frames.
--- When both queues have been empty for cacheWarmIdleSeconds, the lane takes the shapes of the current and
--- related sections first, then the rest of shapes.json, skips shapes whose .cdae already exists
--- (FS:fileExists) and imports the others one at a time, cacheWarmGapSeconds apart: a hidden TSStatic
--- below the camera, created and deleted in the same call, so it is never drawn and keeps no memory. The
--- .cdae on disk is the progress record. Without FS:fileExists the lane stays off. Shape names come from
--- shapes.json (builder output); when the pack has none, hold.scanUpdate reads every section file in idle time
--- and builds the same index from the shapeName fields (the game loads <shape>.cdae by itself).
--- getCacheWarmStatus() feeds a progress display.
---
--- "Everything is warm" (TUNING.warmAll, a test mode): the streamer holds every shape of shapes.json with one hidden
--- TSStatic each (collision none, in its own group NFSC_WarmMeshes, outside the pool and the live counts), so no mesh
--- is ever loaded or built while streaming. Whatever the creation mode then costs is object work only:
--- registerObject, field writes, hide/unhide, shapeName retargets of shells. The lane runs while nothing is queued
--- (idle before it starts: Cache warm-up settings), a few shapes per frame within a share of the frame budget.
--- Switching it off releases the holders in batches. Purge, mode switches and "Reload streamed scenery" leave them alone.
--- getWarmAllStatus() feeds the panel; the run summary states whether the mode was on.
+-- Shape cache (TUNING.shapeCache): the streamer holds every shape of the streamed sections with one hidden TSStatic each
+-- (collision none, in its own group NFSC_WarmMeshes, outside the pool and the live counts), kept all session and never
+-- retargeted. So a mesh is loaded once, by its holder, and the pooled objects only revive, retarget and unhide: in
+-- resident mode the pool (residentMax) is sized to the most objects that are resident at once, not to the shape count.
+-- Two channels fill it: the idle lane (while both load queues are empty: the shapes of the current and related
+-- sections first, then every shape once, widest use first; one holder per frame within shapeCacheBudgetShare) and the
+-- need channel (a create wants a shape nobody holds: the holder loads it first, inside the create's frame budget and
+-- first-use caps, then the shell retargets to an already loaded shape). Heavy shapes (measured over shapeCacheHeavyMs,
+-- kept in lua/carbon_stream/shape_costs.json) wait for a still camera, a RAM floor can pause the lane (needs a memory
+-- source: M.setMemoryProvider), a shape without a file is flagged absent, a failed hold is retried once. Placeholders
+-- (hidden holders on the dot, shapeCachePlaceholders) are built ahead of the fill cursor so a hold only changes a shapeName.
+-- Shape names come from shapes.json (builder output); when the pack has none, hold.scanUpdate reads every section file
+-- in idle time and builds the same index from the shapeName fields.
+-- Per visit to a section the lane records the readiness at entry and the late / dropped neighbours (hold.visitClose).
+-- M.getShapeCacheStatus() feeds the panel; M.logRunSummary prints the cacher-log v1 lines.
 --
 -- Creation methods (TUNING.creationMode, switch at runtime with M.setCreationMode):
 --   "current": every streamed object is created with createObject/registerObject and deleted again.
@@ -385,17 +382,23 @@ local TUNING = {
   stallLogMs = 100,               -- a single create or cache import slower than this is logged at once (shape, kind)
   testingMode = false,            -- detailed bounded frame/stall diagnostics; off by default
   logEmptySettles = false,        -- true: also print the settled line of a change that created nothing
-  cacheWarm = true,               -- idle-time warm-up of the .cdae shape cache (see header)
-  cacheWarmPerFrame = 1,          -- shapes imported per frame; each one is a stall of its own import time
-  cacheWarmGapSeconds = 0.25,     -- pause after every import (0 = back to back, for a loading screen)
-  cacheWarmIdleSeconds = 1.0,     -- both load queues must have been empty this long before the lane starts
-  cacheWarmCheckShare = 0.0625,   -- share of frameBudgetMs per frame for skipping shapes that already have a .cdae (1 ms at 16)
-  cacheWarmLogEvery = 100,        -- progress line after this many imports (0 = none)
   shapeIndexBudgetShare = 0.25,   -- share of frameBudgetMs per frame for reading section files into the shape index (one file always goes)
-  warmAll = false,                -- "Everything is warm" test mode: hold every mesh with one hidden object each (see header)
-  warmAllPerFrame = 8,            -- meshes held per frame while the lane runs
-  warmAllBudgetShare = 0.5,       -- share of frameBudgetMs per frame for holding (a first import can still run longer)
-  warmAllLogEvery = 2000,         -- progress line after this many meshes (0 = none)
+  shapeCache = true,              -- Preload: hold the meshes of the section island you are in with one hidden object each (see header)
+  shapeCacheMax = 100000,         -- Max meshes to save: most holders kept (the fill stops there; holders of other islands are evicted first)
+  shapeCacheAlways = false,       -- Preload always: fill while the camera moves too (default: only when it is still)
+  debugLog = false,               -- Debug: the detailed logs (cacher lines, run summary details, fill progress)
+  shapeCacheAtLoad = true,        -- start filling at level load (no idle wait before the first hold)
+  shapeCacheIdleSeconds = 1.0,    -- both load queues must have been empty this long before a hold (after the first)
+  shapeCacheGapSeconds = 0.02,    -- pause after every hold (0 = back to back, for a loading screen)
+  shapeCachePerFrame = 1,         -- most shapes held per idle frame
+  shapeCacheBudgetShare = 0.125,  -- share of frameBudgetMs per frame for holding (a single load can still run longer)
+  shapeCacheRamFloorGB = 1.5,     -- pause the fill while free RAM is below this (0 = off; needs M.setMemoryProvider)
+  shapeCacheHeavyMs = 10.0,       -- a shape measured slower than this is heavy
+  shapeCacheHeavyWait = true,     -- heavy shapes are held only while the camera is still
+  shapeCacheStillSeconds = 1.5,   -- seconds the camera must be still
+  shapeCachePlaceholders = 200,   -- hidden holders on the dot built ahead of the fill (0 = none)
+  shapeCacheLogEvery = 2000,      -- progress line after this many holds (0 = none)
+  restartAmbient = true,          -- animated objects (playAmbient on): playAmbient is off while a pooled object is hidden and on once it is visible
   warmGroupName = "NFSC_WarmMeshes",
   maxSectionReadsPerFrame = 1,
   maxQueuedItems = 512,           -- hard cap of the load queue; the rest waits in pending lists
@@ -415,7 +418,7 @@ local TUNING = {
   selectionInterval = 0.05,       -- seconds between section lookups
   priorityRefreshInterval = 0.5,  -- seconds between load-order refreshes
   logSettle = true,               -- one log line when the load of a section change has finished
-  creationMode = "current",       -- "current", "shells" or "resident" (see header); M.setCreationMode(mode) switches it
+  creationMode = "resident",      -- "resident" (default), "current" or "shells" (see header); M.setCreationMode(mode) switches it
   residentMax = 6000,             -- resident mode: pool size (live + deactivated + free) before the oldest deactivated one is evicted
   residentReserve = 0,            -- resident mode: free shells kept ready by evicting in idle frames (0 = evict only when a load needs one)
   residentCooldown = 0.0,         -- resident mode: seconds before an unwanted object is deactivated (it is cheap, so 0)
@@ -438,79 +441,89 @@ local tun = {}                          -- tuning schema, presets, change tracki
 do
 local SHELL_MODES = { shells = true, resident = true }
 tun.schema = {
-  { key = "frameBudgetMs", group = "Frame budget", label = "Frame budget (ms)", kind = "float", min = 1, max = 50,
+  { key = "frameBudgetMs", debug = true, group = "Frame budget", label = "Frame budget (ms)", kind = "float", min = 1, max = 50,
     desc = "Time one frame may spend on streaming: section reads, deletes, creates and shell building together. Every task below is capped by what is left of it. Higher: sections settle sooner but frames run longer. Lower: smoother frames, slower loading." },
-  { key = "deleteBudgetShare", group = "Frame budget", label = "Delete / park share", kind = "share", min = 0.05, max = 1,
+  { key = "deleteBudgetShare", debug = true, group = "Frame budget", label = "Delete / park share", kind = "share", min = 0.05, max = 1,
     desc = "Largest part of the frame budget that deleting (or parking / deactivating) objects may use. Deletes run first, creates get the rest. Lower: more time for creates, but objects wait longer to be removed. Higher: the unload backlog clears faster and loading slows." },
-  { key = "shellBuildBudgetShare", group = "Frame budget", label = "Shell build share", kind = "share", min = 0.01, max = 1, modes = SHELL_MODES,
+  { key = "shellBuildBudgetShare", debug = true, group = "Frame budget", label = "Shell build share", kind = "share", min = 0.01, max = 1, modes = SHELL_MODES,
     desc = "Largest part of the frame budget for building parked shells ahead (see Shells built ahead). It runs after the loads and only takes what they left, so a busy frame builds none. Higher: the pool fills sooner but idle frames get longer." },
-  { key = "maxCreatesPerFrame", group = "Section loading", label = "Max creates per frame", kind = "int", min = 1, max = 256, lo = 1, modes = { current = true, shells = true },
+  { key = "maxCreatesPerFrame", debug = true, group = "Section loading", label = "Max creates per frame", kind = "int", min = 1, max = 256, lo = 1, modes = { current = true, shells = true },
     desc = "Hard cap on objects created per frame, on top of the time budget. Higher: faster loading when objects are cheap, bigger frame spikes when they are not. Lower: steadier frames, slower loading." },
-  { key = "maxRefillsPerFrame", group = "Section loading", label = "Max refills per frame", kind = "int", min = 1, max = 1024, lo = 1, modes = { resident = true },
+  { key = "maxRefillsPerFrame", debug = true, group = "Section loading", label = "Max refills per frame", kind = "int", min = 1, max = 1024, lo = 1, modes = { resident = true },
     desc = "Hard cap per frame on objects that need a shell with a different shape (no deactivated object of the same shape was left). This is the expensive path: a shape change costs about 1 ms or more. Higher: faster loading, bigger spikes. Lower: steadier frames, slower loading. Revives and same-shape reuses are not counted here." },
-  { key = "maxCheapPerFrame", group = "Section loading", label = "Max cheap reuses per frame", kind = "int", min = 1, max = 4096, lo = 1, modes = { resident = true },
+  { key = "maxCheapPerFrame", debug = true, group = "Section loading", label = "Max cheap reuses per frame", kind = "int", min = 1, max = 4096, lo = 1, modes = { resident = true },
     desc = "Hard cap per frame on objects brought back by a revive or a same-shape reuse (about 0.01 ms each, no shape change, no registerObject). They are still limited by the frame budget. Higher: a returning section is back in very few frames, then the streamer sleeps. Lower: gentler." },
-  { key = "maxDeletesPerFrame", group = "Section loading", label = "Max deletes per frame", kind = "int", min = 1, max = 2048, lo = 1,
+  { key = "maxDeletesPerFrame", debug = true, group = "Section loading", label = "Max deletes per frame", kind = "int", min = 1, max = 2048, lo = 1,
     desc = "Hard cap on objects deleted (or parked) per frame, on top of the delete share. Lower: a long unload trails over more frames; higher: it finishes sooner, in a bigger spike." },
-  { key = "maxFirstUsePerFrame", group = "Section loading", label = "Max first uses per frame", kind = "int", min = 1, max = 16, lo = 1,
+  { key = "maxFirstUsePerFrame", debug = true, group = "Section loading", label = "Max first uses per frame", kind = "int", min = 1, max = 16, lo = 1,
     desc = "How many never-used shapes may be created per frame. A first use loads the mesh and can cost 4-100 ms (a COLLADA import when there is no .cdae yet). Lower: fewer big stalls in one frame, new shapes appear later." },
-  { key = "firstUseGuessMs", group = "Section loading", label = "First use guess (ms)", kind = "float", min = 1, max = 40,
+  { key = "firstUseGuessMs", debug = true, group = "Section loading", label = "First use guess (ms)", kind = "float", min = 1, max = 40,
     desc = "Expected cost of a first use until a real average exists. A new shape is only started when this much budget is left. Higher: more cautious, shapes wait for a quieter frame. Lower: shapes start earlier and may overrun the budget." },
-  { key = "maxSectionReadsPerFrame", group = "Section loading", label = "Section reads per frame", kind = "int", min = 1, max = 8, lo = 1,
+  { key = "maxSectionReadsPerFrame", debug = true, group = "Section loading", label = "Section reads per frame", kind = "int", min = 1, max = 8, lo = 1,
     desc = "Section files read per frame. A read is a JSON parse and cannot be split. Higher: sections get their data sooner, with a heavier frame. A second read only starts while the frame budget has time left." },
-  { key = "maxQueuedItems", group = "Section loading", label = "Load queue cap", kind = "int", min = 64, max = 4096, lo = 1,
+  { key = "maxQueuedItems", debug = true, group = "Section loading", label = "Load queue cap", kind = "int", min = 64, max = 4096, lo = 1,
     desc = "Most objects held in the load queue; the rest wait in per-section lists. Higher: the queue holds more at once and reorders less often. Lower: the order follows the camera more closely." },
 
-  { key = "unloadCooldown", group = "Unloading", label = "Unload cooldown (s)", kind = "float", min = 0, max = 10, modes = { current = true, shells = true },
+  { key = "unloadCooldown", debug = true, group = "Unloading", label = "Unload cooldown (s)", kind = "float", min = 0, max = 10, modes = { current = true, shells = true },
     desc = "Seconds an object that no active section wants survives before it is deleted or parked. Higher: going back to a section you just left is instant, more objects stay in memory. Lower: memory is freed sooner." },
-  { key = "residentCooldown", group = "Unloading", label = "Deactivate delay (s)", kind = "float", min = 0, max = 10, modes = { resident = true },
+  { key = "residentCooldown", debug = true, group = "Unloading", label = "Deactivate delay (s)", kind = "float", min = 0, max = 10, modes = { resident = true },
     desc = "Seconds before an unwanted object is deactivated (hidden, kept bound to its shape and fields). Deactivating is cheap, so 0 is normal. Higher: the object stays drawn a little longer after the camera leaves." },
 
-  { key = "shellTarget", group = "Shell pool", label = "Shells built ahead", kind = "int", min = 0, max = 30000, modes = SHELL_MODES,
+  { key = "shellTarget", debug = true, group = "Shell pool", label = "Shells built ahead", kind = "int", min = 0, max = 30000, modes = SHELL_MODES,
     desc = "Keep at least this many shells (free + in use), built in the background while nothing urgent is queued. 0 = build on demand. Near the peak live count (about 3200 seen) avoids creating during loads; each hidden shell costs a little every frame." },
-  { key = "shellBuildPerFrame", group = "Shell pool", label = "Shells per frame", kind = "int", min = 1, max = 64, lo = 1, modes = SHELL_MODES,
+  { key = "shellBuildPerFrame", debug = true, group = "Shell pool", label = "Shells per frame", kind = "int", min = 1, max = 64, lo = 1, modes = SHELL_MODES,
     desc = "Most shells built ahead per frame, within the shell build share. Higher: the pool fills in fewer frames. Lower: gentler on frame time." },
 
-  { key = "residentMax", group = "Resident pool", label = "Pool size", kind = "int", min = 500, max = 30000, lo = 1, modes = { resident = true },
-    desc = "Most objects held at once (live + deactivated + free). Beyond it the oldest deactivated object is evicted and its shell reused. Higher: more sections stay instantly revivable, more RAM. Lower: more evictions and re-fills. Near 1.2 x the peak live count is a start." },
-  { key = "residentReserve", group = "Resident pool", label = "Free reserve", kind = "int", min = 0, max = 2000, modes = { resident = true },
+  { key = "residentMax", debug = true, group = "Resident pool", label = "Pool size", kind = "int", min = 500, max = 30000, lo = 1, modes = { resident = true },
+    desc = "Active shells: the most objects resident at once (live + deactivated + free). With the shape cache on every mesh is already held, so a shell only revives, retargets and unhides: size this to the most resident at once (about 4,200 seen), not to the shape count. Beyond it the oldest deactivated object is evicted and its shell reused. Higher: more sections stay instantly revivable, more RAM. Lower: more evictions and re-targets." },
+  { key = "residentReserve", debug = true, group = "Resident pool", label = "Free reserve", kind = "int", min = 0, max = 2000, modes = { resident = true },
     desc = "Free shells kept ready by evicting in idle frames. 0 = evict only when a load needs a shell. Higher: loads rarely have to evict mid-frame, but fewer objects stay resident." },
 
-  { key = "currentSectionFirst", group = "Look-ahead and order", label = "Current section first", kind = "bool",
+  { key = "currentSectionFirst", debug = true, group = "Look-ahead and order", label = "Current section first", kind = "bool",
     desc = "Objects of the camera's section (and the one being streamed for) load before everything else. Off: strict distance bands only." },
-  { key = "predictionEnabled", group = "Look-ahead and order", label = "Look-ahead", kind = "bool",
+  { key = "predictionEnabled", debug = true, group = "Look-ahead and order", label = "Look-ahead", kind = "bool",
     desc = "Switch to the section ahead before the camera crosses the border, from the camera velocity. On: the next section starts loading earlier. Off: loading starts at the border." },
-  { key = "predictionSeconds", group = "Look-ahead and order", label = "Look-ahead time (s)", kind = "float", min = 0, max = 5, requires = "predictionEnabled",
+  { key = "predictionSeconds", debug = true, group = "Look-ahead and order", label = "Look-ahead time (s)", kind = "float", min = 0, max = 5, requires = "predictionEnabled",
     desc = "How far ahead (in seconds of travel, capped at 100 m) the look-ahead point lies. Higher: earlier loading, more wrong guesses on turns. Lower: later switches." },
 
-  { key = "cacheWarm", group = "Cache warm-up", label = "Cache warm-up lane", kind = "bool",
-    desc = "While nothing is queued, import shapes that have no .cdae yet, one at a time, so later first uses are cache reads. Each import is a stall of its own length." },
-  { key = "cacheWarmPerFrame", group = "Cache warm-up", label = "Imports per frame", kind = "int", min = 1, max = 4, lo = 1, requires = "cacheWarm",
-    desc = "Shapes imported per frame. Each one stalls the frame for its import time. Higher: the cache fills sooner with longer stalls. A second import is skipped once the frame budget is spent." },
-  { key = "cacheWarmGapSeconds", group = "Cache warm-up", label = "Gap after an import (s)", kind = "float", min = 0, max = 2, requires = "cacheWarm",
-    desc = "Pause after every import. Higher: stalls are spread out. 0 = back to back, for a loading screen." },
-  { key = "cacheWarmIdleSeconds", group = "Cache warm-up", label = "Idle before it starts (s)", kind = "float", min = 0, max = 5, requires = "cacheWarm",
-    desc = "Both load queues must have been empty this long before the lane starts. Higher: it stays out of the way after every section change." },
-  { key = "cacheWarmCheckShare", group = "Cache warm-up", label = "Skip-check share", kind = "share", min = 0.01, max = 1, requires = "cacheWarm",
-    desc = "Part of the frame budget the lane may spend looking for shapes that already have a .cdae (skipping is cheap but there are about 30k shapes). Higher: the scan finishes sooner, with a heavier idle frame." },
-
-  { key = "shapeIndexBudgetShare", group = "Cache warm-up", label = "Shape index share", kind = "share", min = 0.05, max = 4,
+  { key = "restartAmbient", debug = true, group = "Shell pool", label = "Animations only while visible", kind = "bool", modes = SHELL_MODES,
+    desc = "An animated object (playAmbient on) that is shown again in a pooled object (revive, same-shape reuse, refill) otherwise stays frozen. On: playAmbient is switched off when the object is hidden and on again, with a postApply, once it is visible (only for animated objects). Off: shown as they are." },
+  { key = "shapeCache", group = "Shape cache", label = "Preload", kind = "bool",
+    desc = "Hold the meshes of the section island you are in (the sections connected to the current one through their relations) with one hidden object each, kept loaded. A mesh is then loaded once, by its holder, and streaming only revives, retargets and unhides objects. The fill runs only while the car and camera are still (unless Preload always is on) and only while nothing is queued; a mesh a create needs is held at once. Off releases the holders." },
+  { key = "shapeCacheMax", group = "Shape cache", label = "Max meshes to save", kind = "int", min = 0, max = 100000, requires = "shapeCache",
+    desc = "Most meshes kept held. The fill stops there, and when you move to another island the holders of the old one are evicted first. Up to the number of meshes read: everything the island needs. Lower: less RAM, more cold loads in busy frames." },
+  { key = "shapeCacheAlways", group = "Shape cache", debug = true, label = "Preload always", kind = "bool", requires = "shapeCache",
+    desc = "On: the fill also runs while the car and camera move (still only while nothing is queued; heavy meshes still wait for a still camera). Off: it runs only when they are still." },
+  { key = "debugLog", group = "Debug", debug = true, label = "Detailed logs", kind = "bool",
+    desc = "On: the cacher lines, the full run summary and the fill progress go to the log. Off: only a short summary and warnings." },
+  { key = "shapeCacheAtLoad", debug = true, group = "Shape cache", label = "Fill at level load", kind = "bool", requires = "shapeCache",
+    desc = "On: the fill starts at once, without waiting for the idle time. Off: it waits for the idle time before the first hold like after every section change." },
+  { key = "shapeCacheIdleSeconds", debug = true, group = "Shape cache", label = "Idle before fill (s)", kind = "float", min = 0, max = 5, requires = "shapeCache",
+    desc = "Both load queues must have been empty this long before the fill holds a shape. Higher: it stays out of the way after every section change." },
+  { key = "shapeCacheGapSeconds", debug = true, group = "Shape cache", label = "Gap after a hold (s)", kind = "float", min = 0, max = 2, requires = "shapeCache",
+    desc = "Pause after every hold. Higher: the loads are spread out, the fill takes longer. 0 = back to back, for a loading screen." },
+  { key = "shapeCachePerFrame", debug = true, group = "Shape cache", label = "Holds per frame", kind = "int", min = 1, max = 64, lo = 1, requires = "shapeCache",
+    desc = "Most shapes held in one idle frame. Each one is a mesh load (about 1 to 2 ms from the .cdae cache, 5 ms or more when it must be imported first). Higher: filled sooner, longer idle frames." },
+  { key = "shapeCacheBudgetShare", debug = true, group = "Shape cache", label = "Frame share for holding", kind = "share", min = 0.05, max = 4, requires = "shapeCache",
+    desc = "Part of the frame budget the holding may use per idle frame (a single first import can still run longer). Higher: filled sooner. Use 1 or more with a high per-frame count for a loading-screen style fill, standing still." },
+  { key = "shapeCacheRamFloorGB", debug = true, group = "Shape cache", label = "RAM floor (free GB)", kind = "float", min = 0, max = 32, requires = "shapeCache",
+    desc = "The fill pauses while free RAM is below this and resumes above it. 0 = off. Needs a memory source (setMemoryProvider); without one nothing is compared and the panel says so." },
+  { key = "shapeCacheHeavyMs", debug = true, group = "Shape cache", label = "Heavy shape threshold (ms)", kind = "float", min = 1, max = 200, requires = "shapeCache",
+    desc = "A shape whose measured load time is above this is heavy (the times are kept between sessions). Lower: more shapes count as heavy. A slower hold or create than this also shows as the last hitch." },
+  { key = "shapeCacheHeavyWait", debug = true, group = "Shape cache", label = "Heavy shapes wait for a still camera", kind = "bool", requires = "shapeCache",
+    desc = "On: heavy shapes are held only while the camera is still (at level load it is), never mid-drive. Off: they are held like any other shape. A heavy shape a create needs is held at once either way." },
+  { key = "shapeCacheStillSeconds", debug = true, group = "Shape cache", label = "Still time (s)", kind = "float", min = 0, max = 10, requires = "shapeCacheHeavyWait",
+    desc = "How long the camera must stand (under 0.5 m/s) before heavy shapes are held. Higher: heavy shapes wait for a longer stop." },
+  { key = "shapeCachePlaceholders", debug = true, group = "Shape cache", label = "Placeholder shells ahead", kind = "int", min = 0, max = 2000, requires = "shapeCache",
+    desc = "Hidden holders on the dot built ahead of the fill. A hold takes one and only changes its shapeName, so the object cost is paid earlier, in idle frames. 0 = create the holder with the hold." },
+  { key = "shapeIndexBudgetShare", debug = true, group = "Shape cache", label = "Shape index share", kind = "share", min = 0.05, max = 4, requires = "shapeCache",
     desc = "Only used when the pack has no shapes.json: part of the frame budget the shape index may spend per frame reading section files (one file is always read per idle frame). Higher: the index is ready sooner, with longer idle frames." },
 
-  { key = "warmAll", group = "Everything is warm", label = "Everything is warm", kind = "bool",
-    desc = "Test mode: keep every mesh used by the streamed sections loaded by holding it with one hidden object each (about 30k, RAM only, nothing drawn). Then no mesh is ever loaded while streaming, so a run measures object work only: registerObject, field writes, hide/unhide, shell retargets. Starts while nothing is queued; Off releases the meshes. Purge and mode switches leave them alone. The hidden objects cost the engine a little every frame, the same in every mode." },
-  { key = "warmAllPerFrame", group = "Everything is warm", label = "Meshes held per frame", kind = "int", min = 1, max = 64, lo = 1, requires = "warmAll",
-    desc = "Most shapes held in one frame. Each one is a mesh load (about 1 to 2 ms from the .cdae cache, 5 ms or more when it must be imported first). Higher: warm sooner, longer frames while it runs. Lower: gentler." },
-  { key = "warmAllBudgetShare", group = "Everything is warm", label = "Frame share for holding", kind = "share", min = 0.05, max = 4, requires = "warmAll",
-    desc = "Part of the frame budget the holding may use per frame (a single first import can still run longer). Higher: warm sooner. Use 1 or more with a high per-frame count for a loading-screen style warm-up, standing still." },
-
-  { key = "forceCollisionNone", group = "Other", label = "Collision off", kind = "bool",
-    desc = "Created objects get no collision. On is the current test policy: collision is its own system, deferred." },
-  { key = "logSettle", group = "Other", label = "Log settled sections", kind = "bool",
+  { key = "logSettle", debug = true, group = "Other", label = "Log settled sections", kind = "bool",
     desc = "Write a timing block to the log when the load of a section change has finished." },
-  { key = "testingMode", group = "Other", label = "Testing Mode", kind = "bool",
+  { key = "testingMode", debug = true, group = "Other", label = "Testing Mode", kind = "bool",
     desc = "Enable bounded per-frame stage timings, slow-operation traces, pool/queue deltas and spike summaries. Adds a small amount of timing/bookkeeping work; turn off for normal play." },
-  { key = "probeOnSettle", group = "Other", label = "Probe after settle", kind = "bool", requires = "logSettle",
+  { key = "probeOnSettle", debug = true, group = "Other", label = "Probe after settle", kind = "bool", requires = "logSettle",
     desc = "After a settle, time a few test creates and log them next to the real averages. Diagnostic only; it adds a little work to that frame." },
 }
 tun.byKey = {}
@@ -521,19 +534,19 @@ for _, row in ipairs(tun.schema) do tun.byKey[row.key] = row end
 tun.slots = { "A", "B", "C" }
 tun.factory = {
   current = {
-    A = { label = "Gentle", values = { frameBudgetMs = 8, deleteBudgetShare = 0.25, maxCreatesPerFrame = 4, maxFirstUsePerFrame = 1, unloadCooldown = 2 } },
-    B = { label = "Balanced", values = { frameBudgetMs = 16, deleteBudgetShare = 0.25, maxCreatesPerFrame = 16, maxFirstUsePerFrame = 3, unloadCooldown = 2 } },
-    C = { label = "Fast", values = { frameBudgetMs = 24, deleteBudgetShare = 0.5, maxCreatesPerFrame = 64, maxFirstUsePerFrame = 8, unloadCooldown = 1 } },
+    A = { label = "A", values = { frameBudgetMs = 8, deleteBudgetShare = 0.25, maxCreatesPerFrame = 4, maxFirstUsePerFrame = 1, unloadCooldown = 2 } },
+    B = { label = "B", values = { frameBudgetMs = 16, deleteBudgetShare = 0.25, maxCreatesPerFrame = 16, maxFirstUsePerFrame = 3, unloadCooldown = 2 } },
+    C = { label = "C", values = { frameBudgetMs = 24, deleteBudgetShare = 0.5, maxCreatesPerFrame = 64, maxFirstUsePerFrame = 8, unloadCooldown = 1 } },
   },
   shells = {
-    A = { label = "Gentle", values = { frameBudgetMs = 8, deleteBudgetShare = 0.25, maxCreatesPerFrame = 8, maxFirstUsePerFrame = 1, unloadCooldown = 2, shellTarget = 0, shellBuildPerFrame = 4, shellBuildBudgetShare = 0.1 } },
-    B = { label = "Balanced", values = { frameBudgetMs = 16, deleteBudgetShare = 0.25, maxCreatesPerFrame = 32, maxFirstUsePerFrame = 3, unloadCooldown = 2, shellTarget = 3500, shellBuildPerFrame = 8, shellBuildBudgetShare = 0.125 } },
-    C = { label = "Fast", values = { frameBudgetMs = 24, deleteBudgetShare = 0.5, maxCreatesPerFrame = 128, maxFirstUsePerFrame = 8, unloadCooldown = 1, shellTarget = 4000, shellBuildPerFrame = 16, shellBuildBudgetShare = 0.2 } },
+    A = { label = "A", values = { frameBudgetMs = 8, deleteBudgetShare = 0.25, maxCreatesPerFrame = 8, maxFirstUsePerFrame = 1, unloadCooldown = 2, shellTarget = 0, shellBuildPerFrame = 4, shellBuildBudgetShare = 0.1 } },
+    B = { label = "B", values = { frameBudgetMs = 16, deleteBudgetShare = 0.25, maxCreatesPerFrame = 32, maxFirstUsePerFrame = 3, unloadCooldown = 2, shellTarget = 3500, shellBuildPerFrame = 8, shellBuildBudgetShare = 0.125 } },
+    C = { label = "C", values = { frameBudgetMs = 24, deleteBudgetShare = 0.5, maxCreatesPerFrame = 128, maxFirstUsePerFrame = 8, unloadCooldown = 1, shellTarget = 4000, shellBuildPerFrame = 16, shellBuildBudgetShare = 0.2 } },
   },
   resident = {
-    A = { label = "Gentle", values = { frameBudgetMs = 8, deleteBudgetShare = 0.25, maxRefillsPerFrame = 8, maxCheapPerFrame = 64, maxFirstUsePerFrame = 1, residentCooldown = 0, residentMax = 3800, residentReserve = 0, shellBuildBudgetShare = 0.1 } },
-    B = { label = "Balanced", values = { frameBudgetMs = 16, deleteBudgetShare = 0.25, maxRefillsPerFrame = 32, maxCheapPerFrame = 256, maxFirstUsePerFrame = 3, residentCooldown = 0, residentMax = 6000, residentReserve = 200, shellBuildBudgetShare = 0.125 } },
-    C = { label = "Fast", values = { frameBudgetMs = 24, deleteBudgetShare = 0.5, maxRefillsPerFrame = 128, maxCheapPerFrame = 1024, maxFirstUsePerFrame = 8, residentCooldown = 0, residentMax = 9000, residentReserve = 500, shellBuildBudgetShare = 0.2 } },
+    A = { label = "A", values = { frameBudgetMs = 8, deleteBudgetShare = 0.25, maxRefillsPerFrame = 8, maxCheapPerFrame = 64, maxFirstUsePerFrame = 1, residentCooldown = 0, shapeCachePerFrame = 1, shapeCacheBudgetShare = 0.1 } },
+    B = { label = "B", values = { frameBudgetMs = 16, deleteBudgetShare = 0.25, maxRefillsPerFrame = 32, maxCheapPerFrame = 256, maxFirstUsePerFrame = 3, residentCooldown = 0, shapeCachePerFrame = 1, shapeCacheBudgetShare = 0.125 } },
+    C = { label = "C", values = { frameBudgetMs = 24, deleteBudgetShare = 0.5, maxRefillsPerFrame = 128, maxCheapPerFrame = 1024, maxFirstUsePerFrame = 8, residentCooldown = 0, shapeCachePerFrame = 2, shapeCacheBudgetShare = 0.25 } },
   },
 }
 
@@ -631,11 +644,15 @@ local function newRun(stamp)
   return r
 end
 local run = newRun(0)
--- Everything-warm: state and lane functions in one table (the main chunk is close to Lua's 200 locals limit).
+-- Shape cache: state and lane functions in one table (the main chunk is close to Lua's 200 locals limit).
 local hold = { shape = {}, ids = {}, held = 0, cursor = 1, failed = 0, ms = 0, max = 0, maxShape = nil, group = nil,
-               idle = 0, seconds = 0, complete = false,
-               runSeconds = 0, phase = "off", slow = {},                   -- progress readout: time spent holding, lane phase, slowest loads
-               kind = { cached = { n = 0, ms = 0 }, import = { n = 0, ms = 0 }, unknown = { n = 0, ms = 0 } } }   -- .cdae existed / had to be imported / unknown
+               idle = 0, seconds = 0, complete = false, started = false, paused = false, ramPaused = false,
+               runSeconds = 0, phase = "off", slow = {}, lane = "asleep", laneReason = nil, lastHoldMs = 0, lastShape = nil,
+               gap = 0, still = 0, evicted = 0, evictKey = nil, absent = {}, absentN = 0, tries = {}, deferred = {}, deferredN = 0,
+               rings = {}, ringPos = 1, pass = 1, secIdx = 1, shpIdx = 1, nearFor = nil, nearAt = 0, adj = nil,
+               islandId = nil, islandSet = nil, islandN = 0, islandHeld = 0, islandSections = 0, ph = {}, phN = 0, phMs = 0,
+               cost = {}, costDirty = 0, visit = nil, visitTimer = 0, lastHitch = nil, lastPause = nil,
+               mem = { time = -1e9, last = nil, provider = nil, luaPeakKB = 0, minFree = nil, minAvail = nil, peakProcess = nil } }
 local changeStamp, createdSinceChange, settled, settleSeconds, settlePeak = 0, 0, true, 0, 0
 local createdTotal, deletedTotal, failureCount, verified = 0, 0, 0, 0
 local failures = {}
@@ -657,6 +674,10 @@ local aheadPoint = { x = 0, y = 0 }
 -- Helpers
 -- ---------------------------------------------------------------------------
 local function logMsg(level, fmt, ...)
+  if level == "D" then                                  -- routine information: only with Debug > Detailed logs
+    if not TUNING.debugLog then return end
+    level = "I"
+  end
   local msg = select("#", ...) > 0 and string.format(fmt, ...) or fmt
   if log then log(level, "nfscSectionStreamer", msg) else print("[nfscSectionStreamer] " .. msg) end
 end
@@ -960,6 +981,7 @@ local function acquireShell(item)
       forceNoCollision(obj)
       pcall(obj.postApply, obj)
       pcall(function() obj.hidden = false end)
+      hold.showAmbient(obj, item)
       return obj
     end
     shellFields[id] = nil                            -- the engine lost it (level change, manual delete)
@@ -972,6 +994,7 @@ local function parkShell(id)
   local obj = scenetree.findObjectById(id)
   if not obj then shellFields[id] = nil; return false end
   pcall(function() obj.hidden = true end)
+  hold.hideAmbient(obj, id)
   pcall(obj.setField, obj, "shapeName", 0, TUNING.shellShape)
   pcall(obj.postApply, obj)
   shellFreeN = shellFreeN + 1
@@ -1029,6 +1052,7 @@ local function deactivateDormant(key, entry)
   local obj = scenetree.findObjectById(entry.id)
   if not obj then shellFields[entry.id] = nil; return false end
   pcall(function() obj.hidden = true end)
+  hold.hideAmbient(obj, entry.id)
   dormantSerial = dormantSerial + 1
   local d = { id = entry.id, shape = entry.shape, stamp = dormantSerial }
   dormant[key] = d
@@ -1066,6 +1090,7 @@ local function reviveDormant(item)
   local obj = scenetree.findObjectById(d.id)
   if not obj then shellFields[d.id] = nil; return nil end
   pcall(function() obj.hidden = false end)
+  hold.showAmbient(obj, item)
   return obj
 end
 
@@ -1106,6 +1131,7 @@ local function acquireDormantShape(item)
         forceNoCollision(obj)
         pcall(obj.postApply, obj)
         pcall(function() obj.hidden = false end)
+        hold.showAmbient(obj, item)
         return obj
       end
       shellFields[d.id] = nil
@@ -1273,7 +1299,7 @@ local function verifyReadback(key, item, obj)
   local ok, pos = pcall(obj.getPosition, obj)
   local ok2, scl = pcall(obj.getScale, obj)
   local p, s = item.position or {}, item.scale or {}
-  logMsg("I", "verify %s exported pos=(%s) scale=(%s) readback pos=%s scale=%s", tostring(key),
+  logMsg("D", "verify %s exported pos=(%s) scale=(%s) readback pos=%s scale=%s", tostring(key),
     table.concat(p, ", "), table.concat(s, ", "), ok and tostring(pos) or "n/a", ok2 and tostring(scl) or "n/a")
 end
 
@@ -1633,10 +1659,13 @@ local function processLoads(diag)
         if cheap and cheapMade >= TUNING.maxCheapPerFrame then run.capHits.cheap = run.capHits.cheap + 1; break end
         if not cheap and costlyMade >= TUNING.maxRefillsPerFrame then run.capHits.costly = run.capHits.costly + 1; break end
       end
-      local isHeld = shape ~= nil and hold.shape[shape] == true        -- everything-warm: a hidden holder keeps it loaded
+      local isHeld = shape ~= nil and hold.shape[shape] == true        -- shape cache: a hidden holder keeps it loaded
+      local wasHeld = isHeld
+      -- a shape nobody holds and no instance keeps loaded: the holder loads it first (need channel), the create then retargets
+      local needHold = shape ~= nil and TUNING.shapeCache and not isHeld and (shapeLive[shape] or 0) == 0 and not hold.isAbsent(shape)
       local isFirst = shape ~= nil and not seenShapes[shape] and not isHeld
       local isWarm = shape ~= nil and (isHeld or (shapeLive[shape] or 0) > 0)    -- a live instance keeps the shape loaded
-      if isFirst and made > 0 then
+      if (isFirst or needHold) and made > 0 then
         -- a new shape is the expensive create: at most maxFirstUsePerFrame, and never one the budget cannot hold
         local elapsed = (os.clock() - started) * 1000
         if firstUse >= TUNING.maxFirstUsePerFrame or elapsed + expectedFirstMs() > budget then
@@ -1651,10 +1680,19 @@ local function processLoads(diag)
         local cached = shapeCached(shape)
         firstKind = (cached == true and "cached") or (cached == false and "import") or "unknown"
       end
+      local needMs = nil
+      if needHold then
+        local okHold, holdMs = hold.add(shape, "need")
+        if okHold then
+          needMs = holdMs
+          if not isFirst then firstUse = firstUse + 1 end          -- a first use counts itself below
+        end
+      end
       local createStart = os.clock()
       local diagCreateStart = diag and diag:now()
       local obj, err = createStreamedObject(item, nil, diag)
-      local createMs = (os.clock() - createStart) * 1000
+      local createOnlyMs = (os.clock() - createStart) * 1000       -- the create itself; createMs adds the hold it waited for
+      local createMs = createOnlyMs + (needMs or 0)
       if diag then diag:recordOperation("create-total", (diag:now() - diagCreateStart) * 1000, currentSectionID, key, shape, split.path, split.diagRegisterMs, "whole streamed-create elapsed; API time is nested registerObject only for new objects; remainder is not pure Lua CPU") end
       if createMs >= TUNING.stallLogMs then
         logMsg("W", "slow create: %s %.0f ms (%s), section %s", shape and shortShapeName(shape) or "?", createMs,
@@ -1703,8 +1741,13 @@ local function processLoads(diag)
       if obj then
         local pr = run.paths[split.path]
         if pr then
-          pr.n, pr.ms = pr.n + 1, pr.ms + createMs
-          if createMs > pr.max then pr.max = createMs end
+          pr.n, pr.ms = pr.n + 1, pr.ms + createOnlyMs
+          if createOnlyMs > pr.max then pr.max = createOnlyMs end
+        end
+        hold.noteCreate(needMs and "cold" or (wasHeld and "held" or (isWarm and "live" or "cold")), createMs, shape)
+        if split.path == "shell-refill" then
+          if needMs then hold.stats.retargetFilled = hold.stats.retargetFilled + 1
+          elseif wasHeld then hold.stats.retargetHeld = hold.stats.retargetHeld + 1 end
         end
         change.objectMs, change.fieldsMs = change.objectMs + split.objectMs, change.fieldsMs + split.fieldsMs
         change.registerMs, change.groupMs = change.registerMs + split.registerMs, change.groupMs + split.groupMs
@@ -1805,13 +1848,15 @@ local function setCurrentSection(newID)
   end
   local promoted = purgeQueue()                                    -- nothing stale waits behind new work
   if promoted and promoted > 0 and TUNING.logSettle then
-    logMsg("I", "section %s: %d queued objects of this section moved ahead of the leftovers", tostring(newID), promoted)
+    logMsg("D", "section %s: %d queued objects of this section moved ahead of the leftovers", tostring(newID), promoted)
   end
   changeStamp, createdSinceChange, settled = totalTime, 0, (newID == nil)
   change = newChange()
   priorityTimer = 0
   rebuildFeedOrder()
   for i = 1, #feedOrder do queueSectionRead(feedOrder[i]) end      -- current section first
+  hold.sectionEntered(newID)
+  hold.visitChange(oldID, newID)
   hook("onNfscSectionChanged", newID, oldID)
 end
 
@@ -1878,7 +1923,7 @@ local function newWarm()
            near = {}, nearPos = 1, nearFor = false, cursor = 1, idle = 0, gap = 0,
            hadCdae = 0, imported = 0, failed = 0, skipped = 0, importMs = 0, importMax = 0, importMaxShape = nil,
            current = nil, finished = false,
-           phase = "waiting: idle timer", runSeconds = 0, slow = {}, scan = nil }      -- progress readout: lane phase, time spent running, slowest imports
+           phase = "waiting: idle timer", runSeconds = 0, slow = {}, scan = nil, terrain = {}, terrainN = 0 }      -- progress readout: lane phase, time spent running, slowest imports
 end
 local warm = newWarm()
 
@@ -1889,13 +1934,19 @@ local function loadShapeList()
     local ids = {}
     for id in pairs(sectionIndex) do ids[#ids + 1] = id end
     table.sort(ids)
-    if #ids == 0 then logMsg("I", "no %s and no streamed sections: the shape cache warm-up is off", SHAPES_JSON); return end
-    warm.scan = { ids = ids, pos = 1, perSection = {}, counts = {}, unique = 0, files = 0, failed = 0, records = 0,
+    if #ids == 0 then logMsg("D", "no %s and no streamed sections: the shape cache warm-up is off", SHAPES_JSON); return end
+    warm.scan = { ids = ids, pos = 1, perSection = {}, counts = {}, terrain = {}, unique = 0, files = 0, failed = 0, records = 0,
                   ms = 0, runSeconds = 0, idle = 0, done = false }
-    logMsg("I", "no %s: shape names are indexed from the %d section files while nothing is queued", SHAPES_JSON, #ids)
+    logMsg("D", "no %s: shape names are indexed from the %d section files while nothing is queued", SHAPES_JSON, #ids)
     return
   end
   warm.names, warm.total = data.shapes, #data.shapes
+  if type(data.terrain) == "table" then            -- positions of the shapes terrain-like objects use (IdentityMatrix / ChoppedRoadway): held first
+    for _, pos in ipairs(data.terrain) do
+      local name = data.shapes[pos]
+      if name and not warm.terrain[name] then warm.terrain[name], warm.terrainN = true, warm.terrainN + 1 end
+    end
+  end
   if type(data.sections) == "table" then
     for id, list in pairs(data.sections) do
       local n = tonumber(id)
@@ -1905,157 +1956,119 @@ local function loadShapeList()
   warm.loaded = warm.total > 0
 end
 
--- shapes of the current section and its related sections, in loading order, not done yet
-local function warmRefreshNear()
-  warm.near, warm.nearPos, warm.nearFor = {}, 1, currentSectionID
-  local seen = {}
-  for i = 1, #feedOrder do
-    local list = warm.bySection[feedOrder[i]]
-    if list then
-      for j = 1, #list do
-        local idx = list[j]
-        if not seen[idx] and warm.done[idx] == nil then
-          seen[idx] = true
-          warm.near[#warm.near + 1] = idx
-        end
-      end
-    end
-  end
-end
-
-local function warmNextCandidate()
-  while warm.nearPos <= #warm.near do
-    local idx = warm.near[warm.nearPos]
-    warm.nearPos = warm.nearPos + 1
-    if warm.done[idx] == nil then return idx end
-  end
-  while warm.cursor <= warm.total do
-    local idx = warm.cursor
-    warm.cursor = warm.cursor + 1
-    if warm.done[idx] == nil then return idx end
-  end
-  return nil
-end
-
-local function warmMark(idx, value)
-  warm.done[idx] = value
-  warm.processed = warm.processed + 1
-end
-
--- Creates one hidden TSStatic of the shape below the camera and deletes it in the same call: the engine
--- imports the COLLADA and writes the .cdae, nothing is drawn and nothing stays in memory.
-local function warmImport(idx, name, diag)
-  warm.current = name
-  local diagStarted = diag and diag:now()
-  local started = os.clock()
-  local cam = core_camera and core_camera.getPosition and core_camera.getPosition()
-  local pos = cam and string.format("%.3f %.3f %.3f", cam.x, cam.y, cam.z - 800) or "0 0 -800"
-  local ok = false
-  local obj = createObject("TSStatic")
-  if obj then
-    pcall(function() obj.hidden = true end)
-    pcall(obj.setField, obj, "shapeName", 0, name)
-    pcall(obj.setField, obj, "position", 0, pos)
-    pcall(obj.setField, obj, "collisionType", 0, "None")
-    pcall(obj.setField, obj, "decalType", 0, "None")
-    local registerStart = diag and diag:now()
-    local okc, res = pcall(obj.registerObject, obj, "")
-    if diag then local ms = (diag:now() - registerStart) * 1000; diag:recordOperation("cache-warm-registerObject", ms, currentSectionID, name, name, "cache-warm", ms, "registerObject API elapsed inside cache warm import") end
-    ok = okc and res ~= false
-    pcall(obj.delete, obj)
-  end
-  local ms = (os.clock() - started) * 1000
-  if diag then diag:recordOperation("cache-warm-total", (diag:now() - diagStarted) * 1000, currentSectionID, name, name, "cache-warm-fresh", nil, "whole hidden import lifecycle; includes create, fields, register and delete") end
-  if ok then
-    warmMark(idx, true)
-    warm.imported = warm.imported + 1
-    warm.importMs = warm.importMs + ms
-    if ms > warm.importMax then warm.importMax, warm.importMaxShape = ms, name end
-    hold.noteSlow(warm.slow, name, ms, "import")
-    if TUNING.cacheWarmLogEvery > 0 and warm.imported % TUNING.cacheWarmLogEvery == 0 then
-      logMsg("I", "cache warm: %d of %d shapes done (%d already had a .cdae, %d imported now, %d failed), import avg %.1f ms, max %.0f ms (%s)",
-        warm.processed, warm.total, warm.hadCdae, warm.imported, warm.failed, warm.importMs / warm.imported,
-        warm.importMax, shortShapeName(warm.importMaxShape or "?"))
-    end
-  else
-    warmMark(idx, false)
-    warm.failed = warm.failed + 1
-    if warm.failed <= 10 then logMsg("W", "cache warm: %s could not be created", shortShapeName(name)) end
-  end
-  if ms >= TUNING.stallLogMs then logMsg("W", "slow cache warm import: %s %.0f ms", shortShapeName(name), ms) end
-end
-
-local function cacheWarmUpdate(dt, diag)
-  if not TUNING.cacheWarm or TUNING.warmAll or not warm.loaded or warm.finished or suspended or not initialized then
-    warm.phase = warm.finished and "finished" or (TUNING.warmAll and "replaced by Everything is warm")
-      or (not TUNING.cacheWarm and "off") or (suspended and "suspended")
-      or ((warm.scan and not warm.scan.done) and "indexing shape names") or (not warm.loaded and "unavailable") or "starting"
-    return
-  end
-  if not M.isIdle() then warm.idle = 0; warm.phase = "waiting: sections are streaming"; return end   -- the section streamer has work: it goes first
-  warm.idle = warm.idle + dt
-  if warm.idle < TUNING.cacheWarmIdleSeconds then warm.phase = "waiting: idle timer"; return end
-  warm.phase = "running"
-  warm.runSeconds = warm.runSeconds + dt
-  if warm.gap > 0 then
-    warm.gap = warm.gap - dt
-    if warm.gap > 0 then return end
-  end
-  local checkMs = fb.cap(TUNING.cacheWarmCheckShare)
-  if checkMs <= 0 then return end                                 -- the frame is already spent
-  if warm.nearFor ~= currentSectionID then warmRefreshNear() end
-  local imports, mark = 0, os.clock()
-  while imports < math.max(1, TUNING.cacheWarmPerFrame) do
-    if imports > 0 and fb.remaining() <= 0 then break end     -- an import is a stall of its own: no second one in a spent frame
-    local idx = warmNextCandidate()
-    if not idx then
-      warm.finished, warm.current, warm.phase = true, nil, "finished"
-      logMsg("I", "cache warm finished: %d shapes (%d already had a .cdae, %d imported now, %d failed, %d skipped), import avg %.1f ms",
-        warm.total, warm.hadCdae, warm.imported, warm.failed, warm.skipped,
-        warm.imported > 0 and warm.importMs / warm.imported or 0)
-      return
-    end
-    local name = warm.names[idx]
-    local cached
-    if seenShapes[name] or shapeLive[name] then cached = true else cached = shapeCached(name) end
-    if cached == nil then
-      if fsUnavailable then
-        warm.loaded = false
-        logMsg("W", "cache warm is off: FS:fileExists is not available here")
-        return
-      end
-      warmMark(idx, false)                                        -- not a .dae shape: nothing to cache
-      warm.skipped = warm.skipped + 1
-    elseif cached then
-      warmMark(idx, true)
-      warm.hadCdae = warm.hadCdae + 1
-    else
-      warmImport(idx, name, diag)
-      imports = imports + 1
-      warm.gap = TUNING.cacheWarmGapSeconds
-      mark = os.clock()
-    end
-    if (os.clock() - mark) * 1000 >= checkMs then break end       -- the time cap is for the skipping
-  end
-end
-
 -- ---------------------------------------------------------------------------
--- Everything is warm: one hidden holder object per shape
+-- Shape cache: one hidden holder object per shape (see the header)
 -- ---------------------------------------------------------------------------
+-- Everything below hangs off the table `hold`: the main chunk is close to Lua's 200 locals limit and a LuaJIT
+-- function may reach 60 upvalues at most, so the lane adds no local and no function with many upvalues.
+function hold.statsNew()
+  local function c() return { n = 0, ms = 0, max = 0 } end
+  return { creates = { held = c(), live = c(), cold = c() }, needN = 0, needMs = 0, idleN = 0, idleMs = 0,
+           retargetHeld = 0, retargetFilled = 0, coldBeforeFill = 0, stallMs = 0,
+           pauses = { busy = 0, heavy = 0, ram = 0, moving = 0, cap = 0 },
+           visits = 0, vReady = 0, vLate = 0, vDropped = 0, vTeleport = 0, nLate = 0, nDropped = 0,
+           ready = {}, readySum = 0, readyN = 0, readyMin = nil, fullSum = 0, fullN = 0, fullMax = 0, coldSum = 0, coldN = 0,
+           idleOff = nil, ambient = 0 }
+end
+hold.stats = hold.statsNew()
+
+-- Animated objects (playAmbient on) are frozen when a pooled object is shown again. So playAmbient is switched off when the
+-- object is hidden (resting in the pool, parked) and switched on again, with a postApply, once it is visible.
+-- hideAmbient: only for an object that was given a playAmbient field (shellFields). showAmbient: only for an animated item.
+function hold.hideAmbient(obj, id)
+  if not TUNING.restartAmbient then return end
+  local applied = shellFields[id]
+  if not (applied and applied.playAmbient) then return end
+  pcall(obj.setField, obj, "playAmbient", 0, "0")
+  pcall(obj.postApply, obj)
+end
+
+function hold.showAmbient(obj, item)
+  local v = item.playAmbient
+  if not TUNING.restartAmbient or not (v == true or v == 1 or v == "1" or v == "true") then return end
+  pcall(obj.setField, obj, "playAmbient", 0, "1")
+  pcall(obj.postApply, obj)
+  hold.stats.ambient = hold.stats.ambient + 1
+end
+
 function hold.reset()
   hold.shape, hold.ids, hold.held, hold.cursor, hold.failed = {}, {}, 0, 1, 0
   hold.ms, hold.max, hold.maxShape, hold.group, hold.idle, hold.seconds, hold.complete = 0, 0, nil, nil, 0, 0, false
-  hold.runSeconds, hold.phase, hold.slow = 0, "off", {}
-  hold.kind = { cached = { n = 0, ms = 0 }, import = { n = 0, ms = 0 }, unknown = { n = 0, ms = 0 } }
+  hold.runSeconds, hold.phase, hold.slow, hold.started = 0, "off", {}, false
+  hold.lane, hold.laneReason, hold.lastHoldMs, hold.lastShape, hold.gap, hold.lastPause = "asleep", nil, 0, nil, 0, nil
+  hold.absent, hold.absentN, hold.tries, hold.deferred, hold.deferredN = {}, 0, {}, {}, 0
+  hold.rings, hold.ringPos, hold.pass, hold.secIdx, hold.shpIdx, hold.nearFor, hold.nearAt, hold.adj = {}, 1, 1, 1, 1, nil, 0, nil
+  hold.islandId, hold.islandSet, hold.islandN, hold.islandHeld, hold.islandSections = nil, nil, 0, 0, 0
+  hold.still, hold.evicted, hold.evictKey = 0, 0, nil
+  hold.ph, hold.phN, hold.visit, hold.visitTimer = {}, 0, nil, 0
 end
 
--- Keeps the 10 slowest loads of a lane (shape, ms, kind), slowest first.
+-- Keeps the 10 slowest loads of a lane (shape, ms, channel), slowest first.
 function hold.noteSlow(list, name, ms, kind)
   local n = #list
   if n >= 10 and ms <= list[n].ms then return end
   list[n + 1] = { name = name, ms = ms, kind = kind }
   table.sort(list, function(a, b) return a.ms > b.ms end)
   if #list > 10 then list[#list] = nil end
+end
+
+-- Cost table: the load time measured for every shape, kept between sessions so a heavy shape is known before it is
+-- held again (heavy shapes wait for a still camera). A shape not in it has never been measured.
+function hold.costLoad()
+  hold.cost, hold.costDirty = {}, 0
+  local ok, data = pcall(jsonReadFile, levelRoot .. "/lua/carbon_stream/shape_costs.json")
+  if ok and type(data) == "table" then
+    for name, ms in pairs(data) do
+      if type(name) == "string" and type(ms) == "number" then hold.cost[name] = ms end
+    end
+  end
+end
+
+function hold.costSave()
+  if hold.costDirty <= 0 then return end
+  hold.costDirty = 0
+  local ok, err = pcall(jsonWriteFile, levelRoot .. "/lua/carbon_stream/shape_costs.json", hold.cost, true)
+  if not ok then logMsg("W", "shape cache: the cost table could not be written: %s", tostring(err)) end
+end
+
+-- Memory: the Lua heap is always known. Free / available / process RAM need a source: M.setMemoryProvider(fn) with
+-- fn returning { freeGB, availableGB, processGB }. Without one the RAM floor has nothing to compare and stays off.
+function hold.memSample(force)
+  local m = hold.mem
+  local now = totalTime                                              -- streamer time, so the sampling follows the frames
+  if not force and m.last and now - m.time < 1.0 then return m.last end
+  m.time = now
+  local kb = collectgarbage("count")
+  if kb > m.luaPeakKB then m.luaPeakKB = kb end
+  local s = { luaGB = kb / 1048576 }
+  if m.provider then
+    local ok, r = pcall(m.provider)
+    if ok and type(r) == "table" then
+      s.freeGB, s.availableGB, s.processGB = tonumber(r.freeGB), tonumber(r.availableGB), tonumber(r.processGB)
+      if s.freeGB and (not m.minFree or s.freeGB < m.minFree) then m.minFree = s.freeGB end
+      if s.availableGB and (not m.minAvail or s.availableGB < m.minAvail) then m.minAvail = s.availableGB end
+      if s.processGB and (not m.peakProcess or s.processGB > m.peakProcess) then m.peakProcess = s.processGB end
+    end
+  end
+  m.last = s
+  return s
+end
+
+-- A shape the game has no file for (neither .dae nor .cdae): it is never held and not retried. Needs FS:fileExists.
+function hold.isAbsent(name)
+  local known = hold.absent[name]
+  if known ~= nil then return known end
+  local res = false
+  if not fsUnavailable and type(name) == "string" then
+    local fs = rawget(_G, "FS")
+    if fs then
+      local alt = name:sub(1, 1) == "/" and name:sub(2) or ("/" .. name)
+      if fileExists(fs, name) == false and fileExists(fs, alt) == false then res = shapeCached(name) == false end
+    end
+  end
+  hold.absent[name] = res
+  if res then hold.absentN = hold.absentN + 1 end
+  return res
 end
 
 -- The section files are read once, one per idle frame within shapeIndexBudgetShare, and every shapeName is collected.
@@ -2077,8 +2090,10 @@ function hold.scanFinish(sc)
     bySection[id] = out
   end
   warm.names, warm.total, warm.bySection, warm.loaded = names, #names, bySection, #names > 0
-  sc.done, sc.perSection, sc.counts = true, nil, nil               -- the working tables are no longer needed
-  logMsg("I", "shape index built: %d unique shapes from %d section files (%d records, %d unreadable), %.1f s of reads in %.0f s of idle time",
+  hold.adj = nil                                                       -- the islands are made again with the new index
+  for name in pairs(sc.terrain) do warm.terrain[name], warm.terrainN = true, warm.terrainN + 1 end
+  sc.done, sc.perSection, sc.counts, sc.terrain = true, nil, nil, nil               -- the working tables are no longer needed
+  logMsg("D", "shape index built: %d unique shapes from %d section files (%d records, %d unreadable), %.1f s of reads in %.0f s of idle time",
     #names, sc.files, sc.records, sc.failed, sc.ms / 1000, sc.runSeconds)
 end
 
@@ -2086,10 +2101,10 @@ end
 function hold.scanUpdate(dt)
   local sc = warm.scan
   if not sc or sc.done or suspended or not initialized then return 0 end
-  if not (TUNING.cacheWarm or TUNING.warmAll) then return 0 end      -- nobody needs the names yet
+  if not TUNING.shapeCache then return 0 end                         -- nobody needs the names yet
   if not M.isIdle() then sc.idle = 0; return 0 end                   -- the section streamer goes first
   sc.idle = sc.idle + dt
-  if sc.idle < TUNING.cacheWarmIdleSeconds then return 0 end
+  if sc.idle < ((TUNING.shapeCacheAtLoad and not hold.started) and 0 or TUNING.shapeCacheIdleSeconds) then return 0 end
   sc.runSeconds = sc.runSeconds + dt
   local limit = fb.cap(TUNING.shapeIndexBudgetShare)
   local started, n = os.clock(), 0
@@ -2107,6 +2122,7 @@ function hold.scanUpdate(dt)
         local shape = type(rec) == "table" and rec.shapeName or nil
         if type(shape) == "string" and shape ~= "" then
           sc.records = sc.records + 1
+          if isTerrainItem(rec) then sc.terrain[shape] = true end
           if not seen[shape] then
             seen[shape] = true
             list[#list + 1] = shape
@@ -2142,53 +2158,104 @@ function hold.ensureGroup()
   return g
 end
 
--- Creates the holder of one shape: hidden, no collision, below the camera. Returns true when the engine took it.
-function hold.add(name)
+-- Placeholders: hidden holders on the dot, built ahead of the fill cursor in a rolling window (shapeCachePlaceholders).
+-- A hold takes one and only changes its shapeName, so the registerObject cost is paid earlier, in idle frames.
+function hold.takePlaceholder()
+  while hold.phN > 0 do
+    local id = hold.ph[hold.phN]
+    hold.ph[hold.phN] = nil
+    hold.phN = hold.phN - 1
+    local obj = scenetree.findObjectById(id)
+    if obj then return obj end
+  end
+  return nil
+end
+
+function hold.placeholderStep()
+  local want = math.min(TUNING.shapeCachePlaceholders, warm.total - hold.held - hold.absentN)
+  if want <= 0 or hold.phN >= want then return 0 end
+  local limit = fb.cap(TUNING.shapeCacheBudgetShare)
+  if limit <= 0 then return 0 end
   local group = hold.ensureGroup()
-  if not group then return false end
-  local cached = shapeCached(name)                              -- asked before the load: afterwards the .cdae exists either way
-  local kind = cached == true and "cached" or (cached == false and "import" or "unknown")
+  if not group then return 0 end
   local cam = core_camera and core_camera.getPosition and core_camera.getPosition()
   local pos = cam and string.format("%.3f %.3f %.3f", cam.x, cam.y, cam.z - 800) or "0 0 -800"
-  local started = os.clock()
-  local ok = false
-  local obj = createObject("TSStatic")
-  if obj then
+  local started, built = os.clock(), 0
+  while hold.phN < want and built < 8 do
+    local obj = createObject("TSStatic")
+    if not obj then break end
     pcall(function() obj.hidden = true end)
-    pcall(obj.setField, obj, "shapeName", 0, name)
+    pcall(obj.setField, obj, "shapeName", 0, TUNING.shellShape)
     pcall(obj.setField, obj, "position", 0, pos)
     pcall(obj.setField, obj, "collisionType", 0, "None")
     pcall(obj.setField, obj, "decalType", 0, "None")
     local okc, res = pcall(obj.registerObject, obj, "")
-    ok = okc and res ~= false
-    if ok then
-      pcall(group.addObject, group, obj)
-      hold.ids[name], hold.shape[name] = obj:getID(), true
-      hold.held = hold.held + 1
-    else
-      pcall(obj.delete, obj)
+    if not (okc and res ~= false) then pcall(obj.delete, obj); break end
+    pcall(group.addObject, group, obj)
+    hold.phN = hold.phN + 1
+    hold.ph[hold.phN] = obj:getID()
+    built = built + 1
+    if (os.clock() - started) * 1000 >= limit then break end
+  end
+  hold.phMs = hold.phMs + (os.clock() - started) * 1000
+  return built
+end
+
+-- Holds one shape: a hidden object without collision that keeps it loaded for the rest of the session. channel is "idle"
+-- (the fill lane) or "need" (a create wants a shape nobody holds yet). Returns true and the ms it took, or false.
+function hold.add(name, channel)
+  local group = hold.ensureGroup()
+  if not group then return false, 0 end
+  hold.tries[name] = (hold.tries[name] or 0) + 1
+  local started = os.clock()
+  local ok = false
+  local obj = hold.takePlaceholder()
+  if obj then
+    pcall(obj.setField, obj, "shapeName", 0, name)             -- the load happens here, on the dot-wearing object
+    pcall(obj.postApply, obj)
+    ok = true
+  else
+    local cam = core_camera and core_camera.getPosition and core_camera.getPosition()
+    local pos = cam and string.format("%.3f %.3f %.3f", cam.x, cam.y, cam.z - 800) or "0 0 -800"
+    obj = createObject("TSStatic")
+    if obj then
+      pcall(function() obj.hidden = true end)
+      pcall(obj.setField, obj, "shapeName", 0, name)
+      pcall(obj.setField, obj, "position", 0, pos)
+      pcall(obj.setField, obj, "collisionType", 0, "None")
+      pcall(obj.setField, obj, "decalType", 0, "None")
+      local okc, res = pcall(obj.registerObject, obj, "")
+      ok = okc and res ~= false
+      if ok then pcall(group.addObject, group, obj) else pcall(obj.delete, obj) end
     end
   end
   local ms = (os.clock() - started) * 1000
+  local st = hold.stats
   if ok then
-    hold.ms = hold.ms + ms
-    local k = hold.kind[kind]
-    k.n, k.ms = k.n + 1, k.ms + ms
-    hold.noteSlow(hold.slow, name, ms, kind)
+    hold.ids[name], hold.shape[name] = obj:getID(), true
+    hold.held = hold.held + 1
+    if hold.islandSet and hold.islandSet[name] then hold.islandHeld = hold.islandHeld + 1 end
+    hold.ms, hold.lastHoldMs, hold.lastShape = hold.ms + ms, ms, name
+    if channel == "need" then st.needN, st.needMs = st.needN + 1, st.needMs + ms
+    else st.idleN, st.idleMs = st.idleN + 1, st.idleMs + ms end
+    hold.noteSlow(hold.slow, name, ms, channel)
     if ms > hold.max then hold.max, hold.maxShape = ms, name end
-    if TUNING.warmAllLogEvery > 0 and hold.held % TUNING.warmAllLogEvery == 0 then
-      logMsg("I", "everything warm: %d of %d meshes held (%d failed), avg %.2f ms, max %.0f ms (%s)",
+    hold.cost[name] = math.floor(ms * 10 + 0.5) / 10
+    hold.costDirty = hold.costDirty + 1
+    if channel ~= "need" and ms >= TUNING.shapeCacheHeavyMs then hold.lastHitch = { name = name, ms = ms } end
+    if TUNING.debugLog and TUNING.shapeCacheLogEvery > 0 and hold.held % TUNING.shapeCacheLogEvery == 0 then
+      logMsg("I", "shape cache: %d of %d shapes held (%d failed), avg %.2f ms, max %.0f ms (%s)",
         hold.held, warm.total, hold.failed, hold.ms / hold.held, hold.max, shortShapeName(hold.maxShape or "?"))
     end
   else
     hold.failed = hold.failed + 1
-    if hold.failed <= 10 then logMsg("W", "everything warm: %s could not be held", shortShapeName(name)) end
+    if hold.failed <= 10 then logMsg("W", "shape cache: %s could not be held", shortShapeName(name)) end
   end
-  if ms >= TUNING.stallLogMs then logMsg("W", "slow mesh hold: %s %.0f ms", shortShapeName(name), ms) end
-  return ok
+  if ms >= TUNING.stallLogMs then logMsg("W", "slow mesh hold: %s %.0f ms (%s)", shortShapeName(name), ms, tostring(channel)) end
+  return ok, ms
 end
 
--- Deletes the holders (a batch per call). Returns true when all are gone and the group too.
+-- Deletes the holders and placeholders (a batch per call). Returns true when all are gone and the group too.
 function hold.release(batch)
   local n = 0
   for name, id in pairs(hold.ids) do
@@ -2199,58 +2266,520 @@ function hold.release(batch)
     n = n + 1
     if n >= batch then return false end
   end
+  while hold.phN > 0 do
+    local obj = scenetree.findObjectById(hold.ph[hold.phN])
+    if obj then pcall(obj.delete, obj) end
+    hold.ph[hold.phN] = nil
+    hold.phN = hold.phN - 1
+    n = n + 1
+    if n >= batch then return false end
+  end
   local g = scenetree.findObject(TUNING.warmGroupName)
   if g then pcall(g.delete, g) end
-  logMsg("I", "everything warm: meshes released")
+  if hold.group or hold.costDirty > 0 then logMsg("D", "shape cache: holders released") end
+  hold.costSave()
   hold.reset()
   return true
 end
 
--- The lane, once per frame. Returns how many meshes it held.
+-- Fill order ---------------------------------------------------------------------------------------------------------
+-- Sections are connected through their relations, and those connections form self-contained islands (the city is one big
+-- island, the canyons and districts away from it are others). The fill takes only the island the camera is in: the section
+-- it is in first, then its related sections, then theirs, outward by hops. Within a hop ring the shapes of terrain-like
+-- objects (IdentityMatrix / ChoppedRoadway) come before the rest. Another island is never touched until the camera is in it.
+function hold.adjacency()
+  if hold.adj then return hold.adj end
+  -- sections.json holds the drivable sections only. Their related lists also name sections that are not drivable
+  -- (scenery only, known to the stream index): those are part of the island, their meshes are held, but they are leaves,
+  -- so the walk never goes on through them into another island.
+  local adj = {}
+  for id in pairs(sections) do adj[id] = {} end
+  for id in pairs(sections) do
+    local rel = M.getRelatedSections(id)
+    for i = 1, #rel do
+      local o = rel[i]
+      if o ~= id then
+        if sections[o] then
+          adj[id][o], adj[o][id] = true, true
+        elseif warm.bySection[o] then
+          adj[id][o] = true
+          adj[o] = adj[o] or {}                        -- a leaf: nothing to expand from
+        end
+      end
+    end
+  end
+  -- The island of every drivable section, named by its lowest section id, made once here (not polled while driving).
+  local islandOf = {}
+  for id in pairs(sections) do
+    if not islandOf[id] then
+      local members, stack, minId = { id }, { id }, id
+      islandOf[id] = true
+      while #stack > 0 do
+        local cur = stack[#stack]
+        stack[#stack] = nil
+        for o in pairs(adj[cur]) do
+          if sections[o] and not islandOf[o] then
+            islandOf[o] = true
+            members[#members + 1], stack[#stack + 1] = o, o
+            if o < minId then minId = o end
+          end
+        end
+      end
+      for i = 1, #members do islandOf[members[i]] = minId end
+    end
+  end
+  hold.adj, hold.islandOf = adj, islandOf
+  return adj
+end
+
+-- Called on every section change (not polled): entering a section of another island makes the preload switch to that island,
+-- whatever the lane was doing (an island that is held does not wake the walk by itself).
+function hold.sectionEntered(newID)
+  if not newID or not TUNING.shapeCache or warm.total <= 0 or next(warm.bySection) == nil then return end
+  hold.adjacency()
+  local island = hold.islandOf[newID]
+  if island and island ~= hold.islandId then hold.nearRebuild() end
+end
+
+-- Outside every section (a spawn, a jump): the nearest section stands in as the start.
+function hold.nearestSection(adj)
+  if not camPos then return nil end
+  local best, bestD
+  for id in pairs(adj) do
+    if sections[id] and warm.bySection[id] then
+      local d = isInSection(camPos, id) and 0 or distanceToPolygonEdges(camPos, sections[id].points)
+      if not bestD or d < bestD then best, bestD = id, d end
+    end
+  end
+  return best
+end
+
+function hold.islandChange(seen, id)
+  hold.islandId, hold.complete = id, false
+  local set, n, held, secs = {}, 0, 0, 0
+  for sid in pairs(seen) do
+    secs = secs + 1
+    local list = warm.bySection[sid]
+    if list then
+      for i = 1, #list do
+        local name = warm.names[list[i]]
+        if name and not set[name] then
+          set[name], n = true, n + 1
+          if hold.shape[name] then held = held + 1 end
+        end
+      end
+    end
+  end
+  hold.islandSet, hold.islandN, hold.islandHeld, hold.islandSections = set, n, held, secs
+  hold.deferred, hold.deferredN = {}, 0               -- the postponed heavy shapes belonged to the old island
+  logMsg("D", "shape cache: island of section %s: %d sections, %d meshes (%d already held)", tostring(id), secs, n, held)
+end
+
+function hold.nearRebuild()
+  hold.nearFor, hold.nearAt = currentSectionID, totalTime
+  hold.rings, hold.ringPos, hold.pass, hold.secIdx, hold.shpIdx = {}, 1, warm.terrainN > 0 and 1 or 2, 1, 1
+  local adj = hold.adjacency()
+  local root = currentSectionID
+  if not (root and adj[root]) then root = hold.nearestSection(adj) end
+  if not root then return end
+  local seen, ring, rings, minId = { [root] = true }, { root }, {}, root
+  while #ring > 0 do
+    rings[#rings + 1] = ring
+    local nextRing = {}
+    for i = 1, #ring do
+      for o in pairs(adj[ring[i]]) do
+        if not seen[o] then
+          seen[o] = true
+          nextRing[#nextRing + 1] = o
+          if sections[o] and o < minId then minId = o end
+        end
+      end
+    end
+    table.sort(nextRing)
+    ring = nextRing
+  end
+  hold.rings = rings
+  if hold.islandId ~= minId then hold.islandChange(seen, minId) end
+end
+
+-- true: hold it now. false: skip (held, absent, tried twice) or park it for a still camera (heavy, or a failed first try).
+function hold.candidate(name, heavyOk)
+  if hold.shape[name] or (hold.tries[name] or 0) >= 2 or hold.isAbsent(name) then return false end
+  local cost = hold.cost[name]
+  if cost and cost > TUNING.shapeCacheHeavyMs and not heavyOk then
+    if not hold.deferred[name] then hold.deferred[name], hold.deferredN = true, hold.deferredN + 1 end
+    return false
+  end
+  return true
+end
+
+-- Returns the next shape to hold, or nil and why: "done" (the island is held), "heavy" (only heavy shapes left, the camera
+-- is moving), "scan" (a long run of held shapes was skipped, the walk goes on next frame).
+function hold.nextShape()
+  local heavyOk = (not TUNING.shapeCacheHeavyWait) or hold.still >= TUNING.shapeCacheStillSeconds
+  if heavyOk and hold.deferredN > 0 then
+    local name = next(hold.deferred)
+    hold.deferred[name], hold.deferredN = nil, hold.deferredN - 1
+    if not hold.shape[name] and (hold.tries[name] or 0) < 2 and not hold.isAbsent(name) then return name end
+  end
+  if next(warm.bySection) == nil then                                 -- a pack without per-section lists: the whole index is the island
+    if not hold.islandId then
+      hold.islandId, hold.islandSet, hold.islandN, hold.islandSections = 0, {}, warm.total, 0
+      for i = 1, warm.total do hold.islandSet[warm.names[i]] = true end
+    end
+    local steps = 0
+    while hold.cursor <= warm.total and steps < 512 do
+      local name = warm.names[hold.cursor]
+      hold.cursor, steps = hold.cursor + 1, steps + 1
+      if name and hold.candidate(name, heavyOk) then return name end
+    end
+    if hold.cursor <= warm.total then return nil, "scan" end
+    return nil, hold.deferredN > 0 and "heavy" or "done"
+  end
+  if hold.nearFor ~= currentSectionID or (hold.islandId == nil and #hold.rings == 0 and totalTime - hold.nearAt > 1.0) then
+    hold.nearRebuild()
+  end
+  local steps = 0
+  while hold.ringPos <= #hold.rings and steps < 512 do
+    local ring = hold.rings[hold.ringPos]
+    if hold.secIdx > #ring then
+      hold.secIdx, hold.shpIdx = 1, 1
+      if hold.pass == 1 then hold.pass = 2
+      else hold.pass, hold.ringPos = warm.terrainN > 0 and 1 or 2, hold.ringPos + 1 end
+    else
+      local list = warm.bySection[ring[hold.secIdx]]
+      if not list or hold.shpIdx > #list then
+        hold.secIdx, hold.shpIdx = hold.secIdx + 1, 1
+      else
+        local name = warm.names[list[hold.shpIdx]]
+        hold.shpIdx, steps = hold.shpIdx + 1, steps + 1
+        if name and (hold.pass == 2 or warm.terrain[name]) and hold.candidate(name, heavyOk) then return name end
+      end
+    end
+  end
+  if hold.ringPos <= #hold.rings then return nil, "scan" end
+  if #hold.rings == 0 then return nil, "none" end                     -- no section to start from
+  return nil, hold.deferredN > 0 and "heavy" or "done"
+end
+
+
+-- Visits: readiness at entry and the dropped-section rule ------------------------------------------------------------
+-- A section is ready when every shape of it is held (absent shapes do not count).
+function hold.sectionState(id)
+  local list = warm.bySection[id]
+  if not list then return 0, 0 end
+  local held, total = 0, 0
+  for i = 1, #list do
+    local name = warm.names[list[i]]
+    if name and not hold.isAbsent(name) then
+      total = total + 1
+      if hold.shape[name] then held = held + 1 end
+    end
+  end
+  return held, total
+end
+
+function hold.related(fromID, toID)
+  local list = M.getRelatedSections(fromID)
+  for i = 1, #list do if list[i] == toID then return true end end
+  return false
+end
+
+function hold.visitCheck(v)
+  local t = totalTime - v.t0
+  local allReady = true
+  if not v.readyAt then
+    local h, n = hold.sectionState(v.id)
+    if h >= n then v.readyAt = t else allReady = false end
+  end
+  v.ready = 0
+  for id, e in pairs(v.neigh) do
+    if not e.readyAt then
+      local h, n = hold.sectionState(id)
+      if h >= n then e.readyAt = t end
+    end
+    if e.readyAt then v.ready = v.ready + 1 else allReady = false end
+  end
+  if allReady and not v.fullAt then v.fullAt = t end
+end
+
+-- The visit to a section ended (the camera went on): late = a neighbour that was not ready at entry was ready by exit,
+-- dropped = it was still not ready. A teleport (the section is not in the related list of the one before) is left out and
+-- its time to ready is the cold-start cost.
+function hold.visitClose(v)
+  hold.visitCheck(v)
+  local st = hold.stats
+  if v.teleport then
+    st.vTeleport = st.vTeleport + 1
+    st.coldSum, st.coldN = st.coldSum + (v.readyAt or (totalTime - v.t0)), st.coldN + 1
+    return
+  end
+  st.visits = st.visits + 1
+  local missed, dropped = 0, 0
+  for _, e in pairs(v.neigh) do
+    if not e.ready0 then
+      missed = missed + 1
+      if e.readyAt then st.nLate = st.nLate + 1 else st.nDropped, dropped = st.nDropped + 1, dropped + 1 end
+    end
+  end
+  if missed == 0 then st.vReady = st.vReady + 1
+  elseif dropped > 0 then st.vDropped = st.vDropped + 1
+  else st.vLate = st.vLate + 1 end
+  local frac = v.entryTotal > 0 and v.entryHeld / v.entryTotal or 1
+  st.readyN, st.readySum = st.readyN + 1, st.readySum + frac
+  if not st.readyMin or frac < st.readyMin then st.readyMin = frac end
+  if #st.ready < 4096 then st.ready[#st.ready + 1] = frac end
+  if v.fullAt then
+    st.fullN, st.fullSum = st.fullN + 1, st.fullSum + v.fullAt
+    if v.fullAt > st.fullMax then st.fullMax = v.fullAt end
+  end
+end
+
+function hold.visitChange(oldID, newID)
+  if hold.visit then hold.visitClose(hold.visit) end
+  hold.visit = nil
+  if not newID or not TUNING.shapeCache or warm.total <= 0 then return end
+  local v = { id = newID, t0 = totalTime, neigh = {}, cold = 0, ready = 0, neighN = 0 }
+  v.teleport = oldID == nil or (oldID ~= newID and not hold.related(oldID, newID))
+  v.entryHeld, v.entryTotal = hold.sectionState(newID)
+  if v.entryHeld >= v.entryTotal then v.readyAt = 0 end
+  local allReady = v.readyAt ~= nil
+  local rel = M.getRelatedSections(newID)
+  for i = 1, #rel do
+    local id = rel[i]
+    if id ~= newID and not v.neigh[id] then
+      local h, n = hold.sectionState(id)
+      local e = { ready0 = h >= n }
+      if e.ready0 then e.readyAt = 0; v.ready = v.ready + 1 else allReady = false end
+      v.neigh[id], v.neighN = e, v.neighN + 1
+    end
+  end
+  if allReady then v.fullAt = 0 end
+  hold.visit = v
+end
+
+function hold.visitUpdate(dt)
+  local v = hold.visit
+  if not v then return end
+  hold.visitTimer = hold.visitTimer + dt
+  if hold.visitTimer < 0.5 then return end
+  hold.visitTimer = 0
+  hold.visitCheck(v)
+end
+
+-- One create finished: class "held" (the shape was held), "live" (an instance kept it loaded) or "cold" (it had to be loaded:
+-- the ms then include the hold the create waited for).
+function hold.noteCreate(cls, ms, name)
+  local c = hold.stats.creates[cls]
+  c.n, c.ms = c.n + 1, c.ms + ms
+  if ms > c.max then c.max = ms end
+  if cls == "cold" then
+    hold.stats.stallMs = hold.stats.stallMs + ms
+    if not hold.complete then hold.stats.coldBeforeFill = hold.stats.coldBeforeFill + 1 end
+    if hold.visit then hold.visit.cold = hold.visit.cold + 1 end
+  end
+  if ms >= TUNING.shapeCacheHeavyMs then hold.lastHitch = { name = name, ms = ms } end
+end
+
+-- Over the cap (Max meshes to save, or after moving to another island): deletes holders of shapes the current island does not
+-- use and no live object keeps, a few per call. Returns how many it deleted.
+function hold.evictStep(cap)
+  local n, k = 0, hold.evictKey
+  for _ = 1, 256 do
+    local okNext, name, id = pcall(next, hold.ids, k)
+    if not okNext or name == nil then k = nil; break end             -- a changed table: start over next time
+    k = name
+    if not (hold.islandSet and hold.islandSet[name]) and (shapeLive[name] or 0) == 0 then
+      local obj = scenetree.findObjectById(id)
+      if obj then pcall(obj.delete, obj) end
+      hold.ids[name], hold.shape[name] = nil, nil
+      hold.held, hold.evicted, n = hold.held - 1, hold.evicted + 1, n + 1
+      if hold.held <= cap or n >= 16 then break end
+    end
+  end
+  hold.evictKey = k
+  return n
+end
+
+function hold.pause(reason, phase)
+  hold.lane, hold.laneReason, hold.phase = "paused", reason, phase
+  if hold.lastPause ~= reason then
+    hold.lastPause = reason
+    local p = hold.stats.pauses
+    if p[reason] ~= nil then p[reason] = p[reason] + 1 end
+  end
+end
+
+-- The lane, once per frame, only while nothing is queued. Returns how many shapes (and placeholders) it made.
 function hold.update(dt)
-  if not TUNING.warmAll then
-    hold.phase = hold.held > 0 and "releasing" or "off"
-    if hold.held > 0 or hold.group then hold.release(512) end
+  if not TUNING.shapeCache then
+    hold.lane, hold.laneReason = "asleep", nil
+    hold.phase = (hold.held > 0 or hold.phN > 0) and "releasing" or "off"
+    if hold.held > 0 or hold.phN > 0 or hold.group then hold.release(512) end
     return 0
   end
-  if suspended or not initialized or warm.total <= 0 or hold.complete then
-    hold.phase = hold.complete and "complete" or (not initialized and "starting") or (suspended and "suspended")
+  if suspended or not initialized or warm.total <= 0 then
+    hold.lane, hold.laneReason = "asleep", nil
+    hold.phase = (not initialized and "starting") or (suspended and "suspended")
       or ((warm.scan and not warm.scan.done) and "waiting: indexing shape names") or "no shape names"
     return 0
   end
+  hold.visitUpdate(dt)
+  local mem = hold.memSample()
   hold.seconds = hold.seconds + dt
-  if not M.isIdle() then hold.idle = 0; hold.phase = "waiting: sections are streaming"; return 0 end   -- the section streamer goes first
+  local speed = math.sqrt(camVel.x * camVel.x + camVel.y * camVel.y)
+  if speed < 0.5 then hold.still = hold.still + dt else hold.still = 0 end
+  if hold.complete then hold.lane, hold.laneReason, hold.phase = "asleep", nil, "island held"; return 0 end
+  if hold.paused then hold.pause("user", "paused by the Pause fill button"); return 0 end
+  if not M.isIdle() then hold.idle = 0; hold.pause("busy", "waiting: sections are streaming"); return 0 end   -- the section streamer goes first
   hold.idle = hold.idle + dt
-  if hold.idle < TUNING.cacheWarmIdleSeconds then hold.phase = "waiting: idle timer"; return 0 end
-  local limit = fb.cap(TUNING.warmAllBudgetShare)
-  if limit <= 0 then hold.phase = "waiting: frame budget spent"; return 0 end
-  hold.phase = "holding"
-  hold.runSeconds = hold.runSeconds + dt
-  local started, made = os.clock(), 0
-  while made < TUNING.warmAllPerFrame do
-    if made > 0 and (os.clock() - started) * 1000 >= limit then break end
-    local idx = hold.cursor
-    if idx > warm.total then
-      hold.complete, hold.phase = true, "complete"
-      logMsg("I", "everything warm: all %d meshes held (%d failed), avg %.2f ms per mesh, %.0f s (%.0f s of it holding)", hold.held, hold.failed,
-        hold.held > 0 and hold.ms / hold.held or 0, hold.seconds, hold.runSeconds)
-      logMsg("I", "everything warm: %d already had a .cdae (%.0f ms), %d imported now (%.0f ms), %d unknown (%.0f ms)",
-        hold.kind.cached.n, hold.kind.cached.ms, hold.kind.import.n, hold.kind.import.ms, hold.kind.unknown.n, hold.kind.unknown.ms)
-      break
+  if hold.idle < ((TUNING.shapeCacheAtLoad and not hold.started) and 0 or TUNING.shapeCacheIdleSeconds) then
+    hold.pause("busy", "waiting: idle timer"); return 0
+  end
+  local cap = TUNING.shapeCacheMax
+  if hold.held > cap then
+    hold.lane, hold.laneReason, hold.phase = "filling", nil, "releasing meshes over Max meshes to save"
+    if hold.evictStep(cap) > 0 then return 1 end
+  end
+  if not TUNING.shapeCacheAlways and hold.still < TUNING.shapeCacheStillSeconds and not (TUNING.shapeCacheAtLoad and not hold.started) then
+    hold.pause("moving", "waiting: the car is moving (Preload always is off)"); return 0
+  end
+  if hold.held == 0 and idleFrameMs and not hold.stats.idleOff then hold.stats.idleOff = idleFrameMs end   -- idle frame with no holders
+  local floor = TUNING.shapeCacheRamFloorGB
+  if floor > 0 and mem and mem.freeGB then
+    if mem.freeGB < floor then
+      if not hold.ramPaused then
+        hold.ramPaused = true
+        logMsg("W", "shape cache: paused, free RAM %.2f GB is under the floor of %.2f GB", mem.freeGB, floor)
+      end
+      hold.pause("ram", "waiting: free RAM under the floor")
+      return 0
     end
-    hold.cursor = idx + 1
-    local name = warm.names[idx]
-    if name and not hold.shape[name] then
-      hold.add(name)
-      made = made + 1
+    if hold.ramPaused then
+      hold.ramPaused = false
+      logMsg("D", "shape cache: resumed, free RAM %.2f GB", mem.freeGB)
     end
   end
+  if hold.gap > 0 then
+    hold.gap = hold.gap - dt
+    if hold.gap > 0 then hold.lane, hold.laneReason, hold.phase = "filling", nil, "holding (gap)"; return 0 end
+  end
+  local limit = fb.cap(TUNING.shapeCacheBudgetShare)
+  if limit <= 0 then hold.pause("busy", "waiting: frame budget spent"); return 0 end
+  hold.lane, hold.laneReason, hold.phase, hold.lastPause = "filling", nil, "holding", nil
+  hold.runSeconds = hold.runSeconds + dt
+  local started, made = os.clock(), hold.placeholderStep()
+  local holds = 0
+  while holds < TUNING.shapeCachePerFrame do
+    if holds > 0 and (os.clock() - started) * 1000 >= limit then break end
+    if hold.held >= cap then
+      hold.pause("cap", "Max meshes to save reached")
+      break
+    end
+    local name, why = hold.nextShape()
+    if not name then
+      if why == "done" then
+        hold.complete, hold.lane, hold.phase = true, "asleep", "complete"
+        hold.costDirty = hold.costDirty + 1
+        hold.costSave()
+        logMsg("D", "shape cache: the island is held: %d of %d meshes held (%d failed, %d absent), avg %.2f ms per shape, %.0f s (%.0f s of it holding)",
+          hold.islandHeld, hold.islandN, hold.failed, hold.absentN, hold.held > 0 and hold.ms / hold.held or 0, hold.seconds, hold.runSeconds)
+      elseif why == "heavy" then
+        hold.pause("heavy", "waiting: heavy shapes wait for a still camera")
+      elseif why == "none" then
+        hold.lane, hold.laneReason, hold.phase = "asleep", nil, "waiting: no section to start from"
+      end
+      break
+    end
+    hold.started = true
+    hold.add(name, "idle")
+    holds, made = holds + 1, made + 1
+    if TUNING.shapeCacheGapSeconds > 0 then hold.gap = TUNING.shapeCacheGapSeconds; break end
+  end
+  if hold.costDirty >= 500 then hold.costSave() end
   return made
 end
 
--- ---------------------------------------------------------------------------
--- State reset
--- ---------------------------------------------------------------------------
+-- Progress of the shape cache (panel and console). lane: "asleep" | "filling" | "paused" (+ reason).
+function M.getShapeCacheStatus()
+  local st, v, m = hold.stats, hold.visit, hold.memSample()
+  local remaining = math.max(0, warm.total - hold.held - hold.failed - hold.absentN)
+  local sorted, p10 = {}, nil
+  for i = 1, #st.ready do sorted[i] = st.ready[i] end
+  table.sort(sorted)
+  if #sorted > 0 then p10 = sorted[math.max(1, math.ceil(#sorted * 0.1))] end
+  return {
+    enabled = TUNING.shapeCache, available = warm.total > 0, total = warm.total, held = hold.held, failed = hold.failed,
+    absent = hold.absentN, remaining = remaining, complete = hold.complete, paused = hold.paused,
+    placeholders = hold.phN, placeholderWindow = TUNING.shapeCachePlaceholders,
+    island = { id = hold.islandId, sections = hold.islandSections, meshes = hold.islandN, held = hold.islandHeld },
+    max = TUNING.shapeCacheMax, always = TUNING.shapeCacheAlways, evicted = hold.evicted,
+    lane = hold.lane, laneReason = hold.laneReason, phase = hold.phase, current = hold.lastShape, lastHoldMs = hold.lastHoldMs,
+    avgMs = hold.held > 0 and hold.ms / hold.held or 0, maxMs = hold.max, maxShape = hold.maxShape,
+    seconds = hold.seconds, runSeconds = hold.runSeconds, slow = hold.slow, deferredHeavy = hold.deferredN,
+    etaSeconds = (hold.held > 0 and hold.runSeconds > 0) and remaining * hold.runSeconds / hold.held or nil,
+    visit = v and { id = v.id, ready = v.ready, neighbours = v.neighN, cold = v.cold, teleport = v.teleport,
+                    entryHeld = v.entryHeld, entryTotal = v.entryTotal, readyAt = v.readyAt } or nil,
+    lastHitch = hold.lastHitch, memory = m, ramPaused = hold.ramPaused == true, ramFloor = TUNING.shapeCacheRamFloorGB,
+    ramSource = hold.mem.provider ~= nil, minFreeGB = hold.mem.minFree, peakProcessGB = hold.mem.peakProcess,
+    luaPeakGB = hold.mem.luaPeakKB / 1048576,
+    creates = st.creates, needN = st.needN, needMs = st.needMs, idleN = st.idleN, idleMs = st.idleMs,
+    stallMs = st.stallMs, retargetHeld = st.retargetHeld, retargetFilled = st.retargetFilled, coldBeforeFill = st.coldBeforeFill,
+    pauses = st.pauses, visits = st.visits, visitsReady = st.vReady, visitsLate = st.vLate, visitsDropped = st.vDropped,
+    visitsTeleport = st.vTeleport, neighboursLate = st.nLate, neighboursDropped = st.nDropped,
+    readinessAvg = st.readyN > 0 and st.readySum / st.readyN or nil, readinessP10 = p10, readinessMin = st.readyMin,
+    fullAvgSeconds = st.fullN > 0 and st.fullSum / st.fullN or nil, fullMaxSeconds = st.fullMax,
+    coldStartAvgSeconds = st.coldN > 0 and st.coldSum / st.coldN or nil,
+    ambientRestarts = st.ambient, idleFrameOffMs = st.idleOff, idleFrameOnMs = hold.held > 0 and idleFrameMs or nil,
+  }
+end
+
+function M.setShapeCache(flag) TUNING.shapeCache = flag and true or false end
+function M.pauseShapeCache(flag) hold.paused = flag and true or false end
+
+-- Forgets what the lane tried (shapes that failed twice, heavy shapes waiting) and walks the index again; held shapes stay held.
+function M.restartShapeCache()
+  hold.cursor, hold.tries, hold.deferred, hold.deferredN, hold.complete = 1, {}, {}, 0, false
+  hold.rings, hold.ringPos, hold.pass, hold.secIdx, hold.shpIdx, hold.nearFor, hold.paused = {}, 1, 1, 1, 1, nil, false
+end
+
+-- fn() returns { freeGB, availableGB, processGB } (any may be nil). Without a provider the RAM floor has nothing to compare.
+function M.setMemoryProvider(fn) hold.mem.provider = type(fn) == "function" and fn or nil end
+
+-- The shape cache lines of the run summary: key=value, fixed order, units in the names (header cacher-log v1).
+function hold.logSummary()
+  if not TUNING.debugLog then return end
+  local s = M.getShapeCacheStatus()
+  local function onOff(v) return v and "on" or "off" end
+  local function pct(v) return v and string.format("%.0f", v * 100) or "n/a" end
+  local function cls(c) return string.format("n=%d avg_ms=%.2f max_ms=%.1f", c.n, c.n > 0 and c.ms / c.n or 0, c.max) end
+  logMsg("I", "cacher-log v1 cfg shapeCache=%s atLoad=%s idle_s=%.2f gap_s=%.2f perFrame=%d share=%.3f ramFloor_gb=%.2f heavy_ms=%.1f heavyWait=%s still_s=%.2f placeholders=%d residentMax=%d mode=%s",
+    onOff(TUNING.shapeCache), onOff(TUNING.shapeCacheAtLoad), TUNING.shapeCacheIdleSeconds, TUNING.shapeCacheGapSeconds,
+    TUNING.shapeCachePerFrame, TUNING.shapeCacheBudgetShare, TUNING.shapeCacheRamFloorGB, TUNING.shapeCacheHeavyMs,
+    onOff(TUNING.shapeCacheHeavyWait), TUNING.shapeCacheStillSeconds, TUNING.shapeCachePlaceholders, TUNING.residentMax, tostring(TUNING.creationMode))
+  logMsg("I", "cacher island=%s sections=%d meshes=%d island_held=%d max=%d evicted=%d always=%s", tostring(s.island.id), s.island.sections, s.island.meshes, s.island.held, s.max, s.evicted, tostring(s.always))
+  logMsg("I", "cacher fill held=%d total=%d absent=%d failed=%d complete=%s phase=%q seconds=%.0f hold_s=%.0f placeholders=%d heavy_waiting=%d",
+    s.held, s.total, s.absent, s.failed, tostring(s.complete), tostring(s.phase), s.seconds, s.runSeconds, s.placeholders, s.deferredHeavy)
+  logMsg("I", "cacher creates held{%s} live{%s} cold{%s}", cls(s.creates.held), cls(s.creates.live), cls(s.creates.cold))
+  logMsg("I", "cacher cost stall_ms=%.0f warm_ms=%.0f need_n=%d need_ms=%.0f idle_n=%d idle_ms=%.0f", s.stallMs, s.idleMs, s.needN, s.needMs, s.idleN, s.idleMs)
+  logMsg("I", "cacher lane pauses_busy=%d pauses_moving=%d pauses_heavy=%d pauses_ram=%d pauses_cap=%d cold_before_fill=%d", s.pauses.busy, s.pauses.moving, s.pauses.heavy, s.pauses.ram, s.pauses.cap, s.coldBeforeFill)
+  logMsg("I", "cacher retargets already_held=%d needed_fill=%d ambient_restarts=%d", s.retargetHeld, s.retargetFilled, s.ambientRestarts)
+  logMsg("I", "cacher readiness_pct avg=%s p10=%s min=%s full_avg_s=%s full_max_s=%.1f", pct(s.readinessAvg), pct(s.readinessP10), pct(s.readinessMin),
+    s.fullAvgSeconds and string.format("%.1f", s.fullAvgSeconds) or "n/a", s.fullMaxSeconds)
+  logMsg("I", "cacher visits n=%d ready=%d late=%d dropped=%d teleport=%d cold_start_avg_s=%s neighbours_late=%d neighbours_dropped=%d old_rule_dropped=%d",
+    s.visits, s.visitsReady, s.visitsLate, s.visitsDropped, s.visitsTeleport,
+    s.coldStartAvgSeconds and string.format("%.1f", s.coldStartAvgSeconds) or "n/a", s.neighboursLate, s.neighboursDropped, droppedSections)
+  local m, parts = s.memory or {}, {}
+  for i = 1, math.min(10, #s.slow) do parts[i] = string.format("%s:%.0f", shortShapeName(s.slow[i].name), s.slow[i].ms) end
+  logMsg("I", "cacher heavy top10_ms=%s", #parts > 0 and table.concat(parts, ",") or "none")
+  logMsg("I", "cacher memory lua_gb=%.2f lua_peak_gb=%.2f free_gb=%s free_min_gb=%s avail_gb=%s process_gb=%s process_peak_gb=%s",
+    m.luaGB or 0, s.luaPeakGB, m.freeGB and string.format("%.2f", m.freeGB) or "n/a", s.minFreeGB and string.format("%.2f", s.minFreeGB) or "n/a",
+    m.availableGB and string.format("%.2f", m.availableGB) or "n/a", m.processGB and string.format("%.2f", m.processGB) or "n/a",
+    s.peakProcessGB and string.format("%.2f", s.peakProcessGB) or "n/a")
+  logMsg("I", "cacher idle_frame_ms holders_off=%s holders_on=%s", s.idleFrameOffMs and string.format("%.1f", s.idleFrameOffMs) or "n/a",
+    s.idleFrameOnMs and string.format("%.1f", s.idleFrameOnMs) or "n/a")
+end
+
 -- The pool, resting and dropped-section state. Its own function: LuaJIT allows 60 upvalues per function and
 -- resetState is already near that.
 local function resetPoolState()
@@ -2260,6 +2789,7 @@ local function resetPoolState()
   dormantByShape = {}
   droppedSections, droppedObjects, droppedLast = 0, 0, nil
   for k in pairs(shellStats) do shellStats[k] = 0 end
+  hold.stats = hold.statsNew()
   run = newRun(totalTime)
 end
 
@@ -2276,6 +2806,7 @@ local function clearWork()
   selectTimer = 1e9                                                -- look up at once after a reset
   cameraSectionID, predictedSectionID, aheadCandidate, aheadTime = nil, nil, nil, 0
   feedOrder, priorityTimer = {}, 0
+  hold.visit = nil
 end
 
 local function resetState()
@@ -2314,7 +2845,8 @@ function M.initialize(basePath)
   if readPresets().startup then M.loadPreset("startup") end
   local okShapes, errShapes = pcall(loadShapeList)
   if not okShapes then warm = newWarm(); logMsg("W", "shapes.json could not be read: %s", tostring(errShapes)) end
-  logMsg("I", "initialized: %d sections, %d with streamed objects", #sectionOrder, (function()
+  hold.costLoad()
+  logMsg("D", "initialized: %d sections, %d with streamed objects", #sectionOrder, (function()
     local n = 0
     for _ in pairs(sectionIndex) do n = n + 1 end
     return n
@@ -2342,6 +2874,7 @@ function M.resetStats()
   droppedSections, droppedObjects, droppedLast = 0, 0, nil
   for k in pairs(shellStats) do shellStats[k] = 0 end
   shellStats.peakLive = liveCount
+  hold.stats = hold.statsNew()
   run = newRun(totalTime)
   if M.stallDiagnostics then M.resetDiagnostics() end
   logMsg("I", "statistics reset (tuning and pool unchanged)")
@@ -2470,7 +3003,7 @@ function M.setCreationMode(mode)
   shellChecked, shellDisabled, shellBuildFails, shellBuildOff = false, false, 0, false
   if old == "resident" and mode ~= "resident" then releaseDormant(mode == "current") end
   if mode == "current" then M.clearShellPool() end
-  logMsg("I", "creation mode: %s", mode)
+  logMsg("D", "creation mode: %s", mode)
   return true
 end
 
@@ -2558,6 +3091,13 @@ function tun.migrate(values)
     out[old] = nil
     if ms ~= nil and out[new] == nil and type(ms) == "number" and main > 0 then out[new] = ms / main end
   end
+  for old, new in pairs({ warmAll = "shapeCache", warmAllPerFrame = "shapeCachePerFrame", warmAllBudgetShare = "shapeCacheBudgetShare",
+                          cacheWarmIdleSeconds = "shapeCacheIdleSeconds", cacheWarmGapSeconds = "shapeCacheGapSeconds" }) do
+    local v = out[old]
+    out[old] = nil
+    if v ~= nil and out[new] == nil then out[new] = v end
+  end
+  for _, old in ipairs({ "cacheWarm", "cacheWarmPerFrame", "cacheWarmCheckShare", "cacheWarmLogEvery", "warmAllLogEvery" }) do out[old] = nil end
   return out
 end
 
@@ -2977,28 +3517,8 @@ function M.logRunSummary()
     logMsg("I", "  shape index (no shapes.json): %s, %d of %d section files, %d unique shapes, %d unreadable, %.1f s reading", si.state, si.files, si.total,
       si.unique, si.failed, si.readSeconds)
   end
-  local wa = M.getWarmAllStatus()
-  local function slowText(list)
-    local out = {}
-    for i = 1, math.min(5, #list) do out[i] = string.format("%s %.0f ms (%s)", shortShapeName(list[i].name), list[i].ms, list[i].kind) end
-    return #out > 0 and table.concat(out, ", ") or "none"
-  end
-  if wa.enabled then
-    local valid = wa.complete and r.coldFrames == 0
-    logMsg("I", "  everything warm: ON (%s), %d of %d meshes held%s, %d failed; %d of %d frames of this run came before every mesh was held -> object-cost comparison %s",
-      wa.phase, wa.held, wa.total, wa.complete and "" or " (NOT complete)", wa.failed, r.coldFrames, r.frames, valid and "VALID" or "NOT valid")
-    local k = wa.kind
-    logMsg("I", "  mesh holds: %d already had a .cdae (avg %.2f ms), %d imported now (avg %.1f ms, %.0f s in total), %d unknown (avg %.2f ms); slowest: %s",
-      k.cached.n, k.cached.n > 0 and k.cached.ms / k.cached.n or 0, k.import.n, k.import.n > 0 and k.import.ms / k.import.n or 0, k.import.ms / 1000,
-      k.unknown.n, k.unknown.n > 0 and k.unknown.ms / k.unknown.n or 0, slowText(wa.slow))
-  else
-    logMsg("I", "  everything warm: off (meshes load while streaming; object-cost comparison does not apply)")
-    local cw = M.getCacheWarmStatus()
-    if cw.enabled then
-      logMsg("I", "  cache warm lane: %s, %d of %d shapes done (%d already had a .cdae, %d imported now, %d failed, %d skipped), import avg %.1f ms, max %.0f ms; slowest: %s",
-        cw.phase, cw.processed, cw.total, cw.alreadyCached, cw.imported, cw.failed, cw.skipped, cw.importAvgMs, cw.importMaxMs, slowText(cw.slow))
-    end
-  end
+  hold.logSummary()
+  if not TUNING.debugLog then return end                  -- the paths, frames and settle lines are Debug
   local function line(label, name)
     local p = r.paths[name]
     logMsg("I", "  %-26s %6d x avg %.3f ms, max %.1f ms, %.0f ms total (%.0f%% of creates)", label, p.n, p.avgMs, p.maxMs, p.totalMs,
@@ -3009,7 +3529,7 @@ function M.logRunSummary()
   line("refill (shape change)", "shell-refill")
   line("fresh (registerObject)", "pool-empty-fresh-object")
   line("plain create", "new-object")
-  logMsg("I", "  streamer frames: %d total, %d busy (avg %.2f ms, worst %.1f ms), %d idle (avg %.3f ms, worst %.2f ms) = %.0f%% asleep; cache warm %d frames, %.0f ms",
+  logMsg("I", "  streamer frames: %d total, %d busy (avg %.2f ms, worst %.1f ms), %d idle (avg %.3f ms, worst %.2f ms) = %.0f%% asleep; holds %d frames, %.0f ms",
     r.frames, r.busyFrames, r.busyAvgMs, r.busyMaxMs, r.idleFrames, r.idleAvgMs, r.idleMaxMs, r.sleepShare * 100, r.warmFrames, r.warmMs)
   logMsg("I", "  settles: %d, time to idle avg %.2f s, longest %.2f s; per-frame caps hit: cheap %d, refill %d",
     r.settles, r.settleAvgSeconds, r.settleMaxSeconds, r.cheapCapHits, r.costlyCapHits)
@@ -3055,7 +3575,7 @@ function M.getStatus()
     changeWorkPeakMs = change.workMax,
     changeFirstUseSplit = { import = { n = change.importN, ms = change.importMs }, cached = { n = change.hitN, ms = change.hitMs },
                             unknown = { n = change.unkN, ms = change.unkMs } },
-    cacheWarm = M.getCacheWarmStatus(), warmAll = M.getWarmAllStatus(), shapeIndex = M.getShapeIndexStatus(),
+    shapeCache = M.getShapeCacheStatus(), shapeIndex = M.getShapeIndexStatus(),
     changeDeferredFirstUse = change.deferredFirst,
     changeFirstUse = change.firsts, changeReload = change.reloads, changeWarm = change.warms,
     changeReloadAvgMs = change.reloads > 0 and change.reloadMs / change.reloads or 0,
@@ -3088,7 +3608,7 @@ function M.getStatus()
       lastMs = { reads = fb.ms.reads, deletes = fb.ms.deletes, creates = fb.ms.creates, shells = fb.ms.shells, warm = fb.ms.warm },
       avgMs = { reads = fb.avg.reads, deletes = fb.avg.deletes, creates = fb.avg.creates, shells = fb.avg.shells, warm = fb.avg.warm },
       capsMs = { deletes = TUNING.frameBudgetMs * TUNING.deleteBudgetShare, shells = TUNING.frameBudgetMs * TUNING.shellBuildBudgetShare,
-                 warmCheck = TUNING.frameBudgetMs * TUNING.cacheWarmCheckShare },
+                 holds = TUNING.frameBudgetMs * TUNING.shapeCacheBudgetShare },
     },
     tuningRevision = tun.state.revision, lastPurge = tun.state.purge, run = M.getRunStats(),
     droppedSections = droppedSections, droppedObjects = droppedObjects, droppedLast = droppedLast,
@@ -3147,26 +3667,6 @@ end
 -- true when no section file and no object is waiting to be created (cheap, per-frame safe)
 function M.isIdle() return lqHead > lqTail and pqHead > pqTail and srHead > srTail and pendingCount <= 0 end
 
--- Progress of the shape cache warm-up, for a console check or a progress display.
-function M.getCacheWarmStatus()
-  local imported = warm.imported
-  return {
-    enabled = TUNING.cacheWarm, available = warm.loaded, finished = warm.finished,
-    running = TUNING.cacheWarm and warm.loaded and not warm.finished and not suspended and M.isIdle()
-      and warm.idle >= TUNING.cacheWarmIdleSeconds,
-    total = warm.total, processed = warm.processed, remaining = warm.total - warm.processed,
-    alreadyCached = warm.hadCdae, imported = imported, failed = warm.failed, skipped = warm.skipped,
-    importAvgMs = imported > 0 and warm.importMs / imported or 0, importMaxMs = warm.importMax,
-    importMaxShape = warm.importMaxShape, current = warm.current,
-    nearQueued = math.max(0, #warm.near - warm.nearPos + 1),
-    phase = warm.phase, runSeconds = warm.runSeconds, importSeconds = warm.importMs / 1000, slow = warm.slow,
-    -- remaining shapes at the pace so far (skipping a cached shape is cheap, an import is not: only a rough guide)
-    etaSeconds = (warm.processed > 0 and warm.runSeconds > 0) and (warm.total - warm.processed) * warm.runSeconds / warm.processed or nil,
-  }
-end
-
-function M.setCacheWarm(flag) TUNING.cacheWarm = flag and true or false end
-
 -- The shape index: "file" (shapes.json), "scanning" / "done" (built from the section files) or "none".
 function M.getShapeIndexStatus()
   local sc = warm.scan
@@ -3176,29 +3676,6 @@ function M.getShapeIndexStatus()
     unique = sc.unique, seconds = sc.runSeconds, readSeconds = sc.ms / 1000,
     etaSeconds = (not sc.done and sc.files > 0 and sc.runSeconds > 0) and (#sc.ids - sc.files) * sc.runSeconds / sc.files or nil,
   }
-end
-
--- Progress of the everything-warm mode (panel line, console check).
-function M.getWarmAllStatus()
-  return {
-    enabled = TUNING.warmAll, available = warm.total > 0, total = warm.total, held = hold.held, failed = hold.failed,
-    remaining = math.max(0, warm.total - hold.held - hold.failed), complete = hold.complete,
-    releasing = not TUNING.warmAll and hold.held > 0, avgMs = hold.held > 0 and hold.ms / hold.held or 0,
-    maxMs = hold.max, maxShape = hold.maxShape, seconds = hold.seconds,
-    phase = hold.phase, runSeconds = hold.runSeconds, slow = hold.slow, kind = hold.kind,
-    -- true once every mesh is held: object-cost runs only compare cleanly from then on
-    measurable = TUNING.warmAll and hold.complete,
-    etaSeconds = (hold.held > 0 and hold.runSeconds > 0) and math.max(0, warm.total - hold.held - hold.failed) * hold.runSeconds / hold.held or nil,
-  }
-end
-
-function M.setWarmAll(flag) TUNING.warmAll = flag and true or false end
-
--- Forgets what the lane has checked (after .cdae files were deleted, say) and starts over.
-function M.restartCacheWarm()
-  local names, bySection, total, scan = warm.names, warm.bySection, warm.total, warm.scan
-  warm = newWarm()
-  warm.names, warm.bySection, warm.total, warm.loaded, warm.scan = names, bySection, total, total > 0, scan
 end
 
 -- Builds parked shells ahead (TUNING.shellTarget) while nothing urgent is queued: a little per frame, never in a burst.
@@ -3325,12 +3802,10 @@ function M.onUpdate(dtReal)
     if dt > change.dtMax then change.dtMax = dt end
   end
   local tw = os.clock()
-  local warmBefore = warm.processed
   local warmStageStart = diag and diag:beginStage("cache_warm")
   local scanned = hold.scanUpdate(dtReal or 0)         -- shape index from the section files (only without shapes.json)
-  cacheWarmUpdate(dtReal or 0, diag)                  -- idle lane: only while nothing is queued
-  local heldNow = hold.update(dtReal or 0)             -- everything-warm lane (the cache warm lane stands down)
-  local warmedCount = warm.processed - warmBefore + heldNow + scanned
+  local heldNow = hold.update(dtReal or 0)             -- shape cache lane: only while nothing is queued
+  local warmedCount = heldNow + scanned
   if diag then diag:endStage("cache_warm", warmStageStart, warmedCount) end
   fb.record("warm", (os.clock() - tw) * 1000)
   if warmedCount > 0 then run.warmFrames, run.warmMs = run.warmFrames + 1, run.warmMs + fb.ms.warm end

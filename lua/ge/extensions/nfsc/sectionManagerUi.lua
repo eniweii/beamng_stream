@@ -54,7 +54,6 @@ end
 -- Creation method: three radios.
 local CREATION_MODES = {
   { "current", "Current", "Every object is created when its section loads and deleted when it unloads. Lowest memory, highest cost per object (about 0.5-2.5 ms to create)." },
-  { "shells", "Shells", "Deleted objects are parked as hidden shells and refilled for the next load (about 0.005-0.04 ms of engine work, about 1.2 ms measured in game). Needs the shell shape; shells wait in a pool." },
   { "resident", "Resident", "Shells plus a resting state: an unwanted object is only hidden and keeps its shape and fields, so wanting it again is just an unhide. The oldest is evicted only when the pool is full. Fastest return to a section, most memory." },
 }
 local MODE_LABEL = { current = "Current", shells = "Shells", resident = "Resident" }
@@ -160,15 +159,16 @@ end
 local function drawBudgetUse(st)
   local b = st.frameBudget
   if not b then return end
-  im.TextDisabled(string.format("Streaming per frame (avg): reads %.2f, deletes %.2f, creates %.2f, shells %.2f, cache warm %.2f ms   budget %.1f ms",
-    b.avgMs.reads, b.avgMs.deletes, b.avgMs.creates, b.avgMs.shells, b.avgMs.warm, b.mainMs))
-  tip("Time each streaming task used per frame, averaged over about 10 frames. Reads, deletes, creates and shell building share the frame budget: each is capped by what the frame has left, so together they stay within it. One indivisible engine call (a first-use import) can still overrun it.")
+  im.TextDisabled(string.format("Streaming per frame (avg): reads %.2f, deletes %.2f, creates %.2f, shells %.2f, holds %.2f ms",
+    b.avgMs.reads, b.avgMs.deletes, b.avgMs.creates, b.avgMs.shells, b.avgMs.warm))
+  im.TextDisabled(string.format("Streaming per frame: budget %.1f ms", b.mainMs))
+  tip("Time each streaming task used per frame, averaged over about 10 frames. Reads, deletes, creates, shell building and holds share the frame budget: each is capped by what the frame has left, so together they stay within it. One indivisible engine call (a first-use import) can still overrun it.")
 end
 
 local function drawPresets(mode)
   if im.TreeNode1("Presets for " .. (MODE_LABEL[mode] or mode) .. " mode##tp") then
     for _, p in ipairs(nfsc_sectionStreamer.getModePresets(mode)) do
-      im.Text(string.format("%s  %s", p.slot, p.label))
+      im.Text("Preset " .. p.slot)
       im.SameLine()
       im.TextDisabled(p.source == "saved" and "(saved)" or "(factory)")
       im.SameLine()
@@ -191,7 +191,7 @@ local function drawPresets(mode)
     tip("Saved values (including the creation mode) are applied when the streamer starts.")
     im.SameLine()
     if im.Button("Delete##pstartup") then nfsc_sectionStreamer.deletePreset("startup") end
-    im.TextDisabled("Factory values are untested starting points: budget and pool settings only.")
+    im.TextDisabled("Factory values are untested starting points: frame budget and fill pace only.")
     im.TreePop()
   end
 end
@@ -243,7 +243,6 @@ local function drawTuning(st)
       im.TextDisabled(string.format("%d settings are hidden: not used in %s mode, or their switch is off", #hidden, MODE_LABEL[mode] or mode))
       tip(table.concat(hidden, ", "))
     end
-    drawPresets(mode)
     if im.Button("Reset to defaults") then streamer.resetTuning() end
     tip("Every tuning value back to its default, including the creation mode.")
     im.SameLine()
@@ -288,8 +287,32 @@ local function drawPurge(st)
   end
 end
 
+-- Search bar of the override lists: part of a name, case ignored; filters both lists.
+local ovSearch, ovBroken = nil, false
+local okFfi, ffi = pcall(require, "ffi")                 -- LuaJIT in the game; the search bar turns itself off without it
+if not okFfi then ffi = nil end
+
+local function drawOverrideSearch()
+  if ovBroken then return "" end
+  local ok, text = pcall(function()
+    if not ovSearch then ovSearch = im.ArrayChar(128) end
+    im.InputText("##ovsearch", ovSearch, 128)
+    tip("Type part of an override name to list only the matching overrides, in both the enabled and the hidden list. Case is ignored. Clear shows all again.")
+    local typed = ffi.string(ovSearch)
+    im.SameLine()
+    if im.Button("Clear##ovsearch") then ffi.copy(ovSearch, ""); typed = "" end
+    return typed
+  end)
+  if not ok then
+    ovBroken = true
+    log("W", "nfsc_sectionManagerUi", "override search turned off: " .. tostring(text))
+    return ""
+  end
+  return text
+end
+
 local function drawOverrideList(label, names)
-  if im.TreeNode1(label) then
+  if im.TreeNode1(label .. " (" .. #names .. ")###" .. label) then
     if #names == 0 then im.TextDisabled("(none)") end
     for _, name in ipairs(names) do
       local ptr = im.BoolPtr(nfsc_sectionManager.isOverrideEnabled(name))
@@ -314,66 +337,163 @@ local function textBar(done, total)
   return string.format("[%s%s] %.1f%%", string.rep("#", n), string.rep("-", 30 - n), frac * 100)
 end
 
-local function drawSlowList(label, list)
-  if not list or #list == 0 then return end
-  if im.TreeNode1(label) then
-    for i, e in ipairs(list) do
+-- A progress bar: the imgui one when it exists, else the text bar.
+local barBroken = false
+local function progressBar(done, total, text, width)
+  if not barBroken and im.ProgressBar then
+    local ok = pcall(function()
+      im.ProgressBar(total > 0 and math.max(0, math.min(1, done / total)) or 0, im.ImVec2(width or -1, 0), text)
+    end)
+    if ok then return end
+    barBroken = true
+  end
+  im.Text(textBar(done, total) .. "   " .. text)
+end
+
+local function gb(v) return v and string.format("%.1f", v) or "n/a" end
+
+-- Shape cache: the headline data, always visible, right under the status lines.
+local function drawShapeCache(st)
+  local sc, si = st.shapeCache, st.shapeIndex
+  if not sc then return end
+  if not groupHeader("Shape cache##scache") then return end
+  if not sc.enabled and sc.held == 0 then
+    im.TextDisabled("Off: meshes load while streaming. Turn it on under Tuning > Shape cache.")
+    im.TreePop()
+    return
+  end
+  if si and si.state == "scanning" then
+    im.Text("Indexing shape names from the section files (no shapes.json)")
+    progressBar(si.files, si.total, string.format("%d of %d section files, %d unique shapes so far", si.files, si.total, si.unique))
+    im.TextDisabled(string.format("Reading for %s    ETA: %s. The fill starts when the index is done.", duration(si.seconds), duration(si.etaSeconds)))
+    im.TreePop()
+    return
+  end
+  im.Text("Fill: " .. tostring(sc.phase))
+  tip("What the fill is doing. It only holds shapes while nothing is queued, so waiting phases are normal during streaming. A shape a create needs is held at once, whatever this says.")
+  progressBar(sc.island.held, math.max(sc.island.meshes, 1), string.format("%d / %d meshes of the island held (%d held in all)", sc.island.held, sc.island.meshes, sc.held))
+  tip("Meshes of the section island the camera is in (the sections connected through their relations), each kept loaded by a hidden object: creates then only revive, retarget and unhide.")
+  im.Text("Lane: " .. string.upper(sc.lane or "asleep") .. (sc.laneReason and (" (" .. sc.laneReason .. ")") or "")
+    .. (sc.current and string.format("    last: %s, %.1f ms    holds: %d (avg %.2f ms)", sc.current:match("([^/\\]+)$") or sc.current, sc.lastHoldMs, sc.held, sc.avgMs) or ""))
+  tip("asleep: complete, off or nothing to do. filling: holding shapes. paused: waiting, the reason is in brackets (busy: sections are streaming, heavy: heavy shapes wait for a still camera, ram: free RAM is under the floor, user: Pause fill). Colour is not needed to read it.")
+  local v = sc.visit
+  if v then
+    im.Text(string.format("Visit: section %s    neighbours ready %d/%d    cold arrivals: %d    teleport: %s", tostring(v.id), v.ready, v.neighbours, v.cold, v.teleport and "yes" or "no"))
+  else
+    im.Text("Visit: none")
+  end
+  tip("The section the camera is in. Neighbours are its related sections: ready means every shape of the section is held. A cold arrival is an object whose shape was not held when the section asked for it. A teleport (a section not related to the one before) is not counted in the late and dropped numbers.")
+  im.Text(string.format("Last hitch: %s    pauses: busy %d, heavy-wait %d, RAM floor %d",
+    sc.lastHitch and string.format("%s, %.1f ms", sc.lastHitch.name:match("([^/\\]+)$") or sc.lastHitch.name, sc.lastHitch.ms) or "none",
+    sc.pauses.busy, sc.pauses.heavy, sc.pauses.ram))
+  tip("The latest create or hold slower than the heavy shape threshold.")
+  local m = sc.memory or {}
+  if sc.ramSource then
+    im.Text(string.format("Memory (GB): free %s  available %s  process %s  Lua %.1f    min free %s", gb(m.freeGB), gb(m.availableGB), gb(m.processGB), m.luaGB or 0, gb(sc.minFreeGB)))
+    im.Text(string.format("RAM floor: %s (%.2f)", sc.ramPaused and "PAUSED, free RAM is under it" or "clear", sc.ramFloor))
+  else
+    im.Text(string.format("Memory (GB): Lua %.1f (peak %.1f)    no free-RAM source: the RAM floor is not checked", m.luaGB or 0, sc.luaPeakGB or 0))
+  end
+  tip("Free, available and process RAM need a source: nfsc_sectionStreamer.setMemoryProvider(fn), fn returns { freeGB, availableGB, processGB }. Lua is the Lua heap.")
+  im.Text(string.format("Placeholders ready: %d / %d    absent (no file): %d    failed: %d    heavy waiting: %d", sc.placeholders, sc.placeholderWindow, sc.absent, sc.failed, sc.deferredHeavy))
+  if im.Button(sc.paused and "Resume fill##scfill" or "Pause fill##scfill") then nfsc_sectionStreamer.pauseShapeCache(not sc.paused) end
+  tip("Stop the fill without losing what it holds. Shapes a create needs are still held.")
+  im.SameLine()
+  if im.Button("Restart fill##scfill") then nfsc_sectionStreamer.restartShapeCache() end
+  tip("Forget which shapes failed or were postponed and walk the index again. Held shapes stay held.")
+  im.TreePop()
+end
+
+local function pctText(v) return v and string.format("%.0f%%", v * 100) or "n/a" end
+
+-- Run results of the shape cache and its slowest shapes (below the pool lines).
+local function drawShapeCacheResults(st)
+  local sc = st.shapeCache
+  if not sc or not (sc.enabled or sc.held > 0) then return end
+  if im.TreeNode1("Run results (shape cache)##scres") then
+    local c = sc.creates
+    local function cls(x) return string.format("%d | avg %.1f | max %.1f ms", x.n, x.n > 0 and x.ms / x.n or 0, x.max) end
+    im.Text("Creates held-hit:  " .. cls(c.held))
+    im.Text("Creates live-hit:  " .. cls(c.live))
+    im.Text("Creates cold:      " .. cls(c.cold))
+    tip("held-hit: the shape was held. live-hit: an instance kept it loaded. cold: it had to be loaded; the ms include the hold the create waited for.")
+    im.Text(string.format("Cost shifted: stall %.1f s busy | holds %.1f s idle", sc.stallMs / 1000, sc.idleMs / 1000))
+    im.Text(string.format("Readiness at entry: avg %s | p10 %s | min %s", pctText(sc.readinessAvg), pctText(sc.readinessP10), pctText(sc.readinessMin)))
+    tip("Per visit: the share of the entered section's shapes that were already held when the camera arrived.")
+    im.Text(string.format("Fully ready after entry: avg %s | worst %.1f s", sc.fullAvgSeconds and string.format("%.1f s", sc.fullAvgSeconds) or "n/a", sc.fullMaxSeconds or 0))
+    im.Text(string.format("Visits ready / late / dropped: %d / %d / %d    teleport visits: %d (cold start %s)", sc.visitsReady, sc.visitsLate, sc.visitsDropped,
+      sc.visitsTeleport, sc.coldStartAvgSeconds and string.format("%.1f s", sc.coldStartAvgSeconds) or "n/a"))
+    im.Text(string.format("Fills by channel: idle %d | need %d    cold before the fill finished: %d", sc.idleN, sc.needN, sc.coldBeforeFill))
+    im.Text(string.format("Retargets: already held %d | needed a fill %d    animations restarted: %d", sc.retargetHeld, sc.retargetFilled, sc.ambientRestarts or 0))
+    im.Text(string.format("Idle frame, holders: off %s | on %s", sc.idleFrameOffMs and string.format("%.1f", sc.idleFrameOffMs) or "n/a",
+      sc.idleFrameOnMs and string.format("%.1f ms", sc.idleFrameOnMs) or "n/a"))
+    im.TreePop()
+  end
+  if sc.slow and #sc.slow > 0 and im.TreeNode1("Slowest shapes (top 10)##scslow") then
+    for i, e in ipairs(sc.slow) do
       im.Text(string.format("%2d. %s    %.0f ms    %s", i, (e.name:match("([^/\\]+)$") or e.name), e.ms, e.kind))
     end
     im.TreePop()
   end
 end
 
-local function drawMeshWarm(st)
-  local wa, cw, si = st.warmAll, st.cacheWarm, st.shapeIndex
-  if si and si.state == "scanning" and ((wa and wa.enabled) or (cw and cw.enabled)) then
-    im.Text("Mesh warm-up: indexing shape names from the section files (no shapes.json)")
-    im.Text(textBar(si.files, si.total) .. string.format("   %d of %d section files, %d unique shapes so far%s", si.files, si.total, si.unique,
-      si.failed > 0 and string.format(", %d unreadable", si.failed) or ""))
-    im.Text(string.format("Reading for %s (waiting not counted)    ETA: %s", duration(si.seconds), duration(si.etaSeconds)))
-    im.TextDisabled("The index is read while nothing is queued, one section file per frame. The warm-up starts when it is done.")
-    return
-  end
-  if si and si.state == "done" then
-    im.TextDisabled(string.format("Shape index: %d unique shapes from %d section files (read in %s)", si.unique, si.files, duration(si.readSeconds)))
-  end
-  if wa and (wa.enabled or wa.held > 0) then
-    local k = wa.kind
-    im.Text("Mesh warm-up (Everything is warm): " .. tostring(wa.phase))
-    local done = wa.held + wa.failed
-    im.Text(textBar(done, wa.total) .. string.format("   %d of %d meshes held%s", wa.held, wa.total,
-      wa.failed > 0 and string.format(", %d failed", wa.failed) or ""))
-    tip("Every mesh used by the streamed sections is held by one hidden object each, so no mesh is loaded while streaming. The lane only works while nothing is queued, so 'waiting' phases are normal during streaming.")
-    im.Text(string.format("Already had a .cdae: %d (avg %.2f ms)    Imported now: %d (avg %.1f ms, %s in total)    Unknown: %d",
-      k.cached.n, k.cached.n > 0 and k.cached.ms / k.cached.n or 0, k.import.n, k.import.n > 0 and k.import.ms / k.import.n or 0,
-      duration(k.import.ms / 1000), k.unknown.n))
-    im.Text(string.format("Holding for %s (waiting not counted)    ETA while holding: %s    slowest so far: %.0f ms",
-      duration(wa.runSeconds), wa.complete and "done" or duration(wa.etaSeconds), wa.maxMs or 0))
-    if wa.complete then
-      im.Text("Object-cost measurements: VALID, every mesh is held")
-    elseif wa.releasing then
-      im.Text("Releasing the held meshes")
-    else
-      im.Text(string.format("Object-cost measurements: NOT valid yet, %d meshes still to load", math.max(0, wa.remaining or 0)))
-    end
-    drawSlowList("Slowest mesh holds##warmallslow", wa.slow)
-  elseif cw and (cw.enabled or cw.finished) then
-    im.Text("Mesh warm-up (cache lane): " .. tostring(cw.phase))
-    if cw.available then
-      im.Text(textBar(cw.processed, cw.total) .. string.format("   %d of %d shapes checked%s", cw.processed, cw.total,
-        cw.failed > 0 and string.format(", %d failed", cw.failed) or ""))
-      im.Text(string.format("Already had a .cdae: %d    Imported now: %d (avg %.1f ms, max %.0f ms, %s in total)    Skipped: %d",
-        cw.alreadyCached, cw.imported, cw.importAvgMs, cw.importMaxMs, duration(cw.importSeconds), cw.skipped))
-      im.Text(string.format("Running for %s (waiting not counted)    ETA: %s (rough: cached shapes are skipped fast, imports are slow)",
-        duration(cw.runSeconds), cw.finished and "done" or duration(cw.etaSeconds)))
-      im.TextDisabled("This lane only builds .cdae files, nothing stays loaded: a first use afterwards is a cache read, not an import. Turn on Everything is warm to hold the meshes.")
-      drawSlowList("Slowest imports##cachewarmslow", cw.slow)
-    else
-      im.TextDisabled("Unavailable: no shape names or no FS:fileExists in this build (see the log)")
-    end
+-- The preload controls: what a user needs. Island progress, Preload on/off, Preload always, Max meshes to save.
+local maxMeshesPtr, debugLogPtr = nil, nil
+local function drawPreload(st)
+  local sc = st.shapeCache
+  if not sc then return end
+  local streamer = nfsc_sectionStreamer
+  im.Text("Preload:")
+  im.SameLine()
+  if radio("On##preload", sc.enabled) then streamer.setTuning({ shapeCache = true }, true) end
+  tip("Hold the meshes of the section island you are in, so streaming only revives and unhides objects instead of loading meshes. Runs when the car and camera are still.")
+  im.SameLine()
+  if radio("Off##preload", not sc.enabled) then streamer.setTuning({ shapeCache = false }, true) end
+  tip("Release the held meshes: meshes load while streaming, with hitches.")
+  if not sc.enabled then return end
+  local si = st.shapeIndex
+  if si and si.state == "scanning" then
+    progressBar(si.files, si.total, string.format("reading %d / %d section files", si.files, si.total), -150)
   else
-    im.TextDisabled("Mesh warm-up: off (Cache warm-up lane and Everything is warm are both off)")
+    progressBar(sc.island.held, math.max(sc.island.meshes, 1), string.format("%d / %d meshes cached", sc.island.held, sc.island.meshes), -150)
   end
+  tip("Meshes of the island you are in that are already held. The island is the set of sections connected to the current one through their relations; other islands (far districts, canyons) are not loaded.")
+  im.SameLine()
+  if im.Button((sc.always and "Preload when idle" or "Preload always") .. "##preloadalways") then streamer.setTuning({ shapeCacheAlways = not sc.always }, true) end
+  tip(sc.always and "Back to filling only while the car and camera are still." or "Also fill while the car moves. Heavy meshes still wait for a still camera. Use it for the first minutes in a new area, then switch back.")
+  im.TextDisabled(tostring(sc.phase))
+  if not maxMeshesPtr then maxMeshesPtr = im.IntPtr(sc.max) end
+  maxMeshesPtr[0] = sc.max
+  if im.SliderInt("Max meshes to save###maxmeshes", maxMeshesPtr, 0, math.max(sc.total, 1)) then streamer.setTuning({ shapeCacheMax = maxMeshesPtr[0] }, true) end
+  tip("Most meshes kept held (RAM). The fill stops there, and when you move to another island the holders of the old one are evicted first. All the way right: everything the island needs.")
+end
+
+-- The statistics a player can use: what is cached, how many shells exist and how many are in use.
+local statsOpen = nil
+local function drawStatsWindow(st)
+  if not statsOpen then statsOpen = im.BoolPtr(false) end
+  if not statsOpen[0] then return end
+  im.Begin("Section Manager stats", statsOpen)
+  local sc = st.shapeCache
+  if sc and sc.enabled then
+    progressBar(sc.island.held, math.max(sc.island.meshes, 1), string.format("%d / %d meshes cached", sc.island.held, sc.island.meshes))
+    im.Text(string.format("Meshes held in all: %d    Max meshes to save: %d", sc.held, sc.max))
+    tip("Held in all counts the meshes of islands you left too, until the cap evicts them.")
+  else
+    im.TextDisabled("Preload is off: no meshes are cached.")
+  end
+  im.Text(string.format("Shells created: %d", st.poolTotal or 0))
+  tip("Every object the streamer ever made for streaming. They are reused for the rest of the session.")
+  im.Text(string.format("Active shells: %d in use    %d resting    %d free    cap %d    peak in use %d",
+    st.liveObjectCount or 0, st.residentDormant or 0, st.shellsFree or 0, st.residentMax or 0, st.shellPeakLive or 0))
+  tip("In use: showing a streamed object now. Resting: hidden, waiting to be shown again without a load. Free: ready for any shape. The cap is fixed.")
+  im.Text(string.format("Dropped sections: %d", st.droppedSections or 0))
+  tip("Counted when the camera enters a new section before the previous section change finished loading.")
+  if sc and sc.enabled then
+    im.Text(string.format("Late neighbours: %d    dropped neighbours: %d", sc.neighboursLate, sc.neighboursDropped))
+    tip("Per visit to a drivable section, each neighbour in its related list that was not ready at entry is checked at exit. Ready before the camera left: late. Still not ready: dropped. Arriving at a section that is not in the previous section's related list is a teleport and is not counted.")
+  end
+  im.End()
 end
 
 function M.onUpdate()
@@ -382,37 +502,19 @@ function M.onUpdate()
 
   local st = nfsc_sectionManager.getStatus()
   im.Text("Current section: " .. tostring(st.currentSectionName or "none"))
-  im.Text(string.format("Active sections: %d    Live objects: %d", st.activeSectionCount or 0, st.liveObjectCount or 0))
-  im.Text(string.format("Queued: %d objects, %d section reads    Pending unload: %d",
-    st.queuedObjectCount or 0, st.queuedSectionReads or 0, st.pendingUnloadCount or 0))
-  im.Text(string.format("Created: %d    Deleted: %d    Failures: %d",
-    st.createdTotal or 0, st.deletedTotal or 0, st.failureCount or 0))
+  tip("The section the camera is in. Objects load when an active section wants them: the current section and the one the camera is heading into. Objects no active section wants any more are deactivated, and only evicted when the pool is full.")
+  drawPreload(st)
+  if im.Button(nfsc_sectionStreamer.isSuspended() and "Resume streaming" or "Suspend streaming") then
+    nfsc_sectionStreamer.setSuspended(not nfsc_sectionStreamer.isSuspended())
+  end
+  im.SameLine()
+  if im.Button("Reload streamed scenery") then nfsc_sectionStreamer.reset() end
+  if not statsOpen then statsOpen = im.BoolPtr(false) end
+  im.SameLine()
+  im.Checkbox("Stats window##statswin", statsOpen)
+  tip("Open the statistics in their own window: meshes cached, shells created, active shells, dropped sections.")
+  drawPresets(st.creationMode or "resident")
 
-  drawCreationMode(st)
-  if st.shellPoolActive then
-    im.Text(string.format("Pool: %d (%d free, %d dormant, %d live), %d built ahead (target %d)    recycled %d (avg %.3f ms)    fresh %d    parked %d    peak live %d",
-      st.poolTotal or 0, st.shellsFree or 0, st.residentDormant or 0, st.liveObjectCount or 0, st.shellsBuilt or 0, st.shellTarget or 0,
-      st.shellsRecycled or 0, st.shellRecycleAvgMs or 0, st.shellsFresh or 0, st.shellsParked or 0, st.shellPeakLive or 0))
-  end
-  if st.residentActive then
-    im.Text(string.format("Resident: revived %d (avg %.3f ms), deactivated %d, evicted %d, pool cap %d, free reserve %d",
-      st.residentRevived or 0, st.residentReviveAvgMs or 0, st.residentDeactivated or 0, st.residentEvicted or 0,
-      st.residentMax or 0, st.residentReserve or 0))
-  end
-  drawMeshWarm(st)
-  local run = st.run
-  if run and st.residentActive then
-    local p = run.paths
-    im.Text(string.format("Run: revive %d, same-shape %d, refill %d (avg %.3f ms), fresh %d    asleep %.0f%% (idle frame %.3f ms)    caps hit: cheap %d, refill %d",
-      p["resident-revive"].n, p["resident-same-shape-reuse"].n, p["shell-refill"].n, p["shell-refill"].avgMs,
-      p["pool-empty-fresh-object"].n, run.sleepShare * 100, run.idleAvgMs, run.cheapCapHits, run.costlyCapHits))
-  end
-  im.Text(string.format("Dropped sections: %d (%d objects were still missing when the camera left)", st.droppedSections or 0, st.droppedObjects or 0))
-  local d = st.droppedLast
-  if d then
-    im.TextDisabled(string.format("last: %s after %.2f s, %d created, %d queued, %d waiting records", tostring(d.section), d.after or 0,
-      d.created or 0, d.queued or 0, d.waiting or 0))
-  end
   local left, right = radioPair("Emitters:", "On", "Off", st.emittersOn)
   if left then nfsc_sectionManager.setSceneClassEnabled("emitters", true) end
   if right then nfsc_sectionManager.setSceneClassEnabled("emitters", false) end
@@ -425,37 +527,83 @@ function M.onUpdate()
   left, right = radioPair("Platform:", "High", "Low", st.platform == "high")
   if left then nfsc_sectionManager.setPlatform("high") end
   if right then nfsc_sectionManager.setPlatform("low") end
-  im.Text(string.format("Scene: %d emitters, %d lights, %d shown    Managed streamed objects: %d    Unknown flags: %d",
-    st.sceneEmitters or 0, st.sceneLights or 0, st.sceneShown or 0, st.managedObjectsLive or 0, st.unknownFlagCount or 0))
-
-  if nfsc_sectionCollision then
-    local c = nfsc_sectionCollision.getStatus()
-    im.Text(string.format("Collision: %s    refreshes: %d  last %.1f ms  max %.1f ms%s", c.mode, c.reloads,
-      c.lastMs, c.maxMs, c.dirty and "  (pending)" or ""))
-  end
-
-  if im.Button(nfsc_sectionStreamer.isSuspended() and "Resume streaming" or "Suspend streaming") then
-    nfsc_sectionStreamer.setSuspended(not nfsc_sectionStreamer.isSuspended())
-  end
-  im.SameLine()
-  if im.Button("Reload streamed scenery") then nfsc_sectionStreamer.reset() end
-  drawPurge(st)
-  im.Separator()
-  drawTuning(st)
   im.Separator()
 
   local on, off = {}, {}
   for _, name in ipairs(nfsc_sectionManager.getOverrideNames()) do
     if nfsc_sectionManager.isOverrideEnabled(name) then on[#on + 1] = name else off[#off + 1] = name end
   end
+  local total = #on + #off
+  local typed = drawOverrideSearch()
+  local needle = typed:lower()
+  if needle ~= "" then
+    local function keep(list)
+      local out = {}
+      for _, name in ipairs(list) do if name:lower():find(needle, 1, true) then out[#out + 1] = name end end
+      return out
+    end
+    on, off = keep(on), keep(off)
+  end
+  if not ovBroken then
+    im.SameLine()
+    im.TextDisabled(needle == "" and string.format("Search overrides    %d overrides", total) or string.format("showing %d of %d", #on + #off, total))
+  end
   drawOverrideList("Enabled overrides", on)
   drawOverrideList("Hidden overrides", off)
+  im.Separator()
 
-  if (st.failureCount or 0) > 0 and im.TreeNode1("Last failures") then
-    for _, msg in ipairs(nfsc_sectionStreamer.getFailures()) do im.TextWrapped(msg) end
-    im.TreePop()
+  -- Everything else, for debugging only.
+  if im.CollapsingHeader1("Debug") then
+    if not debugLogPtr then debugLogPtr = im.BoolPtr(false) end
+    debugLogPtr[0] = nfsc_sectionStreamer.getTuning().debugLog == true
+    if im.Checkbox("Detailed logs##debuglog", debugLogPtr) then nfsc_sectionStreamer.setTuning({ debugLog = debugLogPtr[0] }, true) end
+    tip("The cacher lines, the full run summary and the fill progress go to the log.")
+    im.Text(string.format("Active sections: %d    Live objects: %d    Queued: %d objects, %d section reads    Pending unload: %d",
+      st.activeSectionCount or 0, st.liveObjectCount or 0, st.queuedObjectCount or 0, st.queuedSectionReads or 0, st.pendingUnloadCount or 0))
+    im.Text(string.format("Created: %d    Deleted: %d    Failures: %d", st.createdTotal or 0, st.deletedTotal or 0, st.failureCount or 0))
+    drawCreationMode(st)
+    drawShapeCache(st)
+    if st.shellPoolActive then
+      im.Text(string.format("Pool: %d (%d free, %d dormant, %d live), %d built ahead (target %d)",
+        st.poolTotal or 0, st.shellsFree or 0, st.residentDormant or 0, st.liveObjectCount or 0, st.shellsBuilt or 0, st.shellTarget or 0))
+      im.Text(string.format("Pool: recycled %d (avg %.3f ms)    fresh %d    parked %d    peak live %d",
+        st.shellsRecycled or 0, st.shellRecycleAvgMs or 0, st.shellsFresh or 0, st.shellsParked or 0, st.shellPeakLive or 0))
+    end
+    if st.residentActive then
+      im.Text(string.format("Resident: revived %d (avg %.3f ms), deactivated %d, evicted %d, cap %d, reserve %d",
+        st.residentRevived or 0, st.residentReviveAvgMs or 0, st.residentDeactivated or 0, st.residentEvicted or 0,
+        st.residentMax or 0, st.residentReserve or 0))
+    end
+    if st.shapeIndex and st.shapeIndex.state == "done" then
+      im.TextDisabled(string.format("Shape index: %d unique shapes from %d section files (read in %s)", st.shapeIndex.unique, st.shapeIndex.files, duration(st.shapeIndex.readSeconds)))
+    end
+    drawShapeCacheResults(st)
+    local run = st.run
+    if run and st.residentActive then
+      local p = run.paths
+      im.Text(string.format("Run: revive %d, same-shape %d, refill %d (avg %.3f ms), fresh %d",
+        p["resident-revive"].n, p["resident-same-shape-reuse"].n, p["shell-refill"].n, p["shell-refill"].avgMs, p["pool-empty-fresh-object"].n))
+      im.Text(string.format("Run: asleep %.0f%% (idle frame %.3f ms)    caps hit: cheap %d, refill %d", run.sleepShare * 100, run.idleAvgMs, run.cheapCapHits, run.costlyCapHits))
+    end
+    im.Text(string.format("Dropped sections: %d (%d objects missing at exit)", st.droppedSections or 0, st.droppedObjects or 0))
+    tip("Counted when the camera enters a new section before the previous section change finished loading. The objects still queued or waiting at that moment are the ones missing at exit.")
+    local d = st.droppedLast
+    if d then
+      im.TextDisabled(string.format("last: %s after %.2f s, %d created, %d queued, %d waiting", tostring(d.section), d.after or 0,
+        d.created or 0, d.queued or 0, d.waiting or 0))
+    end
+    im.Text(string.format("Scene: %d emitters, %d lights, %d shown    Managed streamed objects: %d    Unknown flags: %d",
+      st.sceneEmitters or 0, st.sceneLights or 0, st.sceneShown or 0, st.managedObjectsLive or 0, st.unknownFlagCount or 0))
+    drawPurge(st)
+    im.Separator()
+    drawTuning(st)
+    if (st.failureCount or 0) > 0 and im.TreeNode1("Last failures") then
+      for _, msg in ipairs(nfsc_sectionStreamer.getFailures()) do im.TextWrapped(msg) end
+      im.TreePop()
+    end
   end
   im.End()
+  drawStatsWindow(st)
 end
 
 return M
