@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from build_palmont_stream_pack import analyze_source, build_stream_pack, is_never_rendered, read_item_file
+from build_palmont_stream_pack import analyze_source, build_stream_pack, read_item_file
 
 FIXTURE = Path(__file__).parent / "fixtures" / "level_sample"
 RUNTIME = Path("runtime") / "levels" / "nfsc" / "lua" / "carbon_stream"
@@ -88,22 +88,6 @@ class SectionGroupingTests(FixtureCase):
         self.assertEqual(index["overrides"],
                          {"0x1111AAAA": [1022], "0x2222BBBB": [1022], "0x454C22D2": [1021]})
 
-    def test_shapes_list_for_the_cache_warm_up(self):
-        self.build()
-        shapes = json.loads((self.out / RUNTIME / "shapes.json").read_text(encoding="utf-8"))
-        self.assertEqual(shapes["schemaVersion"], 1)
-        names = shapes["shapes"]
-        self.assertEqual(len(names), len(set(names)))
-        self.assertEqual(sorted(shapes["sections"]), ["1021", "1022", "1101"])
-        for section_id, positions in shapes["sections"].items():          # 1-based positions, one entry per shape
-            self.assertEqual(positions, sorted(set(positions)))
-            self.assertTrue(all(1 <= p <= len(names) for p in positions))
-        used_in = {name: sum(1 for ps in shapes["sections"].values() if i + 1 in ps) for i, name in enumerate(names)}
-        self.assertEqual([used_in[n] for n in names], sorted(used_in.values(), reverse=True))   # widest use first
-        report = json.loads((self.out / "build_report.json").read_text(encoding="utf-8")) if (self.out / "build_report.json").exists() else {}
-        if report:
-            self.assertEqual(report.get("uniqueShapes"), len(names))
-
 
 class MultiSectionTests(FixtureCase):
     def test_multi_section_object_shares_one_key(self):
@@ -168,25 +152,17 @@ class FlagsAndOverridesTests(FixtureCase):
 
 
 class SourcePreservationTests(FixtureCase):
-    def test_skybox_names_are_not_rendered(self):
-        for name in ("SKYDOME", "skydome_00", "SKYDOME_XENON_01", "SKY_SPECULAR.001"):
-            self.assertTrue(is_never_rendered({"name": name}), name)
-        for name in ("XTU_SKYDOMELIKE_1A_00", "SKYDOME_EXTRA", "PAN_SKYDOME_1A_00", ""):
-            self.assertFalse(is_never_rendered({"name": name}), name)
-        self.assertTrue(is_never_rendered({"name": "XYZ_1", "shapeName": "/levels/nfsc/assets/meshes/SKYDOME.dae"}))
+    def test_sky_objects_are_streamed_like_any_other_object(self):
         item_file = self.source_root / "main/MissionGroup/Palmont/Palmont1021/items.level.json"
         line = {"class": "TSStatic", "name": "SKYDOME_XENON_00", "__parent": "Palmont1021", "position": [0.0, 0.0, 0.0],
                 "rotationEuler": [0.0, 0.0, 0.0], "scale": [1.0, 1.0, 1.0], "isRenderEnabled": True,
                 "shapeName": "/levels/nfsc/assets/meshes/SKYDOME_XENON.dae", "sectionID": "1021"}
         with item_file.open("a", encoding="utf-8", newline="") as handle:
             handle.write("\n" + json.dumps(line))
-        report = self.build()
-        self.assertEqual(report["neverRenderedRecords"], 1)
+        self.build()
         sky = [o for o in self.section(1021)["objects"] if o["name"] == "SKYDOME_XENON_00"]
         self.assertEqual(len(sky), 1)
-        self.assertIs(sky[0]["isRenderEnabled"], False)
-        others = [o for o in self.section(1021)["objects"] if o["name"] != "SKYDOME_XENON_00"]
-        self.assertTrue(all(o.get("isRenderEnabled") is not False for o in others))
+        self.assertIs(sky[0]["isRenderEnabled"], True)             # exported value, untouched
 
     def test_source_files_are_never_modified(self):
         before = tree_hashes(self.source_root)

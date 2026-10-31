@@ -2,7 +2,7 @@
 --
 -- Streaming determines which base objects EXIST. This extension:
 --   * finds the camera's section from sections.json (drivable polygons only),
---   * keeps that section plus its related sections resident,
+--   * keeps that section plus its related sections resident (and the always-loaded sections, see below),
 --   * creates their TSStatic objects from whole-section files and deletes them again
 --     after a cooldown, spread across frames,
 --   * reports what happened to other extensions. It never decides override visibility
@@ -11,7 +11,6 @@
 -- Files (all under <levelRoot>/):
 --   lua/sections.json                   {sections = {{id, points, boundsMin, boundsMax, related}}}
 --   lua/carbon_stream/index.json        written by the builder (schemaVersion 2)
---   lua/carbon_stream/shapes.json       written by the builder (schemaVersion 1): unique shapes + per-section lists
 --   lua/carbon_stream/sections/<id>.json  one whole file per section
 --
 -- Events (coarse, via extensions.hook):
@@ -51,8 +50,12 @@
 -- kept in lua/carbon_stream/shape_costs.json) wait for a still camera, a RAM floor can pause the lane (needs a memory
 -- source: M.setMemoryProvider), a shape without a file is flagged absent, a failed hold is retried once. Placeholders
 -- (hidden holders on the dot, shapeCachePlaceholders) are built ahead of the fill cursor so a hold only changes a shapeName.
--- Shape names come from shapes.json (builder output); when the pack has none, hold.scanUpdate reads every section file
--- in idle time and builds the same index from the shapeName fields.
+-- Shape names are found at runtime: hold.scanUpdate reads every section file in idle time and builds the index (unique
+-- shapes, widest use first, per-section lists, terrain shapes) from the shapeName fields. No extra file is needed.
+--
+-- Always-loaded sections: a section that has streamed objects but is in no polygon of sections.json and in no
+-- section's related list is never reached through the camera, so it is kept active all the time, also while the camera
+-- is outside every section (found at initialize from the data, nothing is listed by hand).
 -- Per visit to a section the lane records the readiness at entry and the late / dropped neighbours (hold.visitClose).
 -- M.getShapeCacheStatus() feeds the panel; M.logRunSummary prints the cacher-log v1 lines.
 --
@@ -398,7 +401,8 @@ local TUNING = {
   shapeCacheStillSeconds = 1.5,   -- seconds the camera must be still
   shapeCachePlaceholders = 200,   -- hidden holders on the dot built ahead of the fill (0 = none)
   shapeCacheLogEvery = 2000,      -- progress line after this many holds (0 = none)
-  restartAmbient = true,          -- animated objects (playAmbient on): playAmbient is off while a pooled object is hidden and on once it is visible
+  animatedInShells = false,       -- debug: animated objects use the shell pool too (false: plain create and delete, so they restart cleanly)
+  restartAmbient = true,          -- only with animatedInShells: playAmbient is off while a pooled object is hidden and on once it is visible
   warmGroupName = "NFSC_WarmMeshes",
   maxSectionReadsPerFrame = 1,
   maxQueuedItems = 512,           -- hard cap of the load queue; the rest waits in pending lists
@@ -486,8 +490,10 @@ tun.schema = {
   { key = "predictionSeconds", debug = true, group = "Look-ahead and order", label = "Look-ahead time (s)", kind = "float", min = 0, max = 5, requires = "predictionEnabled",
     desc = "How far ahead (in seconds of travel, capped at 100 m) the look-ahead point lies. Higher: earlier loading, more wrong guesses on turns. Lower: later switches." },
 
-  { key = "restartAmbient", debug = true, group = "Shell pool", label = "Animations only while visible", kind = "bool", modes = SHELL_MODES,
-    desc = "An animated object (playAmbient on) that is shown again in a pooled object (revive, same-shape reuse, refill) otherwise stays frozen. On: playAmbient is switched off when the object is hidden and on again, with a postApply, once it is visible (only for animated objects). Off: shown as they are." },
+  { key = "animatedInShells", debug = true, group = "Shell pool", label = "Animated objects in shells", kind = "bool", modes = SHELL_MODES,
+    desc = "For performance tests. Off (default): an animated object (playAmbient on, or an _anim shape) never uses the pool: it is created fresh and deleted when its section goes, so its animation restarts cleanly. On: it is pooled like every other object (revive, same-shape reuse, refill); see Reset animations for what happens to its animation." },
+  { key = "restartAmbient", debug = true, group = "Shell pool", label = "Reset animations", kind = "bool", modes = SHELL_MODES, requires = "animatedInShells",
+    desc = "Only with Animated objects in shells. A pooled animated object that is shown again otherwise stays frozen. On: playAmbient is switched off when the object is hidden and on again, with a postApply, once it is visible, which restarts the animation. Off: shown as it is." },
   { key = "shapeCache", group = "Shape cache", label = "Preload", kind = "bool",
     desc = "Hold the meshes of the section island you are in (the sections connected to the current one through their relations) with one hidden object each, kept loaded. A mesh is then loaded once, by its holder, and streaming only revives, retargets and unhides objects. The fill runs only while the car and camera are still (unless Preload always is on) and only while nothing is queued; a mesh a create needs is held at once. Off releases the holders." },
   { key = "shapeCacheMax", group = "Shape cache", label = "Max meshes to save", kind = "int", min = 0, max = 100000, requires = "shapeCache",
@@ -517,7 +523,7 @@ tun.schema = {
   { key = "shapeCachePlaceholders", debug = true, group = "Shape cache", label = "Placeholder shells ahead", kind = "int", min = 0, max = 2000, requires = "shapeCache",
     desc = "Hidden holders on the dot built ahead of the fill. A hold takes one and only changes its shapeName, so the object cost is paid earlier, in idle frames. 0 = create the holder with the hold." },
   { key = "shapeIndexBudgetShare", debug = true, group = "Shape cache", label = "Shape index share", kind = "share", min = 0.05, max = 4, requires = "shapeCache",
-    desc = "Only used when the pack has no shapes.json: part of the frame budget the shape index may spend per frame reading section files (one file is always read per idle frame). Higher: the index is ready sooner, with longer idle frames." },
+    desc = "Part of the frame budget the shape index may spend per frame reading section files (one file is always read per idle frame). Higher: the index is ready sooner, with longer idle frames." },
 
   { key = "logSettle", debug = true, group = "Other", label = "Log settled sections", kind = "bool",
     desc = "Write a timing block to the log when the load of a section change has finished." },
@@ -557,7 +563,6 @@ end
 local SUPPORTED_SCHEMA = 2
 local SECTIONS_JSON = "lua/sections.json"
 local STREAM_INDEX = "lua/carbon_stream/index.json"
-local SHAPES_JSON = "lua/carbon_stream/shapes.json"
 local PRESETS_JSON = "lua/carbon_stream/tuning_presets.json"
 local SKIP_CAP = 4096
 
@@ -651,6 +656,7 @@ local hold = { shape = {}, ids = {}, held = 0, cursor = 1, failed = 0, ms = 0, m
                gap = 0, still = 0, evicted = 0, evictKey = nil, absent = {}, absentN = 0, tries = {}, deferred = {}, deferredN = 0,
                rings = {}, ringPos = 1, pass = 1, secIdx = 1, shpIdx = 1, nearFor = nil, nearAt = 0, adj = nil,
                islandId = nil, islandSet = nil, islandN = 0, islandHeld = 0, islandSections = 0, ph = {}, phN = 0, phMs = 0,
+               always = { set = {}, list = {}, dirty = true },       -- sections kept active everywhere (found from the data)
                cost = {}, costDirty = 0, visit = nil, visitTimer = 0, lastHitch = nil, lastPause = nil,
                mem = { time = -1e9, last = nil, provider = nil, luaPeakKB = 0, minFree = nil, minAvail = nil, peakProcess = nil } }
 local changeStamp, createdSinceChange, settled, settleSeconds, settlePeak = 0, 0, true, 0, 0
@@ -771,6 +777,7 @@ end
 
 local function computeActive(id)
   local set = {}
+  for always in pairs(hold.always.set) do set[always] = true end   -- always-loaded sections stay active everywhere
   if id and sections[id] then
     set[id] = true
     for _, rel in ipairs(sections[id].related) do set[rel] = true end
@@ -825,6 +832,37 @@ local function loadStreamIndex()
     end
   end
   if type(data.overrides) == "table" then overrideIndex = data.overrides end
+end
+
+-- A section with streamed objects that is in no polygon and in no related list can never be reached through the camera
+-- (the section table comes from the level's own data): it is always loaded. Needs loadSections and loadStreamIndex first.
+function hold.findAlways()
+  local reached = {}
+  for _, sec in pairs(sections) do
+    for _, rel in ipairs(sec.related) do reached[rel] = true end
+  end
+  local set, list = {}, {}
+  for id, entry in pairs(sectionIndex) do
+    if not sections[id] and not reached[id] then set[id], list[#list + 1] = true, id end
+  end
+  table.sort(list)
+  hold.always = { set = set, list = list, dirty = true }
+  for _, id in ipairs(list) do
+    logMsg("I", "always-loaded section %d: %d objects, in no section polygon and in no related list", id, sectionIndex[id].count or 0)
+  end
+end
+
+-- Animated objects: playAmbient on, or an _anim shape. They stay out of the pool unless Animated objects in shells is on.
+function hold.animated(item)
+  if type(item) ~= "table" then return false end
+  local v = item.playAmbient
+  if v == true or v == 1 or v == "1" or v == "true" then return true end
+  local shape = item.shapeName
+  return type(shape) == "string" and shape:lower():find("_anim%.dae$") ~= nil
+end
+
+function hold.bypassPool(item)
+  return not TUNING.animatedInShells and hold.animated(item)
 end
 
 -- ---------------------------------------------------------------------------
@@ -1198,7 +1236,7 @@ local function createStreamedObject(item, nameOverride, diag)
   local shape = item.shapeName
   if type(shape) ~= "string" or shape == "" then return nil, "missing shapeName" end
   split.diagRegisterMs = nil
-  local pooled = nameOverride == nil and shellMode()      -- probe objects (named) always take the plain path
+  local pooled = nameOverride == nil and shellMode() and not hold.bypassPool(item)      -- probe objects (named) and animated objects take the plain path
   if pooled then
     local ta = os.clock()
     if residentMode() then
@@ -1337,8 +1375,9 @@ local function deleteLive(key, diag)
   if not entry then return end
   notify("onObjectDeleted", key)
   deletedTotal = deletedTotal + 1
-  if residentMode() and deactivateDormant(key, entry) then return end
-  if shellMode() then
+  local plain = hold.bypassPool(entry.item)                    -- animated objects are deleted, never pooled
+  if not plain and residentMode() and deactivateDormant(key, entry) then return end
+  if not plain and shellMode() then
     local ta = os.clock()
     if parkShell(entry.id) then
       local ms = (os.clock() - ta) * 1000
@@ -1381,17 +1420,19 @@ end
 -- Current section first, then its related sections by priority band; the static order breaks ties.
 local function rebuildFeedOrder()
   feedOrder = {}
-  if not currentSectionID or not sections[currentSectionID] then return end
-  local entries = {}
-  for rank, id in ipairs(sections[currentSectionID].related) do
-    if id ~= currentSectionID then entries[#entries + 1] = { id = id, tier = loadingPriority(id), rank = rank } end
+  if currentSectionID and sections[currentSectionID] then
+    local entries = {}
+    for rank, id in ipairs(sections[currentSectionID].related) do
+      if id ~= currentSectionID then entries[#entries + 1] = { id = id, tier = loadingPriority(id), rank = rank } end
+    end
+    table.sort(entries, function(a, b)
+      if a.tier ~= b.tier then return a.tier < b.tier end
+      return a.rank < b.rank
+    end)
+    feedOrder[1] = currentSectionID
+    for i = 1, #entries do feedOrder[i + 1] = entries[i].id end
   end
-  table.sort(entries, function(a, b)
-    if a.tier ~= b.tier then return a.tier < b.tier end
-    return a.rank < b.rank
-  end)
-  feedOrder[1] = currentSectionID
-  for i = 1, #entries do feedOrder[i + 1] = entries[i].id end
+  for _, id in ipairs(hold.always.list) do feedOrder[#feedOrder + 1] = id end    -- always-loaded sections go last
 end
 
 local function queueSectionRead(id)
@@ -1400,6 +1441,15 @@ local function queueSectionRead(id)
   sectionReading[id] = true
   srTail = srTail + 1
   sectionReadQueue[srTail] = id
+end
+
+-- Makes the always-loaded sections active (at start, and again after a purge cleared the selection).
+function hold.activateAlways()
+  hold.always.dirty = false
+  if next(hold.always.set) == nil then return end
+  activeSet = computeActive(currentSectionID)
+  rebuildFeedOrder()
+  for i = 1, #feedOrder do queueSectionRead(feedOrder[i]) end
 end
 
 -- Objects of the section the camera is in, or the one the streamer is currently loading for, are
@@ -1518,8 +1568,8 @@ end
 
 -- Terrain of every active section first, then the rest; sections in feedOrder (current first).
 local function feedQueue()
-  if pendingCount <= 0 or not currentSectionID or not sections[currentSectionID] then return end
-  if TUNING.currentSectionFirst then                       -- the camera's section and the streamed one, terrain first
+  if pendingCount <= 0 or #feedOrder == 0 then return end
+  if TUNING.currentSectionFirst and currentSectionID and sections[currentSectionID] then                       -- the camera's section and the streamed one, terrain first
     for _, tierName in ipairs({ "terrain", "rest" }) do
       feedTier(currentSectionID, tierName)
       if cameraSectionID and cameraSectionID ~= currentSectionID then feedTier(cameraSectionID, tierName) end
@@ -1929,31 +1979,13 @@ local warm = newWarm()
 
 local function loadShapeList()
   warm = newWarm()
-  local data = jsonReadFile(levelRoot .. "/" .. SHAPES_JSON)
-  if type(data) ~= "table" or type(data.shapes) ~= "table" then
-    local ids = {}
-    for id in pairs(sectionIndex) do ids[#ids + 1] = id end
-    table.sort(ids)
-    if #ids == 0 then logMsg("D", "no %s and no streamed sections: the shape cache warm-up is off", SHAPES_JSON); return end
-    warm.scan = { ids = ids, pos = 1, perSection = {}, counts = {}, terrain = {}, unique = 0, files = 0, failed = 0, records = 0,
-                  ms = 0, runSeconds = 0, idle = 0, done = false }
-    logMsg("D", "no %s: shape names are indexed from the %d section files while nothing is queued", SHAPES_JSON, #ids)
-    return
-  end
-  warm.names, warm.total = data.shapes, #data.shapes
-  if type(data.terrain) == "table" then            -- positions of the shapes terrain-like objects use (IdentityMatrix / ChoppedRoadway): held first
-    for _, pos in ipairs(data.terrain) do
-      local name = data.shapes[pos]
-      if name and not warm.terrain[name] then warm.terrain[name], warm.terrainN = true, warm.terrainN + 1 end
-    end
-  end
-  if type(data.sections) == "table" then
-    for id, list in pairs(data.sections) do
-      local n = tonumber(id)
-      if n and type(list) == "table" then warm.bySection[n] = list end
-    end
-  end
-  warm.loaded = warm.total > 0
+  local ids = {}
+  for id in pairs(sectionIndex) do ids[#ids + 1] = id end
+  table.sort(ids)
+  if #ids == 0 then logMsg("D", "no streamed sections: the shape cache warm-up is off"); return end
+  warm.scan = { ids = ids, pos = 1, perSection = {}, counts = {}, terrain = {}, unique = 0, files = 0, failed = 0, records = 0,
+                ms = 0, runSeconds = 0, idle = 0, done = false }
+  logMsg("D", "shape names are indexed from the %d section files while nothing is queued", #ids)
 end
 
 -- ---------------------------------------------------------------------------
@@ -2072,7 +2104,7 @@ function hold.isAbsent(name)
 end
 
 -- The section files are read once, one per idle frame within shapeIndexBudgetShare, and every shapeName is collected.
--- Result: the same lists shapes.json holds (every unique shape once, widest use first, per-section positions).
+-- Result: every unique shape once (widest use first) and per-section positions.
 function hold.scanFinish(sc)
   local counts, names = sc.counts, {}
   for name in pairs(counts) do names[#names + 1] = name end
@@ -2091,6 +2123,7 @@ function hold.scanFinish(sc)
   end
   warm.names, warm.total, warm.bySection, warm.loaded = names, #names, bySection, #names > 0
   hold.adj = nil                                                       -- the islands are made again with the new index
+  hold.nearFor = nil                                                   -- and so is the ring walk (terrain shapes are known now)
   for name in pairs(sc.terrain) do warm.terrain[name], warm.terrainN = true, warm.terrainN + 1 end
   sc.done, sc.perSection, sc.counts, sc.terrain = true, nil, nil, nil               -- the working tables are no longer needed
   logMsg("D", "shape index built: %d unique shapes from %d section files (%d records, %d unreadable), %.1f s of reads in %.0f s of idle time",
@@ -2797,6 +2830,7 @@ end
 -- Nothing that was queued can create an object afterwards; the next frame looks the camera's section up again.
 local function clearWork()
   currentSectionID, activeSet = nil, {}
+  hold.always.dirty = true                                      -- the always-loaded sections come back on the next frame
   sectionRead, sectionReading = {}, {}
   sectionReadQueue, srHead, srTail = {}, 1, 0
   loadQueue, lqHead, lqTail, queuedKeys = {}, 1, 0, {}
@@ -2835,6 +2869,7 @@ function M.initialize(basePath)
   local ok, err = pcall(function()
     loadSections()
     loadStreamIndex()
+    hold.findAlways()
     ensureRuntimeGroup()
   end)
   if not ok then
@@ -2844,7 +2879,7 @@ function M.initialize(basePath)
   initialized = true
   if readPresets().startup then M.loadPreset("startup") end
   local okShapes, errShapes = pcall(loadShapeList)
-  if not okShapes then warm = newWarm(); logMsg("W", "shapes.json could not be read: %s", tostring(errShapes)) end
+  if not okShapes then warm = newWarm(); logMsg("W", "the shape index could not be started: %s", tostring(errShapes)) end
   hold.costLoad()
   logMsg("D", "initialized: %d sections, %d with streamed objects", #sectionOrder, (function()
     local n = 0
@@ -3514,7 +3549,7 @@ function M.logRunSummary()
     shellStats.peakLive, poolTotal(), liveCount, dormantCount, shellFreeN, shellStats.built)
   local si = M.getShapeIndexStatus()
   if si.state == "scanning" or si.state == "done" then
-    logMsg("I", "  shape index (no shapes.json): %s, %d of %d section files, %d unique shapes, %d unreadable, %.1f s reading", si.state, si.files, si.total,
+    logMsg("I", "  shape index: %s, %d of %d section files, %d unique shapes, %d unreadable, %.1f s reading", si.state, si.files, si.total,
       si.unique, si.failed, si.readSeconds)
   end
   hold.logSummary()
@@ -3667,10 +3702,10 @@ end
 -- true when no section file and no object is waiting to be created (cheap, per-frame safe)
 function M.isIdle() return lqHead > lqTail and pqHead > pqTail and srHead > srTail and pendingCount <= 0 end
 
--- The shape index: "file" (shapes.json), "scanning" / "done" (built from the section files) or "none".
+-- The shape index: "scanning" / "done" (built from the section files) or "none".
 function M.getShapeIndexStatus()
   local sc = warm.scan
-  if not sc then return { state = warm.loaded and "file" or "none", unique = warm.total, files = 0, total = 0, failed = 0, records = 0, seconds = 0, readSeconds = 0 } end
+  if not sc then return { state = "none", unique = warm.total, files = 0, total = 0, failed = 0, records = 0, seconds = 0, readSeconds = 0 } end
   return {
     state = sc.done and "done" or "scanning", files = sc.files, total = #sc.ids, failed = sc.failed, records = sc.records,
     unique = sc.unique, seconds = sc.runSeconds, readSeconds = sc.ms / 1000,
@@ -3740,6 +3775,7 @@ function M.onUpdate(dtReal)
   end
   local selectionStart = diag and diag:beginStage("selection")
   totalTime = totalTime + (dtReal or 0)
+  if hold.always.dirty then hold.activateAlways() end
   updateCamera(dtReal or 0)
   priorityTimer = priorityTimer + (dtReal or 0)
   if priorityTimer >= TUNING.priorityRefreshInterval then
@@ -3803,7 +3839,7 @@ function M.onUpdate(dtReal)
   end
   local tw = os.clock()
   local warmStageStart = diag and diag:beginStage("cache_warm")
-  local scanned = hold.scanUpdate(dtReal or 0)         -- shape index from the section files (only without shapes.json)
+  local scanned = hold.scanUpdate(dtReal or 0)         -- shape index from the section files 
   local heldNow = hold.update(dtReal or 0)             -- shape cache lane: only while nothing is queued
   local warmedCount = heldNow + scanned
   if diag then diag:endStage("cache_warm", warmStageStart, warmedCount) end

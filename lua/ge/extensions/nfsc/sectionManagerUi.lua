@@ -363,7 +363,7 @@ local function drawShapeCache(st)
     return
   end
   if si and si.state == "scanning" then
-    im.Text("Indexing shape names from the section files (no shapes.json)")
+    im.Text("Indexing shape names from the section files")
     progressBar(si.files, si.total, string.format("%d of %d section files, %d unique shapes so far", si.files, si.total, si.unique))
     im.TextDisabled(string.format("Reading for %s    ETA: %s. The fill starts when the index is done.", duration(si.seconds), duration(si.etaSeconds)))
     im.TreePop()

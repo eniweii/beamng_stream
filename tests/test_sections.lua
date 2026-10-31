@@ -521,6 +521,11 @@ do
   eq(s.getStatus().currentSectionID, nil, "outside every section: nothing current")
 end
 
+local function loadOrder(s)                                    -- without the always-loaded sections (the fixture's files are in no fake polygon)
+  local t = {}
+  for _, id in ipairs(s.getLoadOrder()) do if id >= 9000 then t[#t + 1] = id end end
+  return table.concat(t, ",")
+end
 -- 19. load order follows the heading (the game's three priority bands) --------------------------------
 do
   local s = fresh()
@@ -536,12 +541,12 @@ do
   s.initialize("levels/nfsc")
   H.cam = { x = 0, y = 0, z = 0 }
   H.tick(s, 1, 0.1)
-  eq(table.concat(s.getLoadOrder(), ","), "9001,9002,9003", "standing still: static order")
+  eq(loadOrder(s), "9001,9002,9003", "standing still: static order")
   for _ = 1, 8 do
     H.cam.x = H.cam.x - 3                                        -- 30 m/s west
     H.tick(s, 1, 0.1)
   end
-  eq(table.concat(s.getLoadOrder(), ","), "9001,9003,9002", "heading west: the section ahead loads first")
+  eq(loadOrder(s), "9001,9003,9002", "heading west: the section ahead loads first")
   H.readFilter = nil
 end
 
@@ -823,7 +828,7 @@ do
   settle(s, 60)
   local sc = s.getShapeCacheStatus()
   check(not sc.enabled and sc.held == 0, "27e: the shape cache is off by default and holds nothing")
-  -- the fill holds every shape of shapes.json once, outside the live counts
+  -- the fill holds every shape of the section files once, outside the live counts
   local base = fresh()
   settle(base, 60)
   local liveWithout = base.getStatus().liveObjectCount
@@ -831,7 +836,7 @@ do
   settle(s2, 80)
   local w = s2.getShapeCacheStatus()
   check(w.available and w.complete, "27f: the fill finished")
-  eq(w.total, 9, "27f: all unique shapes of shapes.json")
+  eq(w.total, 9, "27f: all unique shapes of the section files")
   eq(w.held, 9, "27f: every shape is held")
   eq(w.failed, 0, "27f: no failures")
   eq(s2.getStatus().liveObjectCount, liveWithout, "27f: the holders are not live objects")
@@ -861,6 +866,8 @@ end
 do
   -- resident: a shape that is held makes the way back a held-hit
   local s = fresh(with(FILL, { creationMode = "resident", unloadCooldown = 0 }))
+  H.cam = { x = 0, y = 0, z = 0 }; settle(s, 10)                -- outside: the shape index is built first
+  H.cam = { x = 3950, y = -200, z = 0 }
   settle(s, 80)
   local before = s.getShapeCacheStatus().creates.held.n
   H.cam = { x = 3950, y = -310, z = 0 }; settle(s, 40)
@@ -1672,6 +1679,13 @@ do
 end
 -- 27p. terrain-like meshes (IdentityMatrix / ChoppedRoadway) are held first within a hop ring ------------------------
 do
+  fresh()                                                -- installs the harness; the fixture has no terrain-flagged object, so one is flagged here
+  local file = "levels/nfsc/lua/carbon_stream/sections/1022.json"
+  local data = jsonReadFile(file)
+  for _, o in ipairs(data.objects) do
+    if o.shapeName and o.shapeName:find("XTU_HOUSE_1A_00", 1, true) then o.instanceFlags = "IdentityMatrix,Collidable" end
+  end
+  H.files[file] = data
   local s = fresh(with(FILL, { shapeCachePerFrame = 1, shapeCacheAlways = true }))
   H.cam = { x = 3950, y = -300, z = 0 }                 -- in 1022
   -- the create filter keeps the loader from holding anything: only the idle lane holds here
@@ -1679,6 +1693,7 @@ do
   settle(s, 3)
   local c = s.getShapeCacheStatus()
   check(c.held >= 1 and c.current and c.current:find("XTU_HOUSE_1A_00", 1, true), "27p: the shape of the terrain-flagged object is held first")
+  H.files = {}
 end
 
 -- 27q. the island holds the meshes of related sections that are not drivable too ------------------------------------
@@ -1724,9 +1739,39 @@ do
   H.files = {}
 end
 
+-- Helpers for 27o-27t: put a section file (and its index entry) or an extra object into the harness files.
+local BASE = "levels/nfsc/lua/carbon_stream/"
+local function addSectionFile(id, objects)
+  local idx = jsonReadFile(BASE .. "index.json")
+  idx.sections[#idx.sections + 1] = { id = id, file = "lua/carbon_stream/sections/" .. id .. ".json", count = #objects }
+  H.files[BASE .. "index.json"] = idx
+  H.files[BASE .. "sections/" .. id .. ".json"] = { schemaVersion = 2, sectionID = id, objectCount = #objects, objects = objects }
+end
+local function animatedObject(name, sectionId, extra)
+  local src = jsonReadFile(BASE .. "sections/1021.json").objects[1]
+  local o = {}
+  for k, v in pairs(src) do o[k] = v end
+  o.name, o.sectionID, o.__streamKey, o.__streamSections = name, tostring(sectionId), "cs:test_" .. name, { sectionId }
+  o.playAmbient = true
+  for k, v in pairs(extra or {}) do o[k] = v end
+  return o
+end
+local function addAnimatedTo1021()
+  local data = jsonReadFile(BASE .. "sections/1021.json")
+  local o = animatedObject("XTU_ANIM_TEST_1", 1021, { __parent = "Palmont1021", __streamSections = { 1021 }, shapeName = "/levels/nfsc/assets/meshes/ANIMTEST_anim.dae" })
+  data.objects[#data.objects + 1] = o
+  data.objectCount = #data.objects
+  H.files[BASE .. "sections/1021.json"] = data
+  local idx = jsonReadFile(BASE .. "index.json")
+  for _, e in ipairs(idx.sections) do if tonumber(e.id) == 1021 then e.count = #data.objects end end
+  H.files[BASE .. "index.json"] = idx
+end
+
 -- 27o. animated objects shown again in a pooled object restart their animation ----------------------------------------
 do
-  local s = fresh({ creationMode = "resident", unloadCooldown = 0 })
+  fresh()                                                      -- installs the harness
+  addAnimatedTo1021()
+  local s = fresh({ creationMode = "resident", unloadCooldown = 0, animatedInShells = true })
   local anim
   s.addListener({ onObjectCreated = function(self, key, obj, item) if item.playAmbient then anim = obj end end })
   settle(s, 40)
@@ -1747,6 +1792,8 @@ end
 -- 40. the shape cache block of the panel ---------------------------------------------------------------
 do
   local s = fresh(with(FILL, { creationMode = "resident" }))
+  H.cam = { x = 0, y = 0, z = 0 }; settle(s, 10)                -- outside: the shape index is built first
+  H.cam = { x = 3950, y = -200, z = 0 }
   settle(s, 80)
   local texts, bars, clicks = {}, {}, {}
   local function ptr(v) return { [0] = v } end
@@ -1771,7 +1818,7 @@ do
   check(saw("Placeholders ready:"), "40b: and the placeholders")
   eq(#bars, 2, "40c: the Preload bar and the Debug one")
   eq(bars[1].frac, 1, "40c: full when every mesh of the island is held")
-  check(bars[1].text == "9 / 9 meshes cached", "40c: with the count")
+  check(bars[1].text == "10 / 10 meshes cached", "40c: with the count")
   check(saw("Preload:"), "40c: the Preload radios are drawn")
   clicks["Pause fill##scfill"] = true
   ui.onUpdate()
@@ -1805,6 +1852,47 @@ if jit then
   end
   for k, v in pairs(nfsc_sectionStreamer) do if type(v) == "function" then walk(v, k) end end
   check(worst <= 56, "33: a function has " .. worst .. " upvalues, the LuaJIT limit is 60: " .. worstName)
+end
+
+H.files = {}
+
+-- 27s. a section in no polygon and no related list is always loaded, also with the camera outside every section ------
+do
+  fresh()
+  addSectionFile(2600, { animatedObject("XTU_PLANE_1", 2600, { __parent = "Palmont2600" }) })
+  local s = fresh()
+  H.cam = { x = 0, y = 0, z = 0 }                             -- outside every section
+  settle(s, 10)
+  local st = s.getStatus()
+  eq(st.currentSectionID, nil, "27s: the camera is outside every section")
+  eq(H.created["XTU_PLANE_1"], 1, "27s: the always-loaded object exists without a section")
+  check(s.isSectionActive(2600), "27s: its section is active")
+  H.cam = { x = 3950, y = -200, z = 0 }; settle(s, 30)           -- in 1021
+  eq(H.created["XTU_PLANE_1"], 1, "27s: entering a section does not recreate it")
+  H.cam = { x = 4100, y = -320, z = 0 }; settle(s, 30)           -- 1101
+  H.cam = { x = 0, y = 0, z = 0 }; settle(s, 30)                 -- outside again
+  check(s.isSectionActive(2600) and s.getStatus().liveObjectCount == 1, "27s: only the always-loaded object stays alive outside")
+  s.purge()
+  settle(s, 10)
+  eq(s.getStatus().liveObjectCount, 1, "27s: and it comes back after a purge")
+  H.files = {}
+end
+
+-- 27t. animated objects stay out of the pool unless Animated objects in shells is on ---------------------------------
+do
+  fresh()
+  addAnimatedTo1021()
+  local s = fresh({ creationMode = "resident", unloadCooldown = 0 })
+  local anim, first
+  s.addListener({ onObjectCreated = function(self, key, obj, item) if item.name == "XTU_ANIM_TEST_1" then anim = obj; first = first or obj end end })
+  settle(s, 40)
+  check(anim ~= nil and not anim.hidden, "27t: the animated object is created")
+  H.cam = { x = 4100, y = -320, z = 0 }; settle(s, 40)           -- 1021 is no longer active
+  check(first.deleted, "27t: it is deleted, not pooled, when its section goes")
+  eq(s.getShapeCacheStatus().ambientRestarts, 0, "27t: nothing to restart")
+  H.cam = { x = 3950, y = -200, z = 0 }; settle(s, 40)
+  check(anim ~= first and not anim.deleted and H.created["XTU_ANIM_TEST_1"] == 2, "27t: it comes back as a fresh object")
+  H.files = {}
 end
 
 print(string.format("%d passed, %d failed", passed, failed))

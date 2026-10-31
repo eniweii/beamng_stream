@@ -15,8 +15,16 @@
 - Look-ahead switch to the predicted section, heading-based load order and timing counters
   (see ARCHITECTURE). Not validated in BeamNG: read the `settled` log lines and `getStatus()` timings
   first to see whether queue order or TSStatic creation is the bottleneck.
-- Builder: objects named or shaped SKYDOME / SKYDOME_XENON / SKY_SPECULAR are written with `isRenderEnabled`
-  false.
+- Builder: no render filter any more; sky objects are streamed like every other object (the skydome is gone from
+  the source data).
+- No `shapes.json`: the shape index (unique shapes, per-section lists, terrain shapes) is built at runtime by reading
+  the section files while idle. Nothing else has to be maintained.
+- Always-loaded sections: a section with streamed objects that is in no polygon of `sections.json` and in no
+  related list (section 2600, the authored animations) is found at initialize and kept active everywhere, also with
+  the camera outside every section. The log has one `always-loaded section` line per section found.
+- Animated objects (`playAmbient` on, or an `_anim` shape) are created fresh and deleted, never pooled. Debug
+  settings: `Animated objects in shells` (pool them again, for performance tests) and `Reset animations` (only with
+  the first one: playAmbient off while hidden, on when visible).
 
 ## Not validated yet
 - Everything inside BeamNG (see the list at the end of `docs/ARCHITECTURE.md`).
@@ -55,8 +63,8 @@
   rest; `currentSectionFirst = false` restores the old order for comparison.
 - 0014: first use split into import (no `.cdae` yet) / cached / unknown, a log line for any single
   create over `stallLogMs`, peak frame work in the settled header, no settled block for changes that
-  created nothing (`logEmptySettles`), and the idle shape cache warm-up lane (`cacheWarm`, builder
-  writes `shapes.json`). Last streamer patch: what is left is tuning `frameBudgetMs` and the warm-up
+  created nothing (`logEmptySettles`), and the idle shape cache warm-up lane (`cacheWarm`, shapes
+  index built at runtime). Last streamer patch: what is left is tuning `frameBudgetMs` and the warm-up
   settings in game.
 - 0015: creation methods. `creationMode = "current"` (create and delete every object, unchanged) or
   `"shells"`: a released object is parked (tiny `shellShape`, hidden, free list) and the next load
