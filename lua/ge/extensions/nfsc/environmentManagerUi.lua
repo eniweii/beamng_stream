@@ -1,0 +1,149 @@
+-- nfsc_environmentManagerUi: imgui panel for nfsc_environmentManager.
+-- A control surface only; all state lives in nfsc_environmentManager. The imgui calls follow the same
+-- conventions as nfsc_sectionManagerUi (unverified in the engine like that panel).
+
+local M = {}
+M.dependencies = { "nfsc_environmentManager" }
+
+local im = ui_imgui
+local windowOpen = im.BoolPtr(true)
+
+local tipBroken = false
+local function tip(text)
+  if tipBroken or not text or text == "" then return end
+  local ok, err = pcall(function()
+    if not im.IsItemHovered() then return end
+    if im.BeginTooltip and im.EndTooltip and im.PushTextWrapPos and im.PopTextWrapPos and im.TextUnformatted and im.GetFontSize then
+      im.BeginTooltip()
+      im.PushTextWrapPos(im.GetFontSize() * 28)
+      im.TextUnformatted(text)
+      im.PopTextWrapPos()
+      im.EndTooltip()
+    else
+      im.SetTooltip(text)
+    end
+  end)
+  if not ok then
+    tipBroken = true
+    log("W", "nfsc_environmentManagerUi", "tooltips turned off: " .. tostring(err))
+  end
+end
+
+local ptrs = {}
+local function floatPtr(key, value)
+  local p = ptrs[key]
+  if not p then p = im.FloatPtr(value); ptrs[key] = p end
+  p[0] = value
+  return p
+end
+local function intPtr(key, value)
+  local p = ptrs[key]
+  if not p then p = im.IntPtr(value); ptrs[key] = p end
+  p[0] = value
+  return p
+end
+local function boolPtr(key, value)
+  local p = ptrs[key]
+  if not p then p = im.BoolPtr(value); ptrs[key] = p end
+  p[0] = value and true or false
+  return p
+end
+
+local userMult, userFade = 1.0, 0.0           -- what the sliders hold between frames
+
+local function drawRoughness(env, st)
+  im.Text("Roughness")
+  if st.indexState == "failed" then
+    im.TextDisabled("Material index failed: " .. tostring(st.indexInfo.error))
+  elseif st.indexState ~= "ready" then
+    im.TextDisabled("Reading the materials...")
+    return
+  else
+    im.Text(string.format("%d materials with a shader class, %d selected", st.materials, st.selected))
+    tip("Materials whose name ends in a shader class, read once from the level's materials files. Only the selected shaders are changed.")
+  end
+
+  for _, c in ipairs(env.getClasses()) do
+    local p = boolPtr("cls_" .. c.name, c.selected)
+    if im.Checkbox(string.format("%s (%d)##cls_%s", c.name, c.count, c.name), p) then env.setClassSelected(c.name, p[0]) end
+    tip("Include the materials of this shader in the roughness change.")
+  end
+
+  local mp = floatPtr("mult", userMult)
+  if im.SliderFloat("Roughness (x baseline)##rough", mp, 0, 2, "%.2f") then
+    userMult = mp[0]
+    env.setRoughness("user", userMult, { priority = 10, fade = userFade })
+  end
+  tip("Scales every selected material's own roughness. 1.00 is the exported value. The result is kept between 0 and 1, so a value above 1 only changes materials that are not fully rough.")
+  local fp = floatPtr("fade", userFade)
+  if im.SliderFloat("Fade (s)##roughfade", fp, 0, 10, "%.1f") then userFade = fp[0] end
+  tip("0 applies the change at once. Above 0 the change is spread over that many seconds in coarse steps.")
+  if im.Button("Reset roughness") then
+    userMult = 1.0
+    env.clearRoughness("user", { fade = userFade })
+  end
+  tip("Back to the exported roughness of every material.")
+
+  if st.passActive then
+    im.Text(string.format("Writing materials: %d of %d", st.passTotal - st.passPending, st.passTotal))
+  elseif st.fading then
+    im.Text(string.format("Fading: x%.2f towards x%.2f", st.shown, st.desired))
+  else
+    im.Text(string.format("Applied: x%.2f", st.shown))
+  end
+end
+
+local function drawSway(env, st)
+  im.Text("Sway")
+  local on = boolPtr("swayon", st.swayEnabled)
+  if im.Checkbox("Sway swayable objects##swayon", on) then env.setSwayEnabled(on[0]) end
+  tip("Objects flagged Swayable lean back and forth about their own origin. Only the nearest ones move; every other object keeps its exported pose.")
+  if st.swayUnavailable then im.TextDisabled("Sway unavailable: " .. st.swayUnavailable) end
+
+  local sw = env.getSway()
+  local changed = {}
+  local p = floatPtr("amp", sw.amplitudeDeg)
+  if im.SliderFloat("Amplitude (deg)##swayamp", p, 0, 15, "%.2f") then changed.amplitudeDeg = p[0] end
+  tip("The largest lean along the wind. A gust variation and a smaller sideways lean come on top.")
+  p = floatPtr("speed", sw.speedHz)
+  if im.SliderFloat("Speed (Hz)##swayspeed", p, 0.05, 2, "%.2f") then changed.speedHz = p[0] end
+  tip("Back and forth cycles per second.")
+  p = floatPtr("wind", sw.windDirDeg)
+  if im.SliderFloat("Wind direction (deg)##swaywind", p, 0, 360, "%.0f") then changed.windDirDeg = p[0] end
+  tip("The world direction the objects lean towards. 0 is +X, 90 is +Y.")
+  p = floatPtr("radius", sw.radius)
+  if im.SliderFloat("Radius (m)##swayradius", p, 20, 1000, "%.0f") then changed.radius = p[0] end
+  tip("Only objects this close to the camera move.")
+  local ip = intPtr("maxobj", sw.maxObjects)
+  if im.SliderInt("Max objects##swaymax", ip, 1, 500) then changed.maxObjects = ip[0] end
+  tip("At most this many objects move at once, the nearest first. Each one costs one transform write per frame.")
+  if next(changed) then env.setSway(changed) end
+
+  im.Text(string.format("Swayable objects: %d registered, %d moving", st.swayRegistered, st.swayMoving))
+end
+
+function M.onUpdate()
+  local env = nfsc_environmentManager
+  if not env then return end
+  im.Begin("Environment Manager", windowOpen)
+  local st = env.getStatus()
+  drawRoughness(env, st)
+  im.Separator()
+  drawSway(env, st)
+  im.Separator()
+  if im.CollapsingHeader1("Debug") then
+    local dp = boolPtr("dbg", env.getDebugLog())
+    if im.Checkbox("Detailed logs##envdebug", dp) then env.setDebugLog(dp[0]) end
+    if im.Button("Rebuild material index") then env.rebuildMaterialIndex() end
+    tip("Reads the materials files again. The selection of shaders is kept.")
+    im.SameLine()
+    if im.Button("Probe one material") then env.probeRoughness() end
+    tip("Writes half the baseline roughness to one material of the first selected shader, logs what the write and the refresh cost, reads it back and restores it.")
+    im.Text(string.format("Passes: %d, writes: %d, %.1f ms in total (worst frame %.2f ms)", st.passes, st.writes, st.writeMs, st.maxWriteMs))
+    im.Text(string.format("Missing in the engine: %d, errors: %d", st.missing, st.errors))
+    im.Text(string.format("Sway: peak %d moving, %d restored, %d skipped (identity or chopped), %d errors", st.swayPeak, st.swayRestored, st.swaySkipped, st.swayErrors))
+  end
+  im.End()
+end
+
+return M
