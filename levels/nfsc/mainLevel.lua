@@ -4,6 +4,7 @@
 -- (lua/ge/extensions/nfsc/): this file only loads them, initializes the streamer, and unloads
 -- them with the level. The engine calls their onUpdate itself, so nothing is forwarded here.
 -- The environment manager (material roughness, object sway) and its panel load the same way.
+-- The sound zones extension builds the tunnel / overpass / garage ambience spaces from lua/zones.json.
 -- The manager also owns emitter and light visibility now, so the legacy
 -- tsstatic_section_streaming.lua and its panel must NOT be loaded any more.
 -- Other level-local modules in <basePath>/lua (for example the emitter scatter script) still load
@@ -15,7 +16,7 @@ local levelName = "nfsc"
 local basePath = "levels/" .. levelName      -- no leading slash
 
 local EXTENSIONS = { "nfsc_sectionStreamer", "nfsc_sectionManager", "nfsc_sectionCollision", "nfsc_sectionManagerUi",
-                     "nfsc_environmentManager", "nfsc_environmentManagerUi" }
+                     "nfsc_environmentManager", "nfsc_environmentManagerUi", "nfsc_soundZones" }
 local SKIP_LEGACY = { tsstatic_section_streaming = true, tsstatic_section_manager_ui = true }
 
 local luaLoaded = false
@@ -34,6 +35,7 @@ local function onLoad()
     if not ok then log('E', 'onLoad', 'Section streamer failed to initialize: ' .. tostring(err)) end
   end
   if nfsc_environmentManager then nfsc_environmentManager.initialize(basePath) end   -- where to find the *materials.json files
+  if nfsc_soundZones then nfsc_soundZones.initialize(basePath) end                   -- builds the ambience spaces from lua/zones.json
 
   local scatter = modules["emitter_volume_scatter"]
   if scatter and scatter.initialize then scatter.initialize() end

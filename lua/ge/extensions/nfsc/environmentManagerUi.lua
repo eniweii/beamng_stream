@@ -122,6 +122,23 @@ local function drawSway(env, st)
   im.Text(string.format("Swayable objects: %d registered, %d moving", st.swayRegistered, st.swayMoving))
 end
 
+local function drawAnimation(env, st)
+  im.Text("Texture animation")
+  local on = boolPtr("animon", st.animEnabled)
+  if im.Checkbox("Animate image sequences##animon", on) then env.setAnimationEnabled(on[0]) end
+  tip("Signs, screens and lights that cycle through several textures. Only the textures of the materials change; a scroll on the same material keeps running. Switching it off puts every material back on its exported frame.")
+  if st.animState == "failed" then
+    im.TextDisabled("Animation file failed: " .. tostring(st.animInfo.error))
+  elseif st.animState == "missing" then
+    im.TextDisabled("No image sequences found. Run Populate animations in the materials populator first.")
+  elseif st.animState ~= "ready" then
+    im.TextDisabled("Reading the animation file...")
+  else
+    im.Text(string.format("%d image sequences on %d materials", st.animSequences, st.animMaterials))
+    if st.animPending > 0 then im.Text(string.format("Writing materials: %d waiting", st.animPending)) end
+  end
+end
+
 function M.onUpdate()
   local env = nfsc_environmentManager
   if not env then return end
@@ -130,6 +147,8 @@ function M.onUpdate()
   drawRoughness(env, st)
   im.Separator()
   drawSway(env, st)
+  im.Separator()
+  drawAnimation(env, st)
   im.Separator()
   if im.CollapsingHeader1("Debug") then
     local dp = boolPtr("dbg", env.getDebugLog())
@@ -141,6 +160,20 @@ function M.onUpdate()
     tip("Writes half the baseline roughness to one material of the first selected shader, logs what the write and the refresh cost, reads it back and restores it.")
     im.Text(string.format("Passes: %d, writes: %d, %.1f ms in total (worst frame %.2f ms)", st.passes, st.writes, st.writeMs, st.maxWriteMs))
     im.Text(string.format("Missing in the engine: %d, errors: %d", st.missing, st.errors))
+    if im.Button("Reload animation file") then env.rebuildAnimationIndex() end
+    tip("Reads material_animations.json again.")
+    im.SameLine()
+    if im.Button("Probe one animated material") then env.probeAnimation() end
+    tip("Writes the next frame to the first animated material, logs what the write and the refresh cost, reads it back and restores the frame. Watch whether its scroll keeps moving.")
+    local bp = intPtr("animbudget", env.getAnimationBudget())
+    if im.SliderInt("Materials per frame##animbudget", bp, 1, 100) then env.setAnimationBudget(bp[0]) end
+    tip("At most this many animated materials are rewritten each frame. Each rewrite reloads the material.")
+    if st.animInfo and st.animInfo.targets then
+      im.Text(string.format("Animation file: %d file(s), %d stage(s) on %d materials, %d skipped, %d with another time base",
+        st.animInfo.files, st.animInfo.targets, st.animInfo.materials, st.animInfo.skipped, st.animInfo.otherTimeBase))
+    end
+    im.Text(string.format("Animation writes: %d, %.1f ms in total (worst %.2f ms), missing in the engine: %d, errors: %d",
+      st.animWrites, st.animWriteMs, st.animMaxWriteMs, st.animMissing, st.animErrors))
     im.Text(string.format("Sway: peak %d moving, %d restored, %d skipped (identity or chopped), %d errors", st.swayPeak, st.swayRestored, st.swaySkipped, st.swayErrors))
   end
   im.End()
