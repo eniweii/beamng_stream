@@ -89,6 +89,39 @@ class SectionGroupingTests(FixtureCase):
                          {"0x1111AAAA": [1022], "0x2222BBBB": [1022], "0x454C22D2": [1021]})
 
 
+class ShapeIndexTests(FixtureCase):
+    def test_index_carries_the_shape_index_the_streamer_would_scan(self):
+        report = self.build()
+        index = json.loads((self.out / RUNTIME / "index.json").read_text(encoding="utf-8"))
+        shape = index["shapeIndex"]
+        self.assertEqual(shape["version"], 1)
+        names = shape["names"]
+        self.assertEqual(len(names), len(set(names)))
+        self.assertEqual(sorted(shape["bySection"]), sorted(str(s["id"]) for s in index["sections"]))
+        counts = {}
+        for entry in index["sections"]:
+            sec = self.section(entry["id"])
+            expected = sorted({o["shapeName"] for o in sec["objects"] if o.get("shapeName")})
+            listed = sorted(names[p - 1] for p in shape["bySection"][str(entry["id"])])
+            self.assertEqual(listed, expected)
+            for name in expected:
+                counts[name] = counts.get(name, 0) + 1
+        self.assertEqual(names, sorted(counts, key=lambda n: (-counts[n], n)))
+        self.assertEqual(report["shapeIndex"]["uniqueShapes"], len(names))
+        self.assertNotIn("names", report["shapeIndex"])
+
+    def test_terrain_shapes_follow_the_streamer_rule(self):
+        self.build()
+        index = json.loads((self.out / RUNTIME / "index.json").read_text(encoding="utf-8"))
+        expected = set()
+        for entry in index["sections"]:
+            for o in self.section(entry["id"])["objects"]:
+                flags = "".join(c for c in str(o.get("instanceFlags", "")).lower() if c.isascii() and c.isalnum())
+                if "identitymatrix" in flags or "choppedroadway" in flags:
+                    expected.add(o["shapeName"])
+        self.assertEqual(set(index["shapeIndex"]["terrain"]), expected)
+
+
 class MultiSectionTests(FixtureCase):
     def test_multi_section_object_shares_one_key(self):
         self.build()

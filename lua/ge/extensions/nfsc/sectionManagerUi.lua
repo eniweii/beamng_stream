@@ -575,7 +575,11 @@ function M.onUpdate()
         st.residentMax or 0, st.residentReserve or 0))
     end
     if st.shapeIndex and st.shapeIndex.state == "done" then
-      im.TextDisabled(string.format("Shape index: %d unique shapes from %d section files (read in %s)", st.shapeIndex.unique, st.shapeIndex.files, duration(st.shapeIndex.readSeconds)))
+      if st.shapeIndex.prebuilt then
+        im.TextDisabled(string.format("Shape index: %d unique shapes from index.json (%d sections, no section file read)", st.shapeIndex.unique, st.shapeIndex.files))
+      else
+        im.TextDisabled(string.format("Shape index: %d unique shapes from %d section files (read in %s)", st.shapeIndex.unique, st.shapeIndex.files, duration(st.shapeIndex.readSeconds)))
+      end
     end
     drawShapeCacheResults(st)
     local run = st.run

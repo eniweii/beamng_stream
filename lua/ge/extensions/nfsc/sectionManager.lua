@@ -130,12 +130,22 @@ for _, name in ipairs(ALWAYS_ON_OVERRIDES) do enabled[name] = true end
 
 local function streamer() return nfsc_sectionStreamer end
 
+-- One override, one name: a hex key the exporter could name (sections.json "overrideNames") becomes that name, so
+-- objects exported with the hex and objects exported with the name are the same entry in the list.
+local function canonName(name)
+  local hex = name:match("^0[xX](%x+)$")
+  if hex then name = "0x" .. hex:upper() end
+  local s = streamer()
+  local alias = s and s.getOverrideAlias and s.getOverrideAlias()
+  return alias and alias[name] or name
+end
+
 local function splitNames(value)
   local out = {}
   if type(value) ~= "string" then return out end
   for token in value:gmatch("[^,]+") do
     local name = token:match("^%s*(.-)%s*$")
-    if name ~= "" then out[#out + 1] = name end
+    if name ~= "" then out[#out + 1] = canonName(name) end
   end
   return out
 end
@@ -189,7 +199,7 @@ end
 local function loadOverrideIndex()
   local s = streamer()
   if not s or not s.getOverrideIndex then return end
-  for name, ids in pairs(s.getOverrideIndex()) do noteOverrideSections(name, ids) end
+  for name, ids in pairs(s.getOverrideIndex()) do noteOverrideSections(canonName(name), ids) end
   sortedDirty = true
 end
 
@@ -399,6 +409,7 @@ function M.isSceneClassEnabled(kind) return sceneClassOn[kind] == true end
 -- Overrides, mode, platform
 -- ---------------------------------------------------------------------------
 function M.setOverrideEnabled(name, on)
+  name = canonName(name)
   local was = enabled[name] == true
   local now = on and true or false
   if was == now then return end
@@ -419,7 +430,7 @@ function M.setOverrideEnabled(name, on)
   if extensions and extensions.hook then extensions.hook("onNfscOverrideChanged", name, now) end
 end
 
-function M.isOverrideEnabled(name) return enabled[name] == true end
+function M.isOverrideEnabled(name) return enabled[canonName(name)] == true end
 
 local function reapplyAllStreamed()
   for _, rec in pairs(tracked) do applyStreamed(rec) end
@@ -573,7 +584,7 @@ function M.onDeserialized(data)
   if type(data) ~= "table" then return end
   if type(data.enabled) == "table" then
     enabled = {}
-    for _, name in ipairs(data.enabled) do enabled[name] = true end
+    for _, name in ipairs(data.enabled) do enabled[canonName(name)] = true end
     local s = streamer()
     if s and s.refreshFilter then s.refreshFilter() end
   end

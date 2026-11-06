@@ -859,6 +859,16 @@ local function loadSections()
   if type(data) ~= "table" or type(data.sections) ~= "table" then
     error("could not read " .. levelRoot .. "/" .. SECTIONS_JSON)
   end
+  -- Hex key -> name of the override groups the exporter could name (the viewer writes it into sections.json). The
+  -- section manager folds a hex token and its name into one override with it, so no hash is computed in game.
+  hold.overrideAlias = {}
+  if type(data.overrideNames) == "table" then
+    for key, name in pairs(data.overrideNames) do
+      if type(key) == "string" and type(name) == "string" and name ~= "" then
+        hold.overrideAlias[(key:gsub("^0[xX](%x+)$", function(h) return "0x" .. h:upper() end))] = name
+      end
+    end
+  end
   for _, entry in ipairs(data.sections) do
     local id = tonumber(entry.id)
     local points = {}
@@ -930,6 +940,7 @@ local function loadStreamIndex()
     end
   end
   if type(data.overrides) == "table" then overrideIndex = data.overrides end
+  hold.prebuilt = type(data.shapeIndex) == "table" and data.shapeIndex or nil     -- optional, written by the builder
 end
 
 -- A section with streamed objects that is in no polygon and in no related list can never be reached through the camera
@@ -2097,6 +2108,7 @@ local function loadShapeList()
   for id in pairs(sectionIndex) do ids[#ids + 1] = id end
   table.sort(ids)
   if #ids == 0 then logMsg("D", "no streamed sections: the shape cache warm-up is off"); return end
+  if hold.usePrebuilt(ids) then return end
   warm.scan = { ids = ids, pos = 1, perSection = {}, counts = {}, terrain = {}, unique = 0, files = 0, failed = 0, records = 0,
                 ms = 0, runSeconds = 0, idle = 0, done = false }
   logMsg("D", "shape names are indexed from the %d section files while nothing is queued", #ids)
@@ -2215,6 +2227,41 @@ function hold.isAbsent(name)
   hold.absent[name] = res
   if res then hold.absentN = hold.absentN + 1 end
   return res
+end
+
+-- The builder writes the same index into index.json ("shapeIndex"), so the section files need no startup read. It is
+-- used only when it covers every streamed section and every position points at a name; otherwise the scan runs.
+function hold.usePrebuilt(ids)
+  local pre = hold.prebuilt
+  hold.prebuilt = nil
+  if type(pre) ~= "table" or pre.version ~= 1 or type(pre.names) ~= "table" or type(pre.bySection) ~= "table" then return false end
+  local names, total = pre.names, #pre.names
+  for i = 1, total do
+    if type(names[i]) ~= "string" or names[i] == "" then return false end
+  end
+  local bySection = {}
+  for i = 1, #ids do
+    local list = pre.bySection[tostring(ids[i])]
+    if type(list) ~= "table" then
+      logMsg("W", "shape index in index.json has no entry for section %s: the section files are scanned instead", tostring(ids[i]))
+      return false
+    end
+    for j = 1, #list do
+      if type(list[j]) ~= "number" or list[j] < 1 or list[j] > total or list[j] % 1 ~= 0 then return false end
+    end
+    bySection[ids[i]] = list
+  end
+  local terrainN = 0
+  if type(pre.terrain) == "table" then
+    for _, name in ipairs(pre.terrain) do
+      if type(name) == "string" and not warm.terrain[name] then warm.terrain[name], terrainN = true, terrainN + 1 end
+    end
+  end
+  warm.names, warm.total, warm.bySection, warm.loaded, warm.terrainN = names, total, bySection, total > 0, terrainN
+  warm.scan = { ids = ids, pos = #ids + 1, perSection = {}, counts = {}, terrain = {}, unique = total, files = 0, failed = 0,
+                records = tonumber(pre.records) or 0, ms = 0, runSeconds = 0, idle = 0, done = true, prebuilt = true }
+  logMsg("D", "shape index read from index.json: %d unique shapes, %d sections, no section file was read", total, #ids)
+  return true
 end
 
 -- The section files are read once, one per idle frame within shapeIndexBudgetShare, and every shapeName is collected.
@@ -3479,6 +3526,7 @@ end
 
 -- name -> list of section IDs, straight from the builder's index
 function M.getOverrideIndex() return overrideIndex end
+function M.getOverrideAlias() return hold.overrideAlias or {} end        -- hex key -> override name, from sections.json
 
 -- 1101 -> "1101 (K01)": letter index above the last two digits, section number below
 function M.sectionIDToDisplayName(id)
@@ -3820,7 +3868,7 @@ function M.getShapeIndexStatus()
   local sc = warm.scan
   if not sc then return { state = "none", unique = warm.total, files = 0, total = 0, failed = 0, records = 0, seconds = 0, readSeconds = 0 } end
   return {
-    state = sc.done and "done" or "scanning", files = sc.files, total = #sc.ids, failed = sc.failed, records = sc.records,
+    state = sc.done and "done" or "scanning", files = sc.prebuilt and #sc.ids or sc.files, total = #sc.ids, prebuilt = sc.prebuilt or false, failed = sc.failed, records = sc.records,
     unique = sc.unique, seconds = sc.runSeconds, readSeconds = sc.ms / 1000,
     etaSeconds = (not sc.done and sc.files > 0 and sc.runSeconds > 0) and (#sc.ids - sc.files) * sc.runSeconds / sc.files or nil,
   }
