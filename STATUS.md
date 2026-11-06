@@ -33,7 +33,7 @@
 
 ## Open
 - Measure collision refresh cost in game; Hyperlinked / MW decomp fidelity comparison.
-- Depth sections (overpass/tunnel variants) in `sections.json` and the lookup.
+- Depth sections (stacked): built, offline tests pass (`python tests/run_lua_tests_lupa.py --stacked`); not validated in BeamNG (name match and z axis, read the `stacked section:` log lines).
 - Studio UI restyle.
 - `lua/ge/extensions/nfscSectionStreamPrototype.lua` is superseded and can be removed by hand.
 - Animated objects (`_anim.dae`, sections 2400/2600): the invisible cause was the manager hiding

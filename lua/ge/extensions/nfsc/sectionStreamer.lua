@@ -409,6 +409,8 @@ local TUNING = {
   maxPendingRecords = 8192,       -- do not read another section file while this many records wait
   unloadCooldown = 2.0,           -- seconds a no-longer-wanted object survives
   containmentTolerance = 0.1,     -- GetDistanceOutside fallback, same as the game
+  elevationZOffset = -150.0,      -- added to the camera height before it is compared with the elevation triangles (stacked sections): every object of the level sits 150 higher than in the game
+  elevationTolerance = 0.0,       -- a triangle counts as below the camera when its surface is at most this far above it
   noSectionLookupInterval = 0.1,  -- seconds between lookups while outside every section
   forceCollisionNone = true,      -- collision policy for the first in-game test (see docs)
   verifyFirstN = 3,               -- log readbacks of the first N created objects
@@ -487,6 +489,10 @@ tun.schema = {
     desc = "Objects of the camera's section (and the one being streamed for) load before everything else. Off: strict distance bands only." },
   { key = "predictionEnabled", debug = true, group = "Look-ahead and order", label = "Look-ahead", kind = "bool",
     desc = "Switch to the section ahead before the camera crosses the border, from the camera velocity. On: the next section starts loading earlier. Off: loading starts at the border." },
+  { key = "elevationZOffset", debug = true, group = "Stacked sections", label = "Elevation height offset (m)", kind = "float", min = -500, max = 500,
+    desc = "Stacked sections (a tunnel under a road, an overpass): added to the camera height before it is compared with the elevation triangles of sections.json, which are in game heights. The level sits 150 higher than the game, so the default is -150; change it only if a drive shows the wrong section below or above a stacked spot." },
+  { key = "elevationTolerance", debug = true, group = "Stacked sections", label = "Elevation tolerance (m)", kind = "float", min = 0, max = 20,
+    desc = "Stacked sections: a triangle surface counts as below the camera when it is at most this far above it. Raise it a little if the camera sits right on the road surface and flickers between the two sections." },
   { key = "predictionSeconds", debug = true, group = "Look-ahead and order", label = "Look-ahead time (s)", kind = "float", min = 0, max = 5, requires = "predictionEnabled",
     desc = "How far ahead (in seconds of travel, capped at 100 m) the look-ahead point lies. Higher: earlier loading, more wrong guesses on turns. Lower: later switches." },
 
@@ -775,12 +781,70 @@ local function findSection(p)
   return bestID
 end
 
+-- ---------------------------------------------------------------------------
+-- Stacked (depth) sections. A drivable section with depth sections (a tunnel under a road, an overpass) is found in 2D
+-- like any other; the camera height then picks between it and its depth section (Hyperlinked / MW decomp rule): the
+-- elevation triangle that contains the camera in x/y and whose surface is the highest one at or below the camera
+-- height names the depth section with the same name, otherwise the base section stays. A depth section has a related
+-- list but no polygon and no stream data, so it lives here and not in `sections`.
+-- ---------------------------------------------------------------------------
+hold.stack = { depth = {}, byBase = {}, tris = {}, last = nil }
+
+function hold.baseOf(id)
+  local d = id and hold.stack.depth[id]
+  return d and d.base or id
+end
+
+function hold.relatedOf(id)
+  local s = id and sections[id]
+  if s then return s.related end
+  local d = id and hold.stack.depth[id]
+  return d and d.related or {}
+end
+
+function hold.hasSection(id)
+  return id ~= nil and (sections[id] ~= nil or hold.stack.depth[id] ~= nil)
+end
+
+local function triangleHit(t, x, y)
+  if x < t.minX or x > t.maxX or y < t.minY or y > t.maxY then return nil end
+  local a, b, c = t.a, t.b, t.c
+  local det = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y)
+  if math.abs(det) < 1e-9 then return nil end                      -- a vertical triangle has no surface
+  local l1 = ((b.y - c.y) * (x - c.x) + (c.x - b.x) * (y - c.y)) / det
+  local l2 = ((c.y - a.y) * (x - c.x) + (a.x - c.x) * (y - c.y)) / det
+  local l3 = 1 - l1 - l2
+  if l1 < 0 or l2 < 0 or l3 < 0 then return nil end
+  return l1 * a.z + l2 * b.z + l3 * c.z                            -- surface height under (x, y)
+end
+
+-- The section to stream for when the camera is in the base section `baseID` at height z.
+function hold.resolveDepth(baseID, p, z)
+  local list = baseID and hold.stack.byBase[baseID]
+  if not list or not z then return baseID end
+  local limit = z + TUNING.elevationZOffset + TUNING.elevationTolerance
+  local bestZ, bestName
+  for i = 1, #hold.stack.tris do
+    local t = hold.stack.tris[i]
+    local sz = triangleHit(t, p.x, p.y)
+    if sz and sz <= limit and (bestZ == nil or sz > bestZ) then bestZ, bestName = sz, t.name end
+  end
+  local chosen = baseID
+  if bestName then
+    for i = 1, #list do
+      if list[i].name == bestName then chosen = list[i].id; break end
+    end
+  end
+  hold.stack.last = { base = baseID, triangle = bestName, surface = bestZ, z = z, chosen = chosen }
+  return chosen
+end
+
 local function computeActive(id)
   local set = {}
   for always in pairs(hold.always.set) do set[always] = true end   -- always-loaded sections stay active everywhere
-  if id and sections[id] then
+  if id and hold.hasSection(id) then
     set[id] = true
-    for _, rel in ipairs(sections[id].related) do set[rel] = true end
+    for _, rel in ipairs(hold.relatedOf(id)) do set[rel] = true end
   end
   return set
 end
@@ -790,6 +854,7 @@ end
 -- ---------------------------------------------------------------------------
 local function loadSections()
   sections, sectionOrder = {}, {}
+  hold.stack.depth, hold.stack.byBase, hold.stack.tris, hold.stack.last = {}, {}, {}, nil
   local data = jsonReadFile(levelRoot .. "/" .. SECTIONS_JSON)
   if type(data) ~= "table" or type(data.sections) ~= "table" then
     error("could not read " .. levelRoot .. "/" .. SECTIONS_JSON)
@@ -810,9 +875,42 @@ local function loadSections()
         boundsMax = { x = entry.boundsMax[1], y = entry.boundsMax[2] },
       }
       sectionOrder[#sectionOrder + 1] = id
+      for _, d in ipairs(entry.depth or {}) do
+        local did, dname = tonumber(d.id), tonumber(d.name)
+        if did and not sections[did] then
+          local drel = {}
+          for _, r in ipairs(d.related or {}) do
+            local n = tonumber(r)
+            if n then drel[#drel + 1] = n end
+          end
+          local rec = { id = did, base = id, name = dname, related = drel }
+          hold.stack.depth[did] = rec
+          local list = hold.stack.byBase[id] or {}
+          list[#list + 1] = rec
+          hold.stack.byBase[id] = list
+        end
+      end
     end
   end
   table.sort(sectionOrder)
+  for _, poly in ipairs(data.elevationPolys or {}) do
+    local name, pts = tonumber(poly.name), poly.points
+    if name and type(pts) == "table" and #pts >= 3 then
+      local v = {}
+      for i = 1, 3 do v[i] = { x = pts[i][1], y = pts[i][2], z = pts[i][3] or 0 } end
+      hold.stack.tris[#hold.stack.tris + 1] = {
+        name = name, a = v[1], b = v[2], c = v[3],
+        minX = math.min(v[1].x, v[2].x, v[3].x), maxX = math.max(v[1].x, v[2].x, v[3].x),
+        minY = math.min(v[1].y, v[2].y, v[3].y), maxY = math.max(v[1].y, v[2].y, v[3].y),
+      }
+    end
+  end
+  local nDepth, nBase = 0, 0
+  for _ in pairs(hold.stack.depth) do nDepth = nDepth + 1 end
+  for _ in pairs(hold.stack.byBase) do nBase = nBase + 1 end
+  if nDepth > 0 then
+    logMsg("I", "stacked sections: %d depth sections under %d base sections, %d elevation triangles", nDepth, nBase, #hold.stack.tris)
+  end
 end
 
 local function loadStreamIndex()
@@ -841,9 +939,12 @@ function hold.findAlways()
   for _, sec in pairs(sections) do
     for _, rel in ipairs(sec.related) do reached[rel] = true end
   end
+  for _, d in pairs(hold.stack.depth) do
+    for _, rel in ipairs(d.related) do reached[rel] = true end
+  end
   local set, list = {}, {}
   for id, entry in pairs(sectionIndex) do
-    if not sections[id] and not reached[id] then set[id], list[#list + 1] = true, id end
+    if not hold.hasSection(id) and not reached[id] then set[id], list[#list + 1] = true, id end
   end
   table.sort(list)
   hold.always = { set = set, list = list, dirty = true }
@@ -1420,9 +1521,9 @@ end
 -- Current section first, then its related sections by priority band; the static order breaks ties.
 local function rebuildFeedOrder()
   feedOrder = {}
-  if currentSectionID and sections[currentSectionID] then
+  if currentSectionID and hold.hasSection(currentSectionID) then
     local entries = {}
-    for rank, id in ipairs(sections[currentSectionID].related) do
+    for rank, id in ipairs(hold.relatedOf(currentSectionID)) do
       if id ~= currentSectionID then entries[#entries + 1] = { id = id, tier = loadingPriority(id), rank = rank } end
     end
     table.sort(entries, function(a, b)
@@ -1460,6 +1561,8 @@ local function isUrgent(item)
   for i = 1, #ids do
     local id = ids[i]
     if id == currentSectionID or id == cameraSectionID then return true end
+    local d = hold.stack.depth[currentSectionID or 0]
+    if d and id == d.base then return true end
   end
   return false
 end
@@ -1569,7 +1672,7 @@ end
 -- Terrain of every active section first, then the rest; sections in feedOrder (current first).
 local function feedQueue()
   if pendingCount <= 0 or #feedOrder == 0 then return end
-  if TUNING.currentSectionFirst and currentSectionID and sections[currentSectionID] then                       -- the camera's section and the streamed one, terrain first
+  if TUNING.currentSectionFirst and currentSectionID and hold.hasSection(currentSectionID) then                       -- the camera's section and the streamed one, terrain first
     for _, tierName in ipairs({ "terrain", "rest" }) do
       feedTier(currentSectionID, tierName)
       if cameraSectionID and cameraSectionID ~= currentSectionID then feedTier(cameraSectionID, tierName) end
@@ -1905,14 +2008,25 @@ local function setCurrentSection(newID)
   priorityTimer = 0
   rebuildFeedOrder()
   for i = 1, #feedOrder do queueSectionRead(feedOrder[i]) end      -- current section first
-  hold.sectionEntered(newID)
-  hold.visitChange(oldID, newID)
+  local newBase, oldBase = hold.baseOf(newID), hold.baseOf(oldID)
+  if newBase ~= oldBase then                                       -- the shape cache follows base sections only
+    hold.sectionEntered(newBase)
+    hold.visitChange(oldBase, newBase)
+  end
+  local st = hold.stack.last
+  if st and st.chosen == newID and (hold.stack.depth[newID or 0] or hold.stack.depth[oldID or 0] or hold.stack.byBase[newID or 0]) then
+    logMsg("I", "stacked section: %s -> %s (base %s), elevation triangle %s, surface height %s, camera height %.2f (offset %.2f)",
+      tostring(oldID), tostring(newID), tostring(st.base), tostring(st.triangle),
+      st.surface and string.format("%.2f", st.surface) or "none", st.z, TUNING.elevationZOffset)
+  end
   hook("onNfscSectionChanged", newID, oldID)
 end
 
-local function sectionAt(p)
-  if currentSectionID and isInSection(p, currentSectionID) then return currentSectionID end
-  return findSection(p)
+local function sectionAt(p, z)
+  local cur = hold.baseOf(currentSectionID)
+  local base
+  if cur and isInSection(p, cur) then base = cur else base = findSection(p) end
+  return hold.resolveDepth(base, p, z)
 end
 
 -- Tracks the camera velocity and picks the section to stream for: the one under the camera, or,
@@ -1937,14 +2051,14 @@ local function updateCamera(dt)
   end
 
   scratch.x, scratch.y = cam.x, cam.y
-  local actual = sectionAt(scratch)
+  local actual = sectionAt(scratch, cam.z)
   local desired = actual
   predictedSectionID = nil
   local speed = math.sqrt(camVel.x * camVel.x + camVel.y * camVel.y)
   if TUNING.predictionEnabled and speed >= TUNING.predictionMinSpeed then
     local reach = math.min(TUNING.predictionSeconds, TUNING.predictionMaxDistance / speed)
     aheadPoint.x, aheadPoint.y = cam.x + camVel.x * reach, cam.y + camVel.y * reach
-    predictedSectionID = sectionAt(aheadPoint)
+    predictedSectionID = sectionAt(aheadPoint, cam.z)
   end
   if predictedSectionID and predictedSectionID ~= actual then
     if aheadCandidate == predictedSectionID then
@@ -2409,10 +2523,10 @@ function hold.islandChange(seen, id)
 end
 
 function hold.nearRebuild()
-  hold.nearFor, hold.nearAt = currentSectionID, totalTime
+  hold.nearFor, hold.nearAt = hold.baseOf(currentSectionID), totalTime
   hold.rings, hold.ringPos, hold.pass, hold.secIdx, hold.shpIdx = {}, 1, warm.terrainN > 0 and 1 or 2, 1, 1
   local adj = hold.adjacency()
-  local root = currentSectionID
+  local root = hold.baseOf(currentSectionID)
   if not (root and adj[root]) then root = hold.nearestSection(adj) end
   if not root then return end
   local seen, ring, rings, minId = { [root] = true }, { root }, {}, root
@@ -2469,7 +2583,7 @@ function hold.nextShape()
     if hold.cursor <= warm.total then return nil, "scan" end
     return nil, hold.deferredN > 0 and "heavy" or "done"
   end
-  if hold.nearFor ~= currentSectionID or (hold.islandId == nil and #hold.rings == 0 and totalTime - hold.nearAt > 1.0) then
+  if hold.nearFor ~= hold.baseOf(currentSectionID) or (hold.islandId == nil and #hold.rings == 0 and totalTime - hold.nearAt > 1.0) then
     hold.nearRebuild()
   end
   local steps = 0
@@ -3360,8 +3474,7 @@ function M.getActiveSections()
 end
 
 function M.getRelatedSections(id)
-  local s = sections[id]
-  return s and s.related or {}
+  return hold.relatedOf(id)
 end
 
 -- name -> list of section IDs, straight from the builder's index

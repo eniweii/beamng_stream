@@ -212,7 +212,7 @@ position and scale line.
 ## Not done / not validated
 - Collision: default `off`. The cost of a `settled` refresh in BeamNG is unmeasured; whether it hitches
   is the open question.
-- Depth sections (stacked sections) are not in `sections.json`; see `docs/FIDELITY.md`.
+- Depth sections (stacked sections): `sections.json` carries `depth: [{id, name, related}]` on a drivable section and a top-level `elevationPolys` list (`{name, points: [[x,y,z] x3]}`). The streamer finds the base section in 2D, then picks the elevation triangle that contains the camera in x/y and whose surface is the highest one at or below the camera height; its name picks the depth section with the same name, otherwise the base stays. The depth section's own `related` list is the active set (it has no polygon and no stream data). The shape cache follows base sections only. Settings (Debug, group Stacked sections): `elevationZOffset`, `elevationTolerance`. Each switch logs one `stacked section:` line with the triangle, its surface height and the camera height. Still to confirm in game: depth name against triangle name, and the z axis.
 - Nothing here has run in BeamNG. To verify: camera tracking, transitions, recreation after
   cooldown, setField behaviour for `rotationEuler`, negative scale and `collisionType`, object counts
   and memory over a long drive, `onDeserialized` (the hook name is assumed), and the imgui calls.
