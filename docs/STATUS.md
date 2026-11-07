@@ -75,7 +75,7 @@
   writes), wanting it again revives it (unhide only), and only when the pool is at `residentMax` the oldest
   resting object is evicted and its shell reused; `residentReserve` keeps free shells ready by evicting in idle
   frames. Live tuning: sliders and checkboxes in the manager panel (applied at once through `setTuning`),
-  presets (`startup`, A, B, C; since 0017 three per creation mode) saved in `lua/carbon_stream/tuning_presets.json` (`startup` is applied at
+  presets (`startup`, A, B, C; since 0017 three per creation mode) saved in `lua/streamer/tuning_presets.json` (`startup` is applied at
   initialize), `resetTuning`, `printTuning`. Dropped sections: a section change that happens before the
   previous one settled is logged (`dropped section <id>: left after ...`), counted in the panel and in
   `getStatus` (`droppedSections`, `droppedObjects`, `droppedLast`). Not validated in game. Still pending:

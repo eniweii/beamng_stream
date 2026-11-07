@@ -3,6 +3,8 @@
     python tests/run_lua_tests_lupa.py            # LuaJIT 2.1, the runtime BeamNG uses (default when lupa has it)
     python tests/run_lua_tests_lupa.py --lua54    # the newer Lua bundled with lupa
     python tests/run_lua_tests_lupa.py --stacked  # the stacked (depth) sections tests
+    python tests/run_lua_tests_lupa.py --host     # the level host and component tests
+    python tests/run_lua_tests_lupa.py --env      # the environment components (roughness, sway, texture animation)
 
 LuaJIT matters: it refuses a function with more than 60 upvalues and has a few other limits that newer Lua
 versions do not have. A file that only loads under Lua 5.4 does not load in the game.
@@ -34,7 +36,7 @@ def main():
     build_stream_pack(REPO / "tests" / "fixtures" / "level_sample", out, "levels/nfsc")
     lua_dir = tmp / "game" / "levels" / "nfsc" / "lua"
     lua_dir.mkdir(parents=True)
-    shutil.copytree(out / "runtime" / "levels" / "nfsc" / "lua" / "carbon_stream", lua_dir / "carbon_stream")
+    shutil.copytree(out / "runtime" / "levels" / "nfsc" / "lua" / "streamer", lua_dir / "streamer")
     stacked = "--stacked" in sys.argv                 # stacked (depth) sections: own fixture and test file
     shutil.copy(REPO / "tests" / "fixtures" / ("sections_stacked.json" if stacked else "sections.json"), lua_dir / "sections.json")
 
@@ -44,7 +46,7 @@ def main():
     lua.execute('function os.exit(c) error("EXIT:" .. tostring(c)) end')
     lua.execute('arg = {[0] = "t", [1] = "%s", [2] = "%s"}' % (REPO.as_posix(), (tmp / "game").as_posix()))
     try:
-        lua.execute((REPO / "tests" / "lua" / ("test_stacked_sections.lua" if stacked else "test_sections.lua")).read_text(encoding="utf-8"))
+        lua.execute((REPO / "tests" / "lua" / ("test_env_components.lua" if "--env" in sys.argv else "test_level_host.lua" if "--host" in sys.argv else "test_stacked_sections.lua" if stacked else "test_sections.lua")).read_text(encoding="utf-8"))
     except Exception as exc:  # the test file ends with os.exit
         print("ended:", str(exc).splitlines()[0][-80:])
     shutil.rmtree(tmp, ignore_errors=True)

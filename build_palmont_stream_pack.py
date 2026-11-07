@@ -290,8 +290,8 @@ def build_stream_pack(
     Writes, under `out_path` only:
       * patches/<relative path>  - copies of the items files with the moved records removed
         (every other line is byte-identical to the source);
-      * runtime/<vfs>/lua/carbon_stream/sections/<id>.json - one file per section;
-      * runtime/<vfs>/lua/carbon_stream/index.json and build_report.json.
+      * runtime/<vfs>/lua/streamer/sections/<id>.json - one file per section;
+      * runtime/<vfs>/lua/streamer/index.json and build_report.json.
     The source files are never modified.
     """
     out_root = out_path.expanduser().resolve()
@@ -370,7 +370,7 @@ def build_stream_pack(
         verification.append({"file": rel, "records": records_here, "kept": kept_records, "moved": moved_here})
         moved_records += moved_here
 
-    runtime_root = out_root / "runtime" / Path(vfs_root) / "lua" / "carbon_stream"
+    runtime_root = out_root / "runtime" / Path(vfs_root) / "lua" / "streamer"
     sections_root = runtime_root / "sections"
     sections_root.mkdir(parents=True, exist_ok=True)
 
@@ -394,7 +394,7 @@ def build_stream_pack(
                    "objectCount": len(records), "objects": records}
         atomic_write(sections_root / filename,
                      json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
-        index_sections.append({"id": section_id, "file": f"lua/carbon_stream/sections/{filename}",
+        index_sections.append({"id": section_id, "file": f"lua/streamer/sections/{filename}",
                                "count": len(records)})
         total_section_copies += len(records)
         unique_keys.update(record["__streamKey"] for record in records)

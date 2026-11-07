@@ -10,8 +10,8 @@
 --
 -- Files (all under <levelRoot>/):
 --   lua/sections.json                   {sections = {{id, points, boundsMin, boundsMax, related}}}
---   lua/carbon_stream/index.json        written by the builder (schemaVersion 2)
---   lua/carbon_stream/sections/<id>.json  one whole file per section
+--   lua/streamer/index.json        written by the builder (schemaVersion 2)
+--   lua/streamer/sections/<id>.json  one whole file per section
 --
 -- Events (coarse, via extensions.hook):
 --   onNfscStreamerInitialized()
@@ -47,7 +47,7 @@
 -- sections first, then every shape once, widest use first; one holder per frame within shapeCacheBudgetShare) and the
 -- need channel (a create wants a shape nobody holds: the holder loads it first, inside the create's frame budget and
 -- first-use caps, then the shell retargets to an already loaded shape). Heavy shapes (measured over shapeCacheHeavyMs,
--- kept in lua/carbon_stream/shape_costs.json) wait for a still camera, a RAM floor can pause the lane (needs a memory
+-- kept in lua/streamer/shape_costs.json) wait for a still camera, a RAM floor can pause the lane (needs a memory
 -- source: M.setMemoryProvider), a shape without a file is flagged absent, a failed hold is retried once. Placeholders
 -- (hidden holders on the dot, shapeCachePlaceholders) are built ahead of the fill cursor so a hold only changes a shapeName.
 -- Shape names are found at runtime: hold.scanUpdate reads every section file in idle time and builds the index (unique
@@ -76,7 +76,7 @@
 --              free ahead of time, evicting in idle frames. The cap bounds RAM; nothing else grows with the level.
 --
 -- Tuning: M.getTuning / setTuning / resetTuning change the values live; savePreset / loadPreset / listPresets /
--- deletePreset keep named sets in lua/carbon_stream/tuning_presets.json (a preset called "startup" is applied
+-- deletePreset keep named sets in lua/streamer/tuning_presets.json (a preset called "startup" is applied
 -- at initialize). The manager panel has sliders for the common ones.
 
 local M = {}
@@ -568,8 +568,8 @@ end
 
 local SUPPORTED_SCHEMA = 2
 local SECTIONS_JSON = "lua/sections.json"
-local STREAM_INDEX = "lua/carbon_stream/index.json"
-local PRESETS_JSON = "lua/carbon_stream/tuning_presets.json"
+local STREAM_INDEX = "lua/streamer/index.json"
+local PRESETS_JSON = "lua/streamer/tuning_presets.json"
 local SKIP_CAP = 4096
 
 local RESERVED = {
@@ -2174,7 +2174,7 @@ end
 -- held again (heavy shapes wait for a still camera). A shape not in it has never been measured.
 function hold.costLoad()
   hold.cost, hold.costDirty = {}, 0
-  local ok, data = pcall(jsonReadFile, levelRoot .. "/lua/carbon_stream/shape_costs.json")
+  local ok, data = pcall(jsonReadFile, levelRoot .. "/lua/streamer/shape_costs.json")
   if ok and type(data) == "table" then
     for name, ms in pairs(data) do
       if type(name) == "string" and type(ms) == "number" then hold.cost[name] = ms end
@@ -2185,7 +2185,7 @@ end
 function hold.costSave()
   if hold.costDirty <= 0 then return end
   hold.costDirty = 0
-  local ok, err = pcall(jsonWriteFile, levelRoot .. "/lua/carbon_stream/shape_costs.json", hold.cost, true)
+  local ok, err = pcall(jsonWriteFile, levelRoot .. "/lua/streamer/shape_costs.json", hold.cost, true)
   if not ok then logMsg("W", "shape cache: the cost table could not be written: %s", tostring(err)) end
 end
 

@@ -124,7 +124,7 @@ flowchart LR
   initialize) and three slots A/B/C per creation mode (`getModePresets`, `loadModePreset`, `saveModePreset`,
   `deleteModePreset`; stored as `<mode>/<slot>`; an unsaved slot holds untested factory values, a flat A/B/C from
   before counts for the mode it was saved in). Presets saved with `shellBuildBudgetMs` / `cacheWarmCheckMs` are
-  converted to shares. File: `lua/carbon_stream/tuning_presets.json`.
+  converted to shares. File: `lua/streamer/tuning_presets.json`.
   The panel (`nfsc_sectionManagerUi`) builds its Tuning section from the schema: only the settings that do something
   in the active creation mode (and whose parent switch is on) are shown, every row has a tooltip, changed rows are
   starred, shares are edited in ms of the main budget, typed values beyond a slider's range are accepted, and the last
@@ -260,3 +260,27 @@ position and scale line.
   terrain no longer precedes the current section's other objects. `getStatus()` has
   `queuedUrgentCount` and `promotedObjectCount`; a section change that promoted objects logs
   `moved ahead of the leftovers`.
+
+## Level host and components
+
+The level folder holds only `mainLevel.lua` and its data. The streamer and section manager stay core and
+independent. `nfsc_levelHost` (`lua/ge/extensions/nfsc/levelHost.lua`) sits beside them and runs the level
+components in `lua/ge/extensions/nfsc/components/` through one interface: `init(ctx)`,
+`onSectionChanged(new, old)`, `onUpdate(dtReal, dtSim)`, `getStatus()`, `describeZone(id)`, `shutdown()`.
+
+- The host reads `lua/zones.json` once and gives every component the zone list and the shared height offset
+  (150, `lua/components/host.json` can change it). Each component reads its own config from
+  `lua/components/<name>.json`.
+- Section changes arrive through the streamer's `onNfscSectionChanged` hook; the streamer knows nothing of the host.
+- The host also tells which zones (every type in zones.json, after the elevation gate) the camera is in; the
+  Section Manager shows that line when the host is loaded and works without it.
+- Components are loaded with `loadfile`, not registered as engine extensions, so only the host receives the engine's `onUpdate`.
+- The host is the streamer's one object-event listener. Components that define `onObjectCreated(key, obj, item)`,
+  `onObjectDeleted(key)` or `onStreamerReset()` receive those events; a failing handler is logged once and never
+  switches the component off.
+- Components with state that must survive an engine Lua reload define `serialize()` / `restore(data)`; the host
+  collects them in `onSerialize` and hands them back after the next `initialize`.
+- Components: `soundZones`, `volumeScatter`, `roughness`, `sway`, `textureAnimation` (the last three were the
+  environment manager; their settings live in the panel, no config files). Panel: `nfsc_levelHostUi`.
+- Tests: `python tests/run_lua_tests_lupa.py --host` (host, sound zones, scatter) and `--env` (roughness, sway,
+  texture animation, panel smoke test).

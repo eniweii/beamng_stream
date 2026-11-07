@@ -1117,7 +1117,7 @@ do
   eq(s.getTuning().maxCreatesPerFrame, 16, "30d: reset restores the defaults")
   eq(s.getTuning().frameBudgetMs, 16.0, "30d: all of them")
   -- values of the wrong type or unknown keys are ignored
-  H.files["levels/nfsc/lua/carbon_stream/tuning_presets.json"].bad = { maxCreatesPerFrame = "many", nonsense = 5, logSettle = false }
+  H.files["levels/nfsc/lua/streamer/tuning_presets.json"].bad = { maxCreatesPerFrame = "many", nonsense = 5, logSettle = false }
   check(s.loadPreset("bad"), "30e: a damaged preset still loads")
   eq(s.getTuning().maxCreatesPerFrame, 16, "30e: wrong type ignored")
   eq(s.getTuning().logSettle, false, "30e: valid key applied")
@@ -1268,7 +1268,7 @@ do
   eq(s.getCreationMode(), "resident", "35f: creationMode through setTuning goes through the mode switch")
   check(s.getStatus().residentActive, "35f: so the resident state is really on")
   -- presets saved before the budgets became shares are converted
-  H.files["levels/nfsc/lua/carbon_stream/tuning_presets.json"] = { old = { frameBudgetMs = 20, shellBuildBudgetMs = 5, cacheWarmCheckMs = 2 } }
+  H.files["levels/nfsc/lua/streamer/tuning_presets.json"] = { old = { frameBudgetMs = 20, shellBuildBudgetMs = 5, cacheWarmCheckMs = 2 } }
   check(s.loadPreset("old"), "35g: an old preset loads")
   eq(s.getTuning().shellBuildBudgetShare, 0.25, "35g: shell build ms became a share of the budget saved with it")
   eq(s.getTuning().cacheWarmCheckShare, 0.1, "35g: so did the warm-up check")
@@ -1301,7 +1301,7 @@ do
   check(not s.loadModePreset("shells", "Z"), "36g: unknown slot refused")
   check(not s.loadModePreset("nope", "A"), "36g: unknown mode refused")
   -- a flat A from before belongs to the mode it was saved in
-  H.files["levels/nfsc/lua/carbon_stream/tuning_presets.json"] = { A = { creationMode = "resident", residentMax = 777 } }
+  H.files["levels/nfsc/lua/streamer/tuning_presets.json"] = { A = { creationMode = "resident", residentMax = 777 } }
   eq(s.getModePresets("resident")[1].source, "saved", "36h: an old flat slot shows in its own mode")
   eq(s.getModePresets("current")[1].source, "factory", "36h: not in the others")
   s.loadModePreset("resident", "A")

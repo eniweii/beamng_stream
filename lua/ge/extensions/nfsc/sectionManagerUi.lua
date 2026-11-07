@@ -503,6 +503,11 @@ function M.onUpdate()
   local st = nfsc_sectionManager.getStatus()
   im.Text("Current section: " .. tostring(st.currentSectionName or "none"))
   tip("The section the camera is in. Objects load when an active section wants them: the current section and the one the camera is heading into. Objects no active section wants any more are deactivated, and only evicted when the pool is full.")
+  local host = nfsc_levelHost                                    -- optional: the section manager works without the level host
+  if host and host.describeCurrentZones then
+    im.Text("Zones: " .. host.describeCurrentZones())
+    tip("The zones of zones.json (tunnels, overpasses, garages, streamer prediction and the rest) the camera is inside, after the zone's elevation gate. A zone with a sound shows its ambience.")
+  end
   drawPreload(st)
   if im.Button(nfsc_sectionStreamer.isSuspended() and "Resume streaming" or "Suspend streaming") then
     nfsc_sectionStreamer.setSuspended(not nfsc_sectionStreamer.isSuspended())

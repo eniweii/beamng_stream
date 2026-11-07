@@ -1,0 +1,714 @@
+{
+  "version": 1,
+  "notes": "speedU/speedV are cycles per second after the S/T swap and invert settings. stepSecondsEstimate is an estimate: the timestep decode is not confirmed. Timestep-driven entries (speed 0 and 0) have no direction decoded yet.",
+  "animations": {
+    "0x0A48DBE0": {
+      "name": "SGN_CASINOKONOP",
+      "fps": 2,
+      "timeBase": "World",
+      "frames": [
+        {
+          "hash": "0xBDDAA271",
+          "path": "/levels/nfsc/assets/textures/0xBDDAA271_SGN_CASINOKONOPALOGO_ANIM001.dds"
+        },
+        {
+          "hash": "0xBDDAA272",
+          "path": "/levels/nfsc/assets/textures/0xBDDAA272_SGN_CASINOKONOPALOGO_ANIM002.dds"
+        },
+        {
+          "hash": "0xBDDAA273",
+          "path": "/levels/nfsc/assets/textures/0xBDDAA273_SGN_CASINOKONOPALOGO_ANIM003.dds"
+        },
+        {
+          "hash": "0xBDDAA274",
+          "path": "/levels/nfsc/assets/textures/0xBDDAA274_SGN_CASINOKONOPALOGO_ANIM004.dds"
+        }
+      ]
+    },
+    "0x0B0D476B": {
+      "name": "SGN_BOBSLOBSTER",
+      "fps": 5,
+      "timeBase": "World",
+      "frames": [
+        {
+          "hash": "0x7317661C",
+          "path": "/levels/nfsc/assets/textures/0x7317661C_SGN_BOBSLOBSTER_ANIM001.dds"
+        },
+        {
+          "hash": "0x7317661D",
+          "path": "/levels/nfsc/assets/textures/0x7317661D_SGN_BOBSLOBSTER_ANIM002.dds"
+        }
+      ]
+    },
+    "0x0EAF56AD": {
+      "name": "SGN_CASINOSILVE",
+      "fps": 3,
+      "timeBase": "World",
+      "frames": [
+        {
+          "hash": "0x73D7461E",
+          "path": "/levels/nfsc/assets/textures/0x73D7461E_SGN_CASINOSILVERTON_ANIM001.dds"
+        },
+        {
+          "hash": "0x73D7461F",
+          "path": "/levels/nfsc/assets/textures/0x73D7461F_SGN_CASINOSILVERTON_ANIM002.dds"
+        },
+        {
+          "hash": "0x73D74620",
+          "path": "/levels/nfsc/assets/textures/0x73D74620_SGN_CASINOSILVERTON_ANIM003.dds"
+        },
+        {
+          "hash": "0x73D74621",
+          "path": "/levels/nfsc/assets/textures/0x73D74621_SGN_CASINOSILVERTON_ANIM004.dds"
+        },
+        {
+          "hash": "0x73D74622",
+          "path": "/levels/nfsc/assets/textures/0x73D74622_SGN_CASINOSILVERTON_ANIM005.dds"
+        },
+        {
+          "hash": "0x73D74623",
+          "path": "/levels/nfsc/assets/textures/0x73D74623_SGN_CASINOSILVERTON_ANIM006.dds"
+        },
+        {
+          "hash": "0x73D74624",
+          "path": "/levels/nfsc/assets/textures/0x73D74624_SGN_CASINOSILVERTON_ANIM007.dds"
+        },
+        {
+          "hash": "0x73D74625",
+          "path": "/levels/nfsc/assets/textures/0x73D74625_SGN_CASINOSILVERTON_ANIM008.dds"
+        },
+        {
+          "hash": "0x73D74626",
+          "path": "/levels/nfsc/assets/textures/0x73D74626_SGN_CASINOSILVERTON_ANIM009.dds"
+        },
+        {
+          "hash": "0x73D7463E",
+          "path": "/levels/nfsc/assets/textures/0x73D7463E_SGN_CASINOSILVERTON_ANIM010.dds"
+        },
+        {
+          "hash": "0x73D7463F",
+          "path": "/levels/nfsc/assets/textures/0x73D7463F_SGN_CASINOSILVERTON_ANIM011.dds"
+        },
+        {
+          "hash": "0x73D74640",
+          "path": "/levels/nfsc/assets/textures/0x73D74640_SGN_CASINOSILVERTON_ANIM012.dds"
+        }
+      ]
+    },
+    "0x1AE2447C": {
+      "name": "BLINKINGLIGHTS_",
+      "fps": 8,
+      "timeBase": "World",
+      "frames": [
+        {
+          "hash": "0xED30958D",
+          "path": "/levels/nfsc/assets/textures/0xED30958D_BLINKINGLIGHTS_ANIM001.dds"
+        },
+        {
+          "hash": "0xED30958E",
+          "path": "/levels/nfsc/assets/textures/0xED30958E_BLINKINGLIGHTS_ANIM002.dds"
+        }
+      ]
+    },
+    "0x1F84E077": {
+      "name": "SGN_ANIMATEDTV_",
+      "fps": 1,
+      "timeBase": "World",
+      "frames": [
+        {
+          "hash": "0x9C1AF3A8",
+          "path": "/levels/nfsc/assets/textures/0x9C1AF3A8_SGN_ANIMATEDTV_ANIM001.dds"
+        },
+        {
+          "hash": "0x9C1AF3A9",
+          "path": "/levels/nfsc/assets/textures/0x9C1AF3A9_SGN_ANIMATEDTV_ANIM002.dds"
+        },
+        {
+          "hash": "0x9C1AF3AA",
+          "path": "/levels/nfsc/assets/textures/0x9C1AF3AA_SGN_ANIMATEDTV_ANIM003.dds"
+        }
+      ]
+    },
+    "0x3A8224F8": {
+      "name": "SGN_CASINO4ACES",
+      "fps": 3,
+      "timeBase": "World",
+      "frames": [
+        {
+          "hash": "0x57887489",
+          "path": "/levels/nfsc/assets/textures/0x57887489_SGN_CASINO4ACESLITES_ANIM001.dds"
+        },
+        {
+          "hash": "0x5788748A",
+          "path": "/levels/nfsc/assets/textures/0x5788748A_SGN_CASINO4ACESLITES_ANIM002.dds"
+        },
+        {
+          "hash": "0x5788748B",
+          "path": "/levels/nfsc/assets/textures/0x5788748B_SGN_CASINO4ACESLITES_ANIM003.dds"
+        }
+      ]
+    },
+    "0x3CD3E865": {
+      "name": "SGN_LUCKYTOP_AN",
+      "fps": 4,
+      "timeBase": "World",
+      "frames": [
+        {
+          "hash": "0xEF631CD6",
+          "path": "/levels/nfsc/assets/textures/0xEF631CD6_SGN_LUCKYTOP_ANIM001.dds"
+        },
+        {
+          "hash": "0xEF631CD7",
+          "path": "/levels/nfsc/assets/textures/0xEF631CD7_SGN_LUCKYTOP_ANIM002.dds"
+        },
+        {
+          "hash": "0xEF631CD8",
+          "path": "/levels/nfsc/assets/textures/0xEF631CD8_SGN_LUCKYTOP_ANIM003.dds"
+        },
+        {
+          "hash": "0xEF631CD9",
+          "path": "/levels/nfsc/assets/textures/0xEF631CD9_SGN_LUCKYTOP_ANIM004.dds"
+        }
+      ]
+    },
+    "0x43C8FEAE": {
+      "name": "SFX_FLAREGREEN_",
+      "fps": 4,
+      "timeBase": "World",
+      "frames": [
+        {
+          "hash": "0x9A707A7F",
+          "path": "/levels/nfsc/assets/textures/0x9A707A7F_SFX_FLAREGREEN_ANIM001.dds"
+        },
+        {
+          "hash": "0x9A707A80",
+          "path": "/levels/nfsc/assets/textures/0x9A707A80_SFX_FLAREGREEN_ANIM002.dds"
+        }
+      ]
+    },
+    "0x4970BFF7": {
+      "name": "SGN_CASINO4ACES",
+      "fps": 2,
+      "timeBase": "World",
+      "frames": [
+        {
+          "hash": "0x7CB4A328",
+          "path": "/levels/nfsc/assets/textures/0x7CB4A328_SGN_CASINO4ACES_ANIM001.dds"
+        },
+        {
+          "hash": "0x7CB4A329",
+          "path": "/levels/nfsc/assets/textures/0x7CB4A329_SGN_CASINO4ACES_ANIM002.dds"
+        }
+      ]
+    },
+    "0x551674CD": {
+      "name": "SGN_A_PETSHOP_A",
+      "fps": 2,
+      "timeBase": "World",
+      "frames": [
+        {
+          "hash": "0x8563303E",
+          "path": "/levels/nfsc/assets/textures/0x8563303E_SGN_A_PETSHOP_ANIM001.dds"
+        },
+        {
+          "hash": "0x8563303F",
+          "path": "/levels/nfsc/assets/textures/0x8563303F_SGN_A_PETSHOP_ANIM002.dds"
+        }
+      ]
+    },
+    "0x5B1861C9": {
+      "name": "SGN_CASINOLEPRO",
+      "fps": 2,
+      "timeBase": "World",
+      "frames": [
+        {
+          "hash": "0xD9B7CBBA",
+          "path": "/levels/nfsc/assets/textures/0xD9B7CBBA_SGN_CASINOLEPRO_ANIM001.dds"
+        },
+        {
+          "hash": "0xD9B7CBBB",
+          "path": "/levels/nfsc/assets/textures/0xD9B7CBBB_SGN_CASINOLEPRO_ANIM002.dds"
+        }
+      ]
+    },
+    "0x5CDC338B": {
+      "name": "SGN_HORSE_ANIM",
+      "fps": 8,
+      "timeBase": "World",
+      "frames": [
+        {
+          "hash": "0x9BA05E3C",
+          "path": "/levels/nfsc/assets/textures/0x9BA05E3C_SGN_HORSE_ANIM001.dds"
+        },
+        {
+          "hash": "0x9BA05E3D",
+          "path": "/levels/nfsc/assets/textures/0x9BA05E3D_SGN_HORSE_ANIM002.dds"
+        },
+        {
+          "hash": "0x9BA05E3E",
+          "path": "/levels/nfsc/assets/textures/0x9BA05E3E_SGN_HORSE_ANIM003.dds"
+        },
+        {
+          "hash": "0x9BA05E3F",
+          "path": "/levels/nfsc/assets/textures/0x9BA05E3F_SGN_HORSE_ANIM004.dds"
+        }
+      ]
+    },
+    "0x7BF38F30": {
+      "name": "SFX_FLARE_SMALL",
+      "fps": 1,
+      "timeBase": "World",
+      "frames": [
+        {
+          "hash": "0x299853C1",
+          "path": "/levels/nfsc/assets/textures/0x299853C1_SFX_FLARE_SMALLRED_ANIM001.dds"
+        },
+        {
+          "hash": "0x299853C2",
+          "path": "/levels/nfsc/assets/textures/0x299853C2_SFX_FLARE_SMALLRED_ANIM002.dds"
+        }
+      ]
+    },
+    "0x7D6CB0D4": {
+      "name": "SGN_DRAGONCAFE_",
+      "fps": 4,
+      "timeBase": "World",
+      "frames": [
+        {
+          "hash": "0xF6E3C2E5",
+          "path": "/levels/nfsc/assets/textures/0xF6E3C2E5_SGN_DRAGONCAFE_ANIM001.dds"
+        },
+        {
+          "hash": "0xF6E3C2E6",
+          "path": "/levels/nfsc/assets/textures/0xF6E3C2E6_SGN_DRAGONCAFE_ANIM002.dds"
+        },
+        {
+          "hash": "0xF6E3C2E7",
+          "path": "/levels/nfsc/assets/textures/0xF6E3C2E7_SGN_DRAGONCAFE_ANIM003.dds"
+        },
+        {
+          "hash": "0xF6E3C2E8",
+          "path": "/levels/nfsc/assets/textures/0xF6E3C2E8_SGN_DRAGONCAFE_ANIM004.dds"
+        }
+      ]
+    },
+    "0x922A63CC": {
+      "name": "SGN_CASINOCB_AN",
+      "fps": 2,
+      "timeBase": "World",
+      "frames": [
+        {
+          "hash": "0x90A432DD",
+          "path": "/levels/nfsc/assets/textures/0x90A432DD_SGN_CASINOCB_ANIM001.dds"
+        },
+        {
+          "hash": "0x90A432DE",
+          "path": "/levels/nfsc/assets/textures/0x90A432DE_SGN_CASINOCB_ANIM002.dds"
+        }
+      ]
+    },
+    "0x9BE1E714": {
+      "name": "SGN_CASINOKONOP",
+      "fps": 2,
+      "timeBase": "World",
+      "frames": [
+        {
+          "hash": "0x9AF85125",
+          "path": "/levels/nfsc/assets/textures/0x9AF85125_SGN_CASINOKONOPATEXT_ANIM001.dds"
+        },
+        {
+          "hash": "0x9AF85126",
+          "path": "/levels/nfsc/assets/textures/0x9AF85126_SGN_CASINOKONOPATEXT_ANIM002.dds"
+        }
+      ]
+    },
+    "0xA4994F5C": {
+      "name": "SGN_CASINOLUCKY",
+      "fps": 3,
+      "timeBase": "World",
+      "frames": [
+        {
+          "hash": "0x357E346D",
+          "path": "/levels/nfsc/assets/textures/0x357E346D_SGN_CASINOLUCKYDI_ANIM001.dds"
+        },
+        {
+          "hash": "0x357E346E",
+          "path": "/levels/nfsc/assets/textures/0x357E346E_SGN_CASINOLUCKYDI_ANIM002.dds"
+        },
+        {
+          "hash": "0x357E346F",
+          "path": "/levels/nfsc/assets/textures/0x357E346F_SGN_CASINOLUCKYDI_ANIM003.dds"
+        },
+        {
+          "hash": "0x357E3470",
+          "path": "/levels/nfsc/assets/textures/0x357E3470_SGN_CASINOLUCKYDI_ANIM004.dds"
+        }
+      ]
+    },
+    "0xEE53CEFF": {
+      "name": "TRS_WATERA_ANIM",
+      "fps": 15,
+      "timeBase": "World",
+      "frames": [
+        {
+          "hash": "0x22F5B530",
+          "path": "/levels/nfsc/assets/textures/0x22F5B530_TRS_WATERA_ANIM001.dds"
+        },
+        {
+          "hash": "0x22F5B531",
+          "path": "/levels/nfsc/assets/textures/0x22F5B531_TRS_WATERA_ANIM002.dds"
+        },
+        {
+          "hash": "0x22F5B532",
+          "path": "/levels/nfsc/assets/textures/0x22F5B532_TRS_WATERA_ANIM003.dds"
+        },
+        {
+          "hash": "0x22F5B533",
+          "path": "/levels/nfsc/assets/textures/0x22F5B533_TRS_WATERA_ANIM004.dds"
+        },
+        {
+          "hash": "0x22F5B534",
+          "path": "/levels/nfsc/assets/textures/0x22F5B534_TRS_WATERA_ANIM005.dds"
+        },
+        {
+          "hash": "0x22F5B535",
+          "path": "/levels/nfsc/assets/textures/0x22F5B535_TRS_WATERA_ANIM006.dds"
+        },
+        {
+          "hash": "0x22F5B536",
+          "path": "/levels/nfsc/assets/textures/0x22F5B536_TRS_WATERA_ANIM007.dds"
+        },
+        {
+          "hash": "0x22F5B537",
+          "path": "/levels/nfsc/assets/textures/0x22F5B537_TRS_WATERA_ANIM008.dds"
+        },
+        {
+          "hash": "0x22F5B538",
+          "path": "/levels/nfsc/assets/textures/0x22F5B538_TRS_WATERA_ANIM009.dds"
+        },
+        {
+          "hash": "0x22F5B550",
+          "path": "/levels/nfsc/assets/textures/0x22F5B550_TRS_WATERA_ANIM010.dds"
+        },
+        {
+          "hash": "0x22F5B551",
+          "path": "/levels/nfsc/assets/textures/0x22F5B551_TRS_WATERA_ANIM011.dds"
+        },
+        {
+          "hash": "0x22F5B552",
+          "path": "/levels/nfsc/assets/textures/0x22F5B552_TRS_WATERA_ANIM012.dds"
+        },
+        {
+          "hash": "0x22F5B553",
+          "path": "/levels/nfsc/assets/textures/0x22F5B553_TRS_WATERA_ANIM013.dds"
+        }
+      ]
+    },
+    "0xF80EB155": {
+      "name": "SGN_SEOTECH_ANI",
+      "fps": 1,
+      "timeBase": "World",
+      "frames": [
+        {
+          "hash": "0x068C7FC6",
+          "path": "/levels/nfsc/assets/textures/0x068C7FC6_SGN_SEOTECH_ANIM001.dds"
+        },
+        {
+          "hash": "0x068C7FC7",
+          "path": "/levels/nfsc/assets/textures/0x068C7FC7_SGN_SEOTECH_ANIM002.dds"
+        },
+        {
+          "hash": "0x068C7FC8",
+          "path": "/levels/nfsc/assets/textures/0x068C7FC8_SGN_SEOTECH_ANIM003.dds"
+        },
+        {
+          "hash": "0x068C7FC9",
+          "path": "/levels/nfsc/assets/textures/0x068C7FC9_SGN_SEOTECH_ANIM004.dds"
+        },
+        {
+          "hash": "0x068C7FCA",
+          "path": "/levels/nfsc/assets/textures/0x068C7FCA_SGN_SEOTECH_ANIM005.dds"
+        },
+        {
+          "hash": "0x068C7FCB",
+          "path": "/levels/nfsc/assets/textures/0x068C7FCB_SGN_SEOTECH_ANIM006.dds"
+        }
+      ]
+    }
+  },
+  "materials": {
+    "BLINKINGLIGHTS_ANIM001_WorldShader": [
+      {
+        "texture": "0xED30958D",
+        "type": "frame_swap",
+        "animation": "0x1AE2447C",
+        "frame": 0,
+        "stage": 0
+      }
+    ],
+    "SFX_FLARE_SMALLRED_ANIM001_WorldShader": [
+      {
+        "texture": "0x299853C1",
+        "type": "frame_swap",
+        "animation": "0x7BF38F30",
+        "frame": 0,
+        "stage": 0
+      }
+    ],
+    "SFX_FLARE_YELLOWBLINKING_01_WorldShader": [
+      {
+        "texture": "0xF919D922",
+        "type": "snap",
+        "rawTimeStep": -2048,
+        "stepSecondsEstimate": 0.3125763125763126,
+        "timestepDriven": true,
+        "direction": null,
+        "stage": 0
+      }
+    ],
+    "SFX_FLAREGREEN_ANIM001_WorldShader": [
+      {
+        "texture": "0x9A707A7F",
+        "type": "frame_swap",
+        "animation": "0x43C8FEAE",
+        "frame": 0,
+        "stage": 0
+      }
+    ],
+    "SFX_NEONSCROLL_01_D_WorldShader": [
+      {
+        "texture": "0xDE456BB1",
+        "type": "smooth",
+        "rawTimeStep": -2457,
+        "stepSecondsEstimate": 0.375,
+        "timestepDriven": true,
+        "direction": null,
+        "stage": 0
+      }
+    ],
+    "SFX_TRACKBARRIERNEONARROW_01_D_WorldShader": [
+      {
+        "texture": "0xABEEC0C9",
+        "type": "snap",
+        "rawTimeStep": -1638,
+        "stepSecondsEstimate": 0.25,
+        "timestepDriven": true,
+        "direction": null,
+        "stage": 0
+      }
+    ],
+    "SGN_A_CPG_03_WorldShader": [
+      {
+        "texture": "0x31521602",
+        "type": "snap",
+        "rawTimeStep": -409,
+        "stepSecondsEstimate": 0.062423687423687424,
+        "timestepDriven": true,
+        "direction": null,
+        "stage": 0
+      }
+    ],
+    "SGN_A_OLDCASINOTICKER_01_D_WorldShader": [
+      {
+        "texture": "0x01CEBF47",
+        "type": "smooth",
+        "rawTimeStep": 819,
+        "stepSecondsEstimate": 0.125,
+        "timestepDriven": true,
+        "direction": null,
+        "stage": 0
+      }
+    ],
+    "SGN_A_PETSHOP_ANIM001_WorldShader": [
+      {
+        "texture": "0x8563303E",
+        "type": "frame_swap",
+        "animation": "0x551674CD",
+        "frame": 0,
+        "stage": 0
+      }
+    ],
+    "SGN_ANIMATEDTV_ANIM001_WorldShader": [
+      {
+        "texture": "0x9C1AF3A8",
+        "type": "frame_swap",
+        "animation": "0x1F84E077",
+        "frame": 0,
+        "stage": 0
+      }
+    ],
+    "SGN_ANIMATEDTV_ANIM002_WorldShader": [
+      {
+        "texture": "0x9C1AF3A9",
+        "type": "frame_swap",
+        "animation": "0x1F84E077",
+        "frame": 1,
+        "stage": 0
+      }
+    ],
+    "SGN_ANIMATEDTV_ANIM003_WorldShader": [
+      {
+        "texture": "0x9C1AF3AA",
+        "type": "frame_swap",
+        "animation": "0x1F84E077",
+        "frame": 2,
+        "stage": 0
+      }
+    ],
+    "SGN_BOBSLOBSTER_ANIM001_WorldShader": [
+      {
+        "texture": "0x7317661C",
+        "type": "frame_swap",
+        "animation": "0x0B0D476B",
+        "frame": 0,
+        "stage": 0
+      }
+    ],
+    "SGN_CASINO4ACES_ANIM001_WorldShader": [
+      {
+        "texture": "0x7CB4A328",
+        "type": "frame_swap",
+        "animation": "0x4970BFF7",
+        "frame": 0,
+        "stage": 0
+      }
+    ],
+    "SGN_CASINO4ACESLITES_ANIM001_WorldShader": [
+      {
+        "texture": "0x57887489",
+        "type": "frame_swap",
+        "animation": "0x3A8224F8",
+        "frame": 0,
+        "stage": 0
+      }
+    ],
+    "SGN_CASINOCB_ANIM001_WorldShader": [
+      {
+        "texture": "0x90A432DD",
+        "type": "frame_swap",
+        "animation": "0x922A63CC",
+        "frame": 0,
+        "stage": 0
+      }
+    ],
+    "SGN_CASINOKONOPALOGO_ANIM001_WorldShader": [
+      {
+        "texture": "0xBDDAA271",
+        "type": "frame_swap",
+        "animation": "0x0A48DBE0",
+        "frame": 0,
+        "stage": 0
+      }
+    ],
+    "SGN_CASINOKONOPATEXT_ANIM001_WorldShader": [
+      {
+        "texture": "0x9AF85125",
+        "type": "frame_swap",
+        "animation": "0x9BE1E714",
+        "frame": 0,
+        "stage": 0
+      }
+    ],
+    "SGN_CASINOLEPRO_ANIM001_WorldShader": [
+      {
+        "texture": "0xD9B7CBBA",
+        "type": "frame_swap",
+        "animation": "0x5B1861C9",
+        "frame": 0,
+        "stage": 0
+      }
+    ],
+    "SGN_CASINOLUCKYDI_ANIM001_WorldShader": [
+      {
+        "texture": "0x357E346D",
+        "type": "frame_swap",
+        "animation": "0xA4994F5C",
+        "frame": 0,
+        "stage": 0
+      }
+    ],
+    "SGN_CASINOSILVERTON_ANIM001_WorldShader": [
+      {
+        "texture": "0x73D7461E",
+        "type": "frame_swap",
+        "animation": "0x0EAF56AD",
+        "frame": 0,
+        "stage": 0
+      }
+    ],
+    "SGN_DRAGONCAFE_ANIM001_WorldShader": [
+      {
+        "texture": "0xF6E3C2E5",
+        "type": "frame_swap",
+        "animation": "0x7D6CB0D4",
+        "frame": 0,
+        "stage": 0
+      }
+    ],
+    "SGN_DRAGONCAFE_ANIM004_WorldShader": [
+      {
+        "texture": "0xF6E3C2E8",
+        "type": "frame_swap",
+        "animation": "0x7D6CB0D4",
+        "frame": 3,
+        "stage": 0
+      }
+    ],
+    "SGN_HORSE_ANIM001_WorldShader": [
+      {
+        "texture": "0x9BA05E3C",
+        "type": "frame_swap",
+        "animation": "0x5CDC338B",
+        "frame": 0,
+        "stage": 0
+      }
+    ],
+    "SGN_LUCKYTOP_ANIM001_WorldShader": [
+      {
+        "texture": "0xEF631CD6",
+        "type": "frame_swap",
+        "animation": "0x3CD3E865",
+        "frame": 0,
+        "stage": 0
+      }
+    ],
+    "SGN_SEOTECH_ANIM001_WorldShader": [
+      {
+        "texture": "0x068C7FC6",
+        "type": "frame_swap",
+        "animation": "0xF80EB155",
+        "frame": 0,
+        "stage": 0
+      }
+    ],
+    "SGN_TNTICKERSCROLL_01_D_WorldShader": [
+      {
+        "texture": "0xDA463E9C",
+        "type": "smooth",
+        "rawTimeStep": 1638,
+        "stepSecondsEstimate": 0.25,
+        "timestepDriven": true,
+        "direction": null,
+        "stage": 0
+      }
+    ],
+    "TRS_WATERA_ANIM001_WATER": [
+      {
+        "texture": "0x22F5B530",
+        "type": "frame_swap",
+        "animation": "0xEE53CEFF",
+        "frame": 0,
+        "stage": 0
+      }
+    ],
+    "TRS_WATERA_ANIM001_WorldShader": [
+      {
+        "texture": "0x22F5B530",
+        "type": "frame_swap",
+        "animation": "0xEE53CEFF",
+        "frame": 0,
+        "stage": 0
+      }
+    ]
+  }
+}

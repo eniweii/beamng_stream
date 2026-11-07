@@ -3,4 +3,5 @@ README.md
 docs/FIDELITY.md
 /output
 /__pycache__
-/levels/nfsc/lua/carbon_stream/sections/
+/levels/nfsc/lua/streamer/sections/
+/oldstreamer/level/oldstreamerbackup/lua/carbon_stream/sections/

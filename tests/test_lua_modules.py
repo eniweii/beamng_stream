@@ -21,7 +21,7 @@ class LuaModuleTests(unittest.TestCase):
             build_stream_pack(FIXTURES / "level_sample", out, "levels/nfsc")
             level_lua = tmp_path / "game" / "levels" / "nfsc" / "lua"
             level_lua.mkdir(parents=True)
-            shutil.copytree(out / "runtime" / "levels" / "nfsc" / "lua" / "carbon_stream", level_lua / "carbon_stream")
+            shutil.copytree(out / "runtime" / "levels" / "nfsc" / "lua" / "streamer", level_lua / "streamer")
             shutil.copy(FIXTURES / "sections.json", level_lua / "sections.json")
             result = subprocess.run([LUA, str(REPO / "tests" / "lua" / "test_sections.lua"), str(REPO),
                                      str(tmp_path / "game")], capture_output=True, text=True)

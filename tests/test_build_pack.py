@@ -8,7 +8,7 @@ from pathlib import Path
 from build_palmont_stream_pack import analyze_source, build_stream_pack, read_item_file
 
 FIXTURE = Path(__file__).parent / "fixtures" / "level_sample"
-RUNTIME = Path("runtime") / "levels" / "nfsc" / "lua" / "carbon_stream"
+RUNTIME = Path("runtime") / "levels" / "nfsc" / "lua" / "streamer"
 
 
 def tree_hashes(root: Path) -> dict[str, str]:
