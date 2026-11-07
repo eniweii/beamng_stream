@@ -23,8 +23,8 @@ from typing import Any, Callable
 
 ITEMS_FILENAME = "items.level.json"
 SCHEMA_VERSION = 2
-SHAPE_INDEX_VERSION = 1   # optional "shapeIndex" block of index.json; the streamer scans the section files without it
 ProgressCallback = Callable[[str], None] | None
+
 
 def parse_section_ids(value: Any) -> list[int]:
     """Accept numeric IDs, comma-separated IDs, or arrays of those forms."""
@@ -88,51 +88,6 @@ def read_item_file(path: Path) -> tuple[list[tuple[str, dict[str, Any]]], str, b
             raise ValueError(f"{path}:{line_no}: each non-empty line must contain a JSON object")
         records.append((raw, obj))
     return records, newline, has_trailing_newline
-
-
-def is_terrain_item(item: dict[str, Any]) -> bool:
-    """Same test as isTerrainItem in sectionStreamer.lua: identity matrix or chopped roadway flag."""
-    flags = item.get("instanceFlags")
-    if not isinstance(flags, str):
-        return False
-    flags = re.sub(r"[^0-9a-z]", "", flags.lower())
-    return "identitymatrix" in flags or "choppedroadway" in flags
-
-
-def build_shape_index(section_objects: dict[int, list[dict[str, Any]]]) -> dict[str, Any]:
-    """The shape index the streamer would otherwise build by reading every section file at startup.
-
-    Same rules as hold.scanUpdate / hold.scanFinish in sectionStreamer.lua: a shape is counted once per section,
-    names are ordered widest use first (then by name), bySection holds the sorted 1-based positions in `names`.
-    """
-    counts: Counter[str] = Counter()
-    per_section: dict[int, list[str]] = {}
-    terrain: set[str] = set()
-    records = 0
-    for section_id in sorted(section_objects):
-        seen: set[str] = set()
-        ordered: list[str] = []
-        for item in section_objects[section_id]:
-            shape = item.get("shapeName")
-            if not isinstance(shape, str) or shape == "":
-                continue
-            records += 1
-            if is_terrain_item(item):
-                terrain.add(shape)
-            if shape not in seen:
-                seen.add(shape)
-                ordered.append(shape)
-                counts[shape] += 1
-        per_section[section_id] = ordered
-    names = sorted(counts, key=lambda name: (-counts[name], name))
-    position = {name: i for i, name in enumerate(names, 1)}
-    return {
-        "version": SHAPE_INDEX_VERSION,
-        "records": records,
-        "names": names,
-        "terrain": sorted(terrain),
-        "bySection": {str(sid): sorted(position[n] for n in per_section[sid]) for sid in sorted(per_section)},
-    }
 
 
 def is_streamable(item: dict[str, Any]) -> tuple[bool, list[int]]:
@@ -412,11 +367,7 @@ def build_stream_pack(
         "overrides": {name: sorted(ids) for name, ids in sorted(override_sections.items())},
         "sections": index_sections,
     }
-    shape_index = build_shape_index(section_objects)
-    # The shape index is one compact line: pretty-printed it would put every position on its own line.
-    index_text = json.dumps(index, indent=2, ensure_ascii=False)
-    shape_text = json.dumps(shape_index, ensure_ascii=False, separators=(",", ":"))
-    atomic_write(runtime_root / "index.json", index_text[:-2] + ',\n  "shapeIndex": ' + shape_text + "\n}\n")
+    atomic_write(runtime_root / "index.json", json.dumps(index, indent=2, ensure_ascii=False) + "\n")
 
     stats = {
         **index,
@@ -427,8 +378,6 @@ def build_stream_pack(
         "patchedItemFiles": len(sources),
         "verification": {"ok": True, "files": verification},
         "sectionCount": len(section_objects),
-        "shapeIndex": {"uniqueShapes": len(shape_index["names"]), "terrainShapes": len(shape_index["terrain"]),
-                       "records": shape_index["records"]},
         "multiSectionRecords": total_section_copies - moved_records,
         "overrideNames": dict(sorted(override_objects.items())),
         "instanceFlags": dict(sorted(flag_objects.items())),

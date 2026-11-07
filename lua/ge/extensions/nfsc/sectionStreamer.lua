@@ -50,7 +50,7 @@
 -- kept in lua/streamer/shape_costs.json) wait for a still camera, a RAM floor can pause the lane (needs a memory
 -- source: M.setMemoryProvider), a shape without a file is flagged absent, a failed hold is retried once. Placeholders
 -- (hidden holders on the dot, shapeCachePlaceholders) are built ahead of the fill cursor so a hold only changes a shapeName.
--- Shape names are found at runtime: hold.scanUpdate reads every section file in idle time and builds the index (unique
+-- Shape names are found at runtime: hold.scanUpdate reads every section file at level load (nothing streams until it is done; indexBeforeStreaming) and builds the index (unique
 -- shapes, widest use first, per-section lists, terrain shapes) from the shapeName fields. No extra file is needed.
 --
 -- Always-loaded sections: a section that has streamed objects but is in no polygon of sections.json and in no
@@ -386,6 +386,7 @@ local TUNING = {
   testingMode = false,            -- detailed bounded frame/stall diagnostics; off by default
   logEmptySettles = false,        -- true: also print the settled line of a change that created nothing
   shapeIndexBudgetShare = 0.25,   -- share of frameBudgetMs per frame for reading section files into the shape index (one file always goes)
+  indexBeforeStreaming = true,    -- at level load, read every section file into the shape index first; nothing is streamed until it is done
   shapeCache = true,              -- Preload: hold the meshes of the section island you are in with one hidden object each (see header)
   shapeCacheMax = 100000,         -- Max meshes to save: most holders kept (the fill stops there; holders of other islands are evicted first)
   shapeCacheAlways = false,       -- Preload always: fill while the camera moves too (default: only when it is still)
@@ -528,6 +529,8 @@ tun.schema = {
     desc = "How long the camera must stand (under 0.5 m/s) before heavy shapes are held. Higher: heavy shapes wait for a longer stop." },
   { key = "shapeCachePlaceholders", debug = true, group = "Shape cache", label = "Placeholder shells ahead", kind = "int", min = 0, max = 2000, requires = "shapeCache",
     desc = "Hidden holders on the dot built ahead of the fill. A hold takes one and only changes its shapeName, so the object cost is paid earlier, in idle frames. 0 = create the holder with the hold." },
+  { key = "indexBeforeStreaming", debug = true, group = "Shape cache", label = "Index before streaming", kind = "bool", requires = "shapeCache",
+    desc = "On: at level load the section files are read into the shape index first, using the whole frame budget, and no scenery is streamed until that is done. Off: the index is read only while nothing is queued, which never happens while a section is still streaming." },
   { key = "shapeIndexBudgetShare", debug = true, group = "Shape cache", label = "Shape index share", kind = "share", min = 0.05, max = 4, requires = "shapeCache",
     desc = "Part of the frame budget the shape index may spend per frame reading section files (one file is always read per idle frame). Higher: the index is ready sooner, with longer idle frames." },
 
@@ -940,11 +943,15 @@ local function loadStreamIndex()
     end
   end
   if type(data.overrides) == "table" then overrideIndex = data.overrides end
-  hold.prebuilt = type(data.shapeIndex) == "table" and data.shapeIndex or nil     -- optional, written by the builder
 end
 
 -- A section with streamed objects that is in no polygon and in no related list can never be reached through the camera
 -- (the section table comes from the level's own data): it is always loaded. Needs loadSections and loadStreamIndex first.
+-- More always-loaded sections than this is not a level design, it is a sections.json whose related lists lost the
+-- sections that have scenery but no boundary (an export made with the wrong or a partial stream file): streaming them
+-- all would load hundreds of sections around the camera. They are then left unloaded and the Section Manager says so.
+local ALWAYS_LOADED_MAX = 16
+
 function hold.findAlways()
   local reached = {}
   for _, sec in pairs(sections) do
@@ -958,7 +965,12 @@ function hold.findAlways()
     if not hold.hasSection(id) and not reached[id] then set[id], list[#list + 1] = true, id end
   end
   table.sort(list)
-  hold.always = { set = set, list = list, dirty = true }
+  if #list > ALWAYS_LOADED_MAX then
+    logMsg("W", "%d sections have scenery but are in no section polygon and in no related list of sections.json: it looks incomplete, so they are not loaded as always-loaded. Export sections.json again with the full stream file loaded", #list)
+    hold.always = { set = {}, list = {}, dirty = true, suspect = #list }
+    return
+  end
+  hold.always = { set = set, list = list, dirty = true, suspect = 0 }
   for _, id in ipairs(list) do
     logMsg("I", "always-loaded section %d: %d objects, in no section polygon and in no related list", id, sectionIndex[id].count or 0)
   end
@@ -2108,10 +2120,9 @@ local function loadShapeList()
   for id in pairs(sectionIndex) do ids[#ids + 1] = id end
   table.sort(ids)
   if #ids == 0 then logMsg("D", "no streamed sections: the shape cache warm-up is off"); return end
-  if hold.usePrebuilt(ids) then return end
   warm.scan = { ids = ids, pos = 1, perSection = {}, counts = {}, terrain = {}, unique = 0, files = 0, failed = 0, records = 0,
                 ms = 0, runSeconds = 0, idle = 0, done = false }
-  logMsg("D", "shape names are indexed from the %d section files while nothing is queued", #ids)
+  logMsg("D", "shape names are indexed from the %d section files %s", #ids, TUNING.indexBeforeStreaming and "first, before any section is streamed" or "while nothing is queued")
 end
 
 -- ---------------------------------------------------------------------------
@@ -2229,41 +2240,6 @@ function hold.isAbsent(name)
   return res
 end
 
--- The builder writes the same index into index.json ("shapeIndex"), so the section files need no startup read. It is
--- used only when it covers every streamed section and every position points at a name; otherwise the scan runs.
-function hold.usePrebuilt(ids)
-  local pre = hold.prebuilt
-  hold.prebuilt = nil
-  if type(pre) ~= "table" or pre.version ~= 1 or type(pre.names) ~= "table" or type(pre.bySection) ~= "table" then return false end
-  local names, total = pre.names, #pre.names
-  for i = 1, total do
-    if type(names[i]) ~= "string" or names[i] == "" then return false end
-  end
-  local bySection = {}
-  for i = 1, #ids do
-    local list = pre.bySection[tostring(ids[i])]
-    if type(list) ~= "table" then
-      logMsg("W", "shape index in index.json has no entry for section %s: the section files are scanned instead", tostring(ids[i]))
-      return false
-    end
-    for j = 1, #list do
-      if type(list[j]) ~= "number" or list[j] < 1 or list[j] > total or list[j] % 1 ~= 0 then return false end
-    end
-    bySection[ids[i]] = list
-  end
-  local terrainN = 0
-  if type(pre.terrain) == "table" then
-    for _, name in ipairs(pre.terrain) do
-      if type(name) == "string" and not warm.terrain[name] then warm.terrain[name], terrainN = true, terrainN + 1 end
-    end
-  end
-  warm.names, warm.total, warm.bySection, warm.loaded, warm.terrainN = names, total, bySection, total > 0, terrainN
-  warm.scan = { ids = ids, pos = #ids + 1, perSection = {}, counts = {}, terrain = {}, unique = total, files = 0, failed = 0,
-                records = tonumber(pre.records) or 0, ms = 0, runSeconds = 0, idle = 0, done = true, prebuilt = true }
-  logMsg("D", "shape index read from index.json: %d unique shapes, %d sections, no section file was read", total, #ids)
-  return true
-end
-
 -- The section files are read once, one per idle frame within shapeIndexBudgetShare, and every shapeName is collected.
 -- Result: every unique shape once (widest use first) and per-section positions.
 function hold.scanFinish(sc)
@@ -2292,15 +2268,24 @@ function hold.scanFinish(sc)
 end
 
 -- Returns how many section files it read this frame.
+-- True while the level-load indexing runs: the section files are read first and nothing is streamed meanwhile.
+function hold.indexFirst()
+  local sc = warm.scan
+  return TUNING.indexBeforeStreaming and TUNING.shapeCache and sc ~= nil and not sc.done and initialized and not suspended
+end
+
 function hold.scanUpdate(dt)
   local sc = warm.scan
   if not sc or sc.done or suspended or not initialized then return 0 end
   if not TUNING.shapeCache then return 0 end                         -- nobody needs the names yet
-  if not M.isIdle() then sc.idle = 0; return 0 end                   -- the section streamer goes first
-  sc.idle = sc.idle + dt
-  if sc.idle < ((TUNING.shapeCacheAtLoad and not hold.started) and 0 or TUNING.shapeCacheIdleSeconds) then return 0 end
+  local first = TUNING.indexBeforeStreaming
+  if not first then
+    if not M.isIdle() then sc.idle = 0; return 0 end                 -- the section streamer goes first
+    sc.idle = sc.idle + dt
+    if sc.idle < ((TUNING.shapeCacheAtLoad and not hold.started) and 0 or TUNING.shapeCacheIdleSeconds) then return 0 end
+  end
   sc.runSeconds = sc.runSeconds + dt
-  local limit = fb.cap(TUNING.shapeIndexBudgetShare)
+  local limit = first and TUNING.frameBudgetMs or fb.cap(TUNING.shapeIndexBudgetShare)
   local started, n = os.clock(), 0
   while sc.pos <= #sc.ids do
     if n > 0 and (os.clock() - started) * 1000 >= limit then break end
@@ -3744,6 +3729,7 @@ function M.getStatus()
     currentSectionID = currentSectionID,
     currentSectionName = M.sectionIDToDisplayName(currentSectionID),
     activeSectionCount = active,
+    alwaysLoadedCount = #hold.always.list, alwaysSuspectCount = hold.always.suspect or 0,
     liveObjectCount = liveCount,
     queuedObjectCount = (lqTail - lqHead + 1) + (pqTail - pqHead + 1),
     queuedUrgentCount = pqTail - pqHead + 1, promotedObjectCount = promotedTotal,
@@ -3868,7 +3854,7 @@ function M.getShapeIndexStatus()
   local sc = warm.scan
   if not sc then return { state = "none", unique = warm.total, files = 0, total = 0, failed = 0, records = 0, seconds = 0, readSeconds = 0 } end
   return {
-    state = sc.done and "done" or "scanning", files = sc.prebuilt and #sc.ids or sc.files, total = #sc.ids, prebuilt = sc.prebuilt or false, failed = sc.failed, records = sc.records,
+    state = sc.done and "done" or "scanning", files = sc.files, total = #sc.ids, failed = sc.failed, records = sc.records,
     unique = sc.unique, seconds = sc.runSeconds, readSeconds = sc.ms / 1000,
     etaSeconds = (not sc.done and sc.files > 0 and sc.runSeconds > 0) and (#sc.ids - sc.files) * sc.runSeconds / sc.files or nil,
   }
@@ -3950,23 +3936,25 @@ function M.onUpdate(dtReal)
   end
   local t0 = os.clock()
   local readStageStart = diag and diag:beginStage("section_reads")
-  local readCount = processSectionReads(diag)
+  local indexing = hold.indexFirst()                    -- level-load indexing: reads, feeding, deletes and creates wait for it
+  local readCount = indexing and 0 or processSectionReads(diag)
   if diag then diag:endStage("section_reads", readStageStart, readCount) end
   local queuedBefore = queueLength()
   local queueStageStart = diag and diag:beginStage("queue_feed")
-  feedQueue()
+  if not indexing then feedQueue() end
   local queuedAfter = queueLength()
   local queuedCount = math.max(0, queuedAfter - queuedBefore)
   if diag then diag:endStage("queue_feed", queueStageStart, queuedCount) end
   local t1 = os.clock()
   fb.record("reads", (t1 - t0) * 1000)
   local unloadStageStart = diag and diag:beginStage("unloads")
-  local unloadCount = processUnloads(diag)               -- deletes first, within their share of the frame budget
+  local unloadCount = indexing and 0 or processUnloads(diag)               -- deletes first, within their share of the frame budget
   if diag then diag:endStage("unloads", unloadStageStart, unloadCount) end
   local t2 = os.clock()
   fb.record("deletes", (t2 - t1) * 1000)
   local loadStageStart = diag and diag:beginStage("loads")
-  local createCount, skippedCount = processLoads(diag)  -- creates use what is left of it
+  local createCount, skippedCount = 0, 0
+  if not indexing then createCount, skippedCount = processLoads(diag) end  -- creates use what is left of it
   if diag then diag:endStage("loads", loadStageStart, createCount); diag.current.workSkipped = skippedCount end
   local t3 = os.clock()
   fb.record("creates", (t3 - t2) * 1000)

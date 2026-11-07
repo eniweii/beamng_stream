@@ -24,8 +24,7 @@ local function fresh(tuning, keepFilter)
   local manager = H.load(repo .. "/lua/ge/extensions/nfsc/sectionManager.lua")
   nfsc_sectionManager = manager
   H.loaded = { streamer, manager }
-  -- the product defaults are resident mode with the preload on; the older tests keep the plain mode they were written for
-  streamer.setTuning({ maxFirstUsePerFrame = 1000, creationMode = "current", shapeCache = false, debugLog = true })   -- the first-use cap has its own test (21); the old tests read the detailed logs
+  streamer.setTuning({ maxFirstUsePerFrame = 1000, indexBeforeStreaming = false, creationMode = "current" })   -- the first-use cap has its own test (21); level-load indexing has test 1b
   if tuning then streamer.setTuning(tuning) end
   manager.onExtensionLoaded()
   if not keepFilter then streamer.setCreateFilter(nil) end
@@ -51,6 +50,20 @@ do
   eq(H.hooks("onNfscSectionChanged")[1].args[1], 1021, "section changed to 1021")
   local g = H.byName("NFSC_StreamedScenery")
   check(g and #g.children == 9, "all objects live in the runtime group")
+end
+
+-- 1b. level-load indexing: the section files are read before anything is streamed ---------------------------
+do
+  local s = fresh({ indexBeforeStreaming = true })
+  H.tick(s, 1, 0.016)
+  eq(s.getStatus().liveObjectCount, 0, "nothing is streamed during the level-load indexing")
+  eq(s.getShapeIndexStatus().state, "done", "the shape index is done after the first frame (small fixture)")
+  settle(s, 5)
+  eq(s.getStatus().liveObjectCount, 9, "streaming starts once the index is done")
+  local off = fresh()
+  H.tick(off, 1, 0.016)
+  check(off.getStatus().liveObjectCount > 0, "indexBeforeStreaming off: streaming starts at once")
+  eq(off.getShapeIndexStatus().state, "scanning", "indexBeforeStreaming off: the index waits for idle time")
 end
 
 -- 2. throttle: objects are created across frames, not all at once ------------------------------
@@ -521,11 +534,6 @@ do
   eq(s.getStatus().currentSectionID, nil, "outside every section: nothing current")
 end
 
-local function loadOrder(s)                                    -- without the always-loaded sections (the fixture's files are in no fake polygon)
-  local t = {}
-  for _, id in ipairs(s.getLoadOrder()) do if id >= 9000 then t[#t + 1] = id end end
-  return table.concat(t, ",")
-end
 -- 19. load order follows the heading (the game's three priority bands) --------------------------------
 do
   local s = fresh()
@@ -541,12 +549,12 @@ do
   s.initialize("levels/nfsc")
   H.cam = { x = 0, y = 0, z = 0 }
   H.tick(s, 1, 0.1)
-  eq(loadOrder(s), "9001,9002,9003", "standing still: static order")
+  eq(table.concat(s.getLoadOrder(), ","), "9001,9002,9003,1021,1022,1101", "standing still: static order, the always-loaded sections last")
   for _ = 1, 8 do
     H.cam.x = H.cam.x - 3                                        -- 30 m/s west
     H.tick(s, 1, 0.1)
   end
-  eq(loadOrder(s), "9001,9003,9002", "heading west: the section ahead loads first")
+  eq(table.concat(s.getLoadOrder(), ","), "9001,9003,9002,1021,1022,1101", "heading west: the section ahead loads first, the always-loaded sections last")
   H.readFilter = nil
 end
 
@@ -591,9 +599,9 @@ do
   os.clock = realClock
 end
 
--- 22. first use / reload / warm split and the most expensive shapes ----------------------------------
+-- 22. first use / reload / warm split and the most expensive shapes (shapeCache off: with it a held shape is warm) -----
 do
-  local s = fresh({ unloadCooldown = 0.2 })
+  local s = fresh({ unloadCooldown = 0.2, shapeCache = false })
   settle(s, 10)
   local st = s.getStatus()
   eq(st.changeFirstUse + st.changeReload + st.changeWarm, st.changeCreates, "every create is first use, reload or warm")
@@ -776,7 +784,7 @@ end
 do
   -- with FS:fileExists the first use is told apart: one shape already has its .cdae, the others get imported
   H.fsMock, H.preCdae = true, { MESH .. "XTU_TREESPINGA_1A_00.cdae" }
-  local s = fresh()
+  local s = fresh({ cacheWarm = false })
   settle(s, 40)
   local sp = s.getStatus().changeFirstUseSplit
   eq(sp.cached.n, 1, "27a: one first use found its .cdae")
@@ -786,19 +794,19 @@ do
   check(logHas("(peak "), "27a: the settled header carries the peak")
   -- a shape that was imported earlier in the session counts as cached when it is used for real
   H.fsMock, H.preCdae = false, nil
-  local s2 = fresh()
+  local s2 = fresh({ cacheWarm = false })
   settle(s2, 40)
   local sp2 = s2.getStatus().changeFirstUseSplit
   check(sp2.unknown.n >= 1 and sp2.import.n == 0 and sp2.cached.n == 0, "27b: without FS:fileExists every first use is 'unknown'")
 end
 do
   -- a single create over stallLogMs is logged at once with its kind
-  local s = fresh({ stallLogMs = 0 })
+  local s = fresh({ cacheWarm = false, stallLogMs = 0 })
   settle(s, 40)
   check(logHas("slow create: "), "27c: slow create line")
   check(logHas("first use, unknown"), "27c: ... with the first use kind")
   H.logs = {}
-  local quiet = fresh()
+  local quiet = fresh({ cacheWarm = false })
   settle(quiet, 40)
   check(not logHas("slow create: "), "27c: nothing is logged below stallLogMs")
 end
@@ -814,140 +822,12 @@ do
     settle(s, 40)
     return before, logCount("settled:"), s
   end
-  local before, after = run({ unloadCooldown = 1000 })
+  local before, after = run({ cacheWarm = false, unloadCooldown = 1000 })
   eq(after - before, 1, "27d: only the change that created objects prints a block")
-  local before2, after2 = run({ unloadCooldown = 1000, logEmptySettles = true })
+  local before2, after2 = run({ cacheWarm = false, unloadCooldown = 1000, logEmptySettles = true })
   eq(after2 - before2, 2, "27d: logEmptySettles brings the empty one back")
 end
--- 27e-j. shape cache: the fill lane, the need channel, heavy shapes, absent shapes, the RAM floor ---------------
-local FILL = { shapeCache = true, shapeCacheIdleSeconds = 0, shapeCacheGapSeconds = 0, shapeCacheBudgetShare = 1, shapeCachePerFrame = 4 }
-local function with(base, extra) local t = {}; for k, v in pairs(base) do t[k] = v end; for k, v in pairs(extra or {}) do t[k] = v end; return t end
-do
-  -- off by default: nothing is held
-  local s = fresh()
-  settle(s, 60)
-  local sc = s.getShapeCacheStatus()
-  check(not sc.enabled and sc.held == 0, "27e: the shape cache is off by default and holds nothing")
-  -- the fill holds every shape of the section files once, outside the live counts
-  local base = fresh()
-  settle(base, 60)
-  local liveWithout = base.getStatus().liveObjectCount
-  local s2 = fresh(FILL)
-  settle(s2, 80)
-  local w = s2.getShapeCacheStatus()
-  check(w.available and w.complete, "27f: the fill finished")
-  eq(w.total, 9, "27f: all unique shapes of the section files")
-  eq(w.held, 9, "27f: every shape is held")
-  eq(w.failed, 0, "27f: no failures")
-  eq(s2.getStatus().liveObjectCount, liveWithout, "27f: the holders are not live objects")
-  check(logHas("shape cache: the island is held: 9 of 9 meshes held"), "27f: finish line")
-  eq(w.lane, "asleep", "27f: the lane sleeps when complete")
-  local costs = H.files["levels/nfsc/lua/carbon_stream/shape_costs.json"]
-  check(type(costs) == "table" and next(costs) ~= nil, "27f: the cost table was written")
-  local heldNow = w.held
-  settle(s2, 40)
-  eq(s2.getShapeCacheStatus().held, heldNow, "27f: a complete cache does nothing more")
-  -- switched off: the holders go
-  s2.setShapeCache(false)
-  settle(s2, 10)
-  eq(s2.getShapeCacheStatus().held, 0, "27g: off releases the holders")
-end
-do
-  -- the need channel: the fill waits for a long idle time, so creates have to hold their shapes themselves
-  local s = fresh(with(FILL, { shapeCacheIdleSeconds = 1000, shapeCacheAtLoad = false, creationMode = "shells", shellTarget = 20 }))
-  settle(s, 40)
-  local sc = s.getShapeCacheStatus()
-  check(sc.needN > 0 and sc.held >= sc.needN, "27h: creates held their shapes through the need channel")
-  eq(sc.idleN, 0, "27h: the idle lane had not started")
-  check(sc.creates.cold.n > 0, "27h: those creates count as cold")
-  check(sc.retargetFilled > 0, "27h: and the shell retargets are split as needed-a-fill")
-  check(sc.stallMs > 0, "27h: the cost of cold creates is reported")
-end
-do
-  -- resident: a shape that is held makes the way back a held-hit
-  local s = fresh(with(FILL, { creationMode = "resident", unloadCooldown = 0 }))
-  H.cam = { x = 0, y = 0, z = 0 }; settle(s, 10)                -- outside: the shape index is built first
-  H.cam = { x = 3950, y = -200, z = 0 }
-  settle(s, 80)
-  local before = s.getShapeCacheStatus().creates.held.n
-  H.cam = { x = 3950, y = -310, z = 0 }; settle(s, 40)
-  H.cam = { x = 3950, y = -200, z = 0 }; settle(s, 40)
-  local sc = s.getShapeCacheStatus()
-  check(sc.creates.held.n > before, "27i: creates of held shapes are held-hits")
-  eq(sc.visits, sc.visitsReady + sc.visitsLate + sc.visitsDropped, "27i: every visit is ready, late or dropped")
-  check(sc.visitsTeleport >= 1, "27i: the first section is a teleport, left out of the late and dropped counts")
-  check(sc.visitsReady >= 1 and sc.visitsDropped == 0, "27i: with everything held no neighbour is dropped")
-  check(sc.readinessAvg == 1, "27i: readiness at entry is 100%")
-  check(s.getModePresets("resident") ~= nil, "27i: presets exist")
-end
-do
-  -- heavy shapes wait for a still camera
-  local heavy = MESH .. "XTU_TREESPINGA_1A_00.dae"
-  H.files["levels/nfsc/lua/carbon_stream/shape_costs.json"] = { [heavy] = 50 }
-  local s = fresh(with(FILL, { shapeCacheHeavyMs = 10, shapeCacheStillSeconds = 1000, shapeCacheAlways = true }))
-  H.cam = { x = 1e7, y = 1e7, z = 0 }                 -- outside every section: no create needs a shape, only the fill holds
-  settle(s, 80)
-  local sc = s.getShapeCacheStatus()
-  eq(sc.held, 8, "27j: the heavy shape is not held while the camera has not been still long enough")
-  eq(sc.deferredHeavy, 1, "27j: it waits")
-  eq(sc.laneReason, "heavy", "27j: the lane says why it is paused")
-  s.setTuning({ shapeCacheStillSeconds = 0 })
-  settle(s, 20)
-  check(s.getShapeCacheStatus().complete, "27j: a still camera lets it through")
-  H.files = {}
-end
-do
-  -- shapes without any file are flagged absent and not held
-  H.fsMock, H.preCdae = true, { MESH .. "XTU_TREESPINGA_1A_00.cdae" }
-  local s = fresh(FILL)
-  settle(s, 80)
-  local sc = s.getShapeCacheStatus()
-  eq(sc.held, 1, "27k: only the shape with a file is held")
-  eq(sc.absent, 8, "27k: the others are absent")
-  check(sc.complete, "27k: absent shapes do not keep the fill from finishing")
-  H.fsMock, H.preCdae = false, nil
-end
-do
-  -- the RAM floor pauses the fill (a memory source is needed)
-  local free = 0.5
-  local s = fresh(with(FILL, { shapeCacheRamFloorGB = 1.5 }))
-  s.setMemoryProvider(function() return { freeGB = free, availableGB = 2, processGB = 3 } end)
-  H.cam = { x = 1e7, y = 1e7, z = 0 }                 -- no create needs a shape: only the fill can hold
-  H.tick(s, 5, 2.0)
-  local sc = s.getShapeCacheStatus()
-  eq(sc.held, 0, "27l: nothing is held under the floor")
-  eq(sc.laneReason, "ram", "27l: the lane says why it is paused")
-  check(sc.ramPaused and sc.pauses.ram >= 1 and logHas("shape cache: paused, free RAM"), "27l: the pause is counted and logged")
-  free = 4
-  settle(s, 80)
-  check(s.getShapeCacheStatus().complete and logHas("shape cache: resumed"), "27l: above the floor it fills again")
-  check(s.getShapeCacheStatus().minFreeGB == 0.5, "27l: the lowest free RAM is kept")
-end
-do
-  -- presets: old keys carry over, the resident factory presets turn the cache on, the run summary prints the cacher lines
-  H.files["levels/nfsc/lua/carbon_stream/tuning_presets.json"] = { old = { warmAll = true, warmAllPerFrame = 3, cacheWarm = true, cacheWarmCheckShare = 0.2 } }
-  local s = fresh()
-  check(s.loadPreset("old"), "27m: an old preset loads")
-  eq(s.getTuning().shapeCache, true, "27m: warmAll became shapeCache")
-  eq(s.getTuning().shapeCachePerFrame, 3, "27m: and its per-frame count carried over")
-  eq(#s.getTuningInfo().last.rejected, 0, "27m: the retired cache warm keys are dropped without a complaint")
-  H.files = {}
-  local pr = fresh().getModePresets("resident")
-  eq(pr[1].label .. pr[2].label .. pr[3].label, "ABC", "27m: the presets are named A, B and C")
-  local r = fresh({ shapeCache = true, debugLog = true, creationMode = "resident" })
-  r.loadModePreset("resident", "B")
-  check(r.getTuning().shapeCache == true and r.getTuning().residentMax == 6000, "27m: a preset leaves Preload alone and the active shells stay capped at 6000")
-  settle(r, 80)
-  r.logRunSummary()
-  check(logHas("cacher-log v1 cfg shapeCache=on"), "27m: the run summary starts with the cacher header (Debug on)")
-  check(logHas("cacher visits n="), "27m: and has the visit line")
-  check(logHas("cacher readiness_pct"), "27m: and the readiness line")
-  H.logs = {}
-  local q = fresh({ shapeCache = true, creationMode = "resident", debugLog = false })
-  settle(q, 80)
-  q.logRunSummary()
-  check(not logHas("cacher-log v1"), "27m: without Debug the cacher lines stay out of the log")
-end
+-- (27e/27f, the cache warm-up lane, were replaced by the shape cache; its lane is tested with the shape cache tests below)
 
 -- 28. patch 0015: shell pool (creationMode = "shells") ---------------------------------------------
 do
@@ -1094,7 +974,7 @@ end
 -- 29. patch 0016: resident mode ----------------------------------------------------------------------
 do
   local DOT = "/levels/nfsc/Assets/Meshes/NFSC_DOT.dae"
-  local s = fresh({ creationMode = "resident", restartAmbient = false })     -- the animation restart writes fields: tested in 27o
+  local s = fresh({ creationMode = "resident" })
   local made = {}
   s.addListener({ onObjectCreated = function(self, key, obj, item) made[item.name] = { key = key, obj = obj, item = item } end })
   settle(s, 5)
@@ -1207,7 +1087,7 @@ do
   eq(s.getTuning().maxCreatesPerFrame, 16, "30d: reset restores the defaults")
   eq(s.getTuning().frameBudgetMs, 16.0, "30d: all of them")
   -- values of the wrong type or unknown keys are ignored
-  H.files["levels/nfsc/lua/carbon_stream/tuning_presets.json"].bad = { maxCreatesPerFrame = "many", nonsense = 5, logSettle = false }
+  H.files["levels/nfsc/lua/streamer/tuning_presets.json"].bad = { maxCreatesPerFrame = "many", nonsense = 5, logSettle = false }
   check(s.loadPreset("bad"), "30e: a damaged preset still loads")
   eq(s.getTuning().maxCreatesPerFrame, 16, "30e: wrong type ignored")
   eq(s.getTuning().logSettle, false, "30e: valid key applied")
@@ -1254,7 +1134,7 @@ end
 
 -- 32. patch 0016: panel smoke test (mock imgui) ------------------------------------------------------
 do
-  local s, m = fresh()
+  local s, m = fresh({ creationMode = "resident" })
   settle(s, 5)
   local texts, clicks, sliders = {}, {}, {}
   local function ptr(v) return { [0] = v } end
@@ -1278,11 +1158,9 @@ do
   clicks["Resident##creation"] = true
   sliders["Max refills per frame###tmaxRefillsPerFrame"] = 5
   sliders["Look-ahead###tpredictionEnabled"] = false
+  clicks["Save##pA"] = true
   ui.onUpdate()
   clicks, sliders = {}, {}
-  clicks["Save##pA"] = true                      -- the next frame: the presets above are the ones of the mode just chosen
-  ui.onUpdate()
-  clicks = {}
   check(ui ~= nil, "32a: the panel loads")
   eq(s.getCreationMode(), "resident", "32b: the radio switches the creation mode")
   eq(s.getTuning().maxRefillsPerFrame, 5, "32c: a slider changes the tuning at once")
@@ -1300,7 +1178,7 @@ do
   ui.onUpdate()
   clicks = {}
   eq(s.getTuning().maxCreatesPerFrame, 16, "32f: reset to defaults")
-  eq(s.getCreationMode(), "resident", "32f: including the creation mode (resident is the default)")
+  eq(s.getCreationMode(), s.getDefaultTuning().creationMode, "32f: including the creation mode")
   ui_imgui = nil
   H.files = {}
 end
@@ -1315,11 +1193,10 @@ do
   s.setTuning({ frameBudgetMs = 16 })
   settle(s, 10)
   check(s.getStatus().shellsBuilt > 0, "34a: with a budget they are built")
-  s.setTuning({ frameBudgetMs = 20, shellBuildBudgetShare = 0.5, deleteBudgetShare = 0.25, shapeCacheBudgetShare = 0.1 })
+  s.setTuning({ frameBudgetMs = 20, shellBuildBudgetShare = 0.5, deleteBudgetShare = 0.25 })
   local caps = s.getStatus().frameBudget.capsMs
   eq(caps.shells, 10, "34b: shell build cap = share x main budget")
   eq(caps.deletes, 5, "34b: delete cap too")
-  eq(caps.holds, 2, "34b: and the shape cache holds")
   s.setTuning({ frameBudgetMs = 8 })
   caps = s.getStatus().frameBudget.capsMs
   eq(caps.shells, 4, "34c: changing the main budget rescales the shell cap")
@@ -1360,10 +1237,9 @@ do
   eq(s.getCreationMode(), "resident", "35f: creationMode through setTuning goes through the mode switch")
   check(s.getStatus().residentActive, "35f: so the resident state is really on")
   -- presets saved before the budgets became shares are converted
-  H.files["levels/nfsc/lua/carbon_stream/tuning_presets.json"] = { old = { frameBudgetMs = 20, shellBuildBudgetMs = 5, cacheWarmCheckMs = 2 } }
+  H.files["levels/nfsc/lua/streamer/tuning_presets.json"] = { old = { frameBudgetMs = 20, shellBuildBudgetMs = 5, cacheWarmCheckMs = 2 } }
   check(s.loadPreset("old"), "35g: an old preset loads")
   eq(s.getTuning().shellBuildBudgetShare, 0.25, "35g: shell build ms became a share of the budget saved with it")
-  eq(#s.getTuningInfo().last.rejected, 0, "35g: the retired warm-up check is dropped without a complaint")
   H.files = {}
 end
 
@@ -1393,7 +1269,7 @@ do
   check(not s.loadModePreset("shells", "Z"), "36g: unknown slot refused")
   check(not s.loadModePreset("nope", "A"), "36g: unknown mode refused")
   -- a flat A from before belongs to the mode it was saved in
-  H.files["levels/nfsc/lua/carbon_stream/tuning_presets.json"] = { A = { creationMode = "resident", residentMax = 777 } }
+  H.files["levels/nfsc/lua/streamer/tuning_presets.json"] = { A = { creationMode = "resident", residentMax = 777 } }
   eq(s.getModePresets("resident")[1].source, "saved", "36h: an old flat slot shows in its own mode")
   eq(s.getModePresets("current")[1].source, "factory", "36h: not in the others")
   s.loadModePreset("resident", "A")
@@ -1494,7 +1370,7 @@ do
   check(has("Max creates per frame"), "38a: a common setting shows in current mode")
   check(not has("Pool size") and not has("Shells built ahead") and not has("Deactivate delay"), "38a: pool settings are hidden in current mode")
   check(has("Unload cooldown"), "38a: the unload cooldown shows")
-  nfsc_sectionStreamer.setCreationMode("shells")      -- the Shells radio is gone from the panel (Debug has Current and Resident)
+  s.setCreationMode("shells")                                    -- the panel offers Current and Resident only
   frame()
   check(has("Shells built ahead") and has("Shell build share"), "38b: shell settings appear in shells mode")
   check(not has("Pool size") and not has("Deactivate delay"), "38b: resident-only settings stay hidden")
@@ -1631,204 +1507,29 @@ do
   eq(s.getRunStats().costlyCapHits, capsBefore, "40e: and it did not touch the refill cap")
 end
 
--- 27n. the fill takes the island the camera is in: related sections, outward ----------------------------------------
+-- 41. always-loaded sections: a few are streamed everywhere, a flood means a broken sections.json -------------
 do
-  local s = fresh(with(FILL, { shapeCachePerFrame = 1 }))
-  settle(s, 60)
-  local sc = s.getShapeCacheStatus()
-  check(sc.island.id ~= nil and sc.island.sections >= 2 and sc.island.meshes == 9, "27n: the island is the connected sections and its meshes")
-  eq(sc.island.held, 9, "27n: every mesh of the island is held")
-  check(sc.complete and sc.phase == "island held", "27n: and the lane says the island is held")
-  local f = fresh(with(FILL, { shapeCachePerFrame = 1, shapeCacheAlways = true }))
-  H.cam = { x = 1e5, y = -1e5, z = 0 }
-  H.tick(f, 3, 0.1)                                      -- the camera lookup outside every section runs on its own interval
-  local before = f.getShapeCacheStatus().held
-  H.tick(f, 12, 0.1)
-  local c = f.getShapeCacheStatus()
-  check(before <= 1 and c.held >= 1 and c.held <= before + 12 and c.current and c.island.id ~= nil, "27n: outside every section the nearest one starts the walk, one mesh per frame")
-end
-do
-  -- idle only: while the car moves nothing is held, unless Preload always is on
-  local s = fresh(with(FILL, { shapeCacheAtLoad = false, shapeCacheStillSeconds = 1.0 }))
-  local x = 0
-  for _ = 1, 40 do
-    H.cam = { x = 1e5 + x, y = -1e5, z = 0 }; x = x + 2        -- 20 m/s, outside every section: no create needs a mesh
-    H.tick(s, 1, 0.1)
+  local function withIndex(count)
+    local s = fresh({ indexBeforeStreaming = false })
+    H.readFilter = function(path)
+      if path:find("index.json", 1, true) then
+        local list = {}
+        for i = 1, count do list[i] = { id = 5000 + i, file = "lua/streamer/sections/" .. (5000 + i) .. ".json", count = 1 } end
+        return { schemaVersion = 2, overrides = {}, sections = list }
+      end
+    end
+    s.initialize("levels/nfsc")
+    settle(s, 3)
+    H.readFilter = nil
+    return s.getStatus()
   end
-  local sc = s.getShapeCacheStatus()
-  eq(sc.held, 0, "27n: nothing is held while the camera moves")
-  eq(sc.laneReason, "moving", "27n: the lane says why")
-  s.setTuning({ shapeCacheAlways = true })
-  for _ = 1, 40 do
-    H.cam = { x = 1e5 + x, y = -1e5, z = 0 }; x = x + 2
-    H.tick(s, 1, 0.1)
-  end
-  check(s.getShapeCacheStatus().held > 0, "27n: Preload always fills while it moves")
-end
-do
-  -- Max meshes to save: the fill stops at the cap and the holders of another island go first
-  local s = fresh(with(FILL, { shapeCacheMax = 4 }))
-  H.cam = { x = 1e5, y = -1e5, z = 0 }                     -- outside every section: only the fill holds
-  settle(s, 60)
-  local sc = s.getShapeCacheStatus()
-  eq(sc.held, 4, "27n: the fill stops at Max meshes to save")
-  eq(sc.pauses.cap >= 1, true, "27n: and counts the pause")
-  s.setTuning({ shapeCacheMax = 2 })
-  settle(s, 20)
-  check(s.getShapeCacheStatus().held == 4, "27n: the island's own meshes are not evicted")
-end
--- 27p. terrain-like meshes (IdentityMatrix / ChoppedRoadway) are held first within a hop ring ------------------------
-do
-  fresh()                                                -- installs the harness; the fixture has no terrain-flagged object, so one is flagged here
-  local file = "levels/nfsc/lua/carbon_stream/sections/1022.json"
-  local data = jsonReadFile(file)
-  for _, o in ipairs(data.objects) do
-    if o.shapeName and o.shapeName:find("XTU_HOUSE_1A_00", 1, true) then o.instanceFlags = "IdentityMatrix,Collidable" end
-  end
-  H.files[file] = data
-  local s = fresh(with(FILL, { shapeCachePerFrame = 1, shapeCacheAlways = true }))
-  H.cam = { x = 3950, y = -300, z = 0 }                 -- in 1022
-  -- the create filter keeps the loader from holding anything: only the idle lane holds here
-  s.setCreateFilter(function() return false end)
-  settle(s, 3)
-  local c = s.getShapeCacheStatus()
-  check(c.held >= 1 and c.current and c.current:find("XTU_HOUSE_1A_00", 1, true), "27p: the shape of the terrain-flagged object is held first")
-  H.files = {}
-end
-
--- 27q. the island holds the meshes of related sections that are not drivable too ------------------------------------
-do
-  fresh()                                              -- installs the harness, so jsonReadFile exists
-  local path = "levels/nfsc/lua/sections.json"
-  local data = jsonReadFile(path)
-  local kept = {}
-  for _, e in ipairs(data.sections) do if tonumber(e.id) ~= 1101 then kept[#kept + 1] = e end end
-  data.sections = kept                                 -- 1101 stays in the stream index and in the related list of 1022, with no polygon
-  H.files[path] = data
-  local s = fresh(with(FILL, { shapeCachePerFrame = 4 }))
-  H.cam = { x = 3950, y = -300, z = 0 }
-  settle(s, 60)
-  local sc = s.getShapeCacheStatus()
-  eq(sc.island.sections, 3, "27q: the related section without a polygon is part of the island")
-  eq(sc.island.meshes, 9, "27q: its meshes are counted")
-  eq(sc.island.held, 9, "27q: and held")
-  H.files = {}
-end
-
--- 27r. entering a section of another island switches the preload to that island, also after the first one was held ----
-do
-  fresh()
-  local path = "levels/nfsc/lua/sections.json"
-  local data = jsonReadFile(path)
-  for _, e in ipairs(data.sections) do
-    local id = tonumber(e.id)
-    if id == 1022 then e.related = { 1021 } end          -- 1101 becomes an island of its own
-    if id == 1101 then e.related = {} end
-  end
-  H.files[path] = data
-  local s = fresh(with(FILL, { shapeCachePerFrame = 8 }))
-  H.cam = { x = 3950, y = -200, z = 0 }                    -- in 1021
-  settle(s, 60)
-  local a = s.getShapeCacheStatus()
-  check(a.complete and a.island.id == 1021 and a.island.sections == 2, "27r: the first island is held")
-  H.cam = { x = 4100, y = -320, z = 0 }                    -- in 1101: another island
-  settle(s, 10)
-  local b = s.getShapeCacheStatus()
-  eq(b.island.id, 1101, "27r: the island follows the section the camera is in")
-  eq(b.island.sections, 1, "27r: with its own sections")
-  H.files = {}
-end
-
--- Helpers for 27o-27t: put a section file (and its index entry) or an extra object into the harness files.
-local BASE = "levels/nfsc/lua/carbon_stream/"
-local function addSectionFile(id, objects)
-  local idx = jsonReadFile(BASE .. "index.json")
-  idx.sections[#idx.sections + 1] = { id = id, file = "lua/carbon_stream/sections/" .. id .. ".json", count = #objects }
-  H.files[BASE .. "index.json"] = idx
-  H.files[BASE .. "sections/" .. id .. ".json"] = { schemaVersion = 2, sectionID = id, objectCount = #objects, objects = objects }
-end
-local function animatedObject(name, sectionId, extra)
-  local src = jsonReadFile(BASE .. "sections/1021.json").objects[1]
-  local o = {}
-  for k, v in pairs(src) do o[k] = v end
-  o.name, o.sectionID, o.__streamKey, o.__streamSections = name, tostring(sectionId), "cs:test_" .. name, { sectionId }
-  o.playAmbient = true
-  for k, v in pairs(extra or {}) do o[k] = v end
-  return o
-end
-local function addAnimatedTo1021()
-  local data = jsonReadFile(BASE .. "sections/1021.json")
-  local o = animatedObject("XTU_ANIM_TEST_1", 1021, { __parent = "Palmont1021", __streamSections = { 1021 }, shapeName = "/levels/nfsc/assets/meshes/ANIMTEST_anim.dae" })
-  data.objects[#data.objects + 1] = o
-  data.objectCount = #data.objects
-  H.files[BASE .. "sections/1021.json"] = data
-  local idx = jsonReadFile(BASE .. "index.json")
-  for _, e in ipairs(idx.sections) do if tonumber(e.id) == 1021 then e.count = #data.objects end end
-  H.files[BASE .. "index.json"] = idx
-end
-
--- 27o. animated objects shown again in a pooled object restart their animation ----------------------------------------
-do
-  fresh()                                                      -- installs the harness
-  addAnimatedTo1021()
-  local s = fresh({ creationMode = "resident", unloadCooldown = 0, animatedInShells = true })
-  local anim
-  s.addListener({ onObjectCreated = function(self, key, obj, item) if item.playAmbient then anim = obj end end })
-  settle(s, 40)
-  eq(s.getShapeCacheStatus().ambientRestarts, 0, "27o: a first create needs no restart")
-  check(anim ~= nil and not anim.hidden, "27o: the animated object is visible")
-  H.cam = { x = 4100, y = -320, z = 0 }; settle(s, 40)         -- 1021 is no longer active: its objects rest
-  check(anim.hidden and anim.fields.playAmbient == "0", "27o: hidden, its playAmbient is off")
-  H.cam = { x = 3950, y = -200, z = 0 }; settle(s, 40)         -- and come back by revive
-  check(not anim.hidden and anim.fields.playAmbient == "1", "27o: visible again, its playAmbient is on")
-  local n = s.getShapeCacheStatus().ambientRestarts
-  check(n >= 1, "27o: and the show is counted")
-  s.setTuning({ restartAmbient = false })
-  H.cam = { x = 4100, y = -320, z = 0 }; settle(s, 40)
-  H.cam = { x = 3950, y = -200, z = 0 }; settle(s, 40)
-  eq(s.getShapeCacheStatus().ambientRestarts, n, "27o: and not when the setting is off")
-end
-
--- 40. the shape cache block of the panel ---------------------------------------------------------------
-do
-  local s = fresh(with(FILL, { creationMode = "resident" }))
-  H.cam = { x = 0, y = 0, z = 0 }; settle(s, 10)                -- outside: the shape index is built first
-  H.cam = { x = 3950, y = -200, z = 0 }
-  settle(s, 80)
-  local texts, bars, clicks = {}, {}, {}
-  local function ptr(v) return { [0] = v } end
-  local im = setmetatable({
-    BoolPtr = ptr, IntPtr = ptr, FloatPtr = ptr,
-    Begin = function() return true end,
-    Text = function(t) texts[#texts + 1] = t end,
-    TextDisabled = function(t) texts[#texts + 1] = t end,
-    CollapsingHeader1 = function() return true end,
-    TreeNode1 = function() return true end,
-    TreeNodeEx1 = function() return true end,
-    ProgressBar = function(frac, _, text) bars[#bars + 1] = { frac = frac, text = text } end,
-    ImVec2 = function(x, y) return { x = x, y = y } end,
-    Button = function(label) return clicks[label] == true end,
-  }, { __index = function() return function() return false end end })
-  ui_imgui = im
-  local ui = H.load(repo .. "/lua/ge/extensions/nfsc/sectionManagerUi.lua")
-  ui.onUpdate()
-  local function saw(prefix) for _, x in ipairs(texts) do if x:find(prefix, 1, true) then return true end end return false end
-  check(saw("Fill: island held") and saw("Lane: ASLEEP") and saw("Visit: section"), "40a: fill, lane and visit lines are drawn (Debug)")
-  check(saw("Memory (GB): Lua"), "40b: memory is drawn")
-  check(saw("Placeholders ready:"), "40b: and the placeholders")
-  eq(#bars, 2, "40c: the Preload bar and the Debug one")
-  eq(bars[1].frac, 1, "40c: full when every mesh of the island is held")
-  check(bars[1].text == "10 / 10 meshes cached", "40c: with the count")
-  check(saw("Preload:"), "40c: the Preload radios are drawn")
-  clicks["Pause fill##scfill"] = true
-  ui.onUpdate()
-  clicks = {}
-  check(s.getShapeCacheStatus().paused, "40d: Pause fill pauses the lane")
-  texts = {}
-  ui.onUpdate()
-  check(saw("Fill: island held") or saw("Fill: paused"), "40d: the readout follows")
-  ui_imgui = nil
-  H.files = {}
+  local few = withIndex(3)
+  eq(few.alwaysLoadedCount, 3, "41a: three sections in no polygon and no related list are always loaded")
+  eq(few.alwaysSuspectCount, 0, "41a: and nothing is suspect")
+  local flood = withIndex(20)
+  eq(flood.alwaysLoadedCount, 0, "41b: twenty of them are not streamed")
+  eq(flood.alwaysSuspectCount, 20, "41b: the count is reported so the panel can warn")
+  check(flood.activeSectionCount < 20, "41b: the camera's section does not drag them all in")
 end
 
 -- 33. LuaJIT: no function may get near the 60 upvalue limit ------------------------------------------
@@ -1852,47 +1553,6 @@ if jit then
   end
   for k, v in pairs(nfsc_sectionStreamer) do if type(v) == "function" then walk(v, k) end end
   check(worst <= 56, "33: a function has " .. worst .. " upvalues, the LuaJIT limit is 60: " .. worstName)
-end
-
-H.files = {}
-
--- 27s. a section in no polygon and no related list is always loaded, also with the camera outside every section ------
-do
-  fresh()
-  addSectionFile(2600, { animatedObject("XTU_PLANE_1", 2600, { __parent = "Palmont2600" }) })
-  local s = fresh()
-  H.cam = { x = 0, y = 0, z = 0 }                             -- outside every section
-  settle(s, 10)
-  local st = s.getStatus()
-  eq(st.currentSectionID, nil, "27s: the camera is outside every section")
-  eq(H.created["XTU_PLANE_1"], 1, "27s: the always-loaded object exists without a section")
-  check(s.isSectionActive(2600), "27s: its section is active")
-  H.cam = { x = 3950, y = -200, z = 0 }; settle(s, 30)           -- in 1021
-  eq(H.created["XTU_PLANE_1"], 1, "27s: entering a section does not recreate it")
-  H.cam = { x = 4100, y = -320, z = 0 }; settle(s, 30)           -- 1101
-  H.cam = { x = 0, y = 0, z = 0 }; settle(s, 30)                 -- outside again
-  check(s.isSectionActive(2600) and s.getStatus().liveObjectCount == 1, "27s: only the always-loaded object stays alive outside")
-  s.purge()
-  settle(s, 10)
-  eq(s.getStatus().liveObjectCount, 1, "27s: and it comes back after a purge")
-  H.files = {}
-end
-
--- 27t. animated objects stay out of the pool unless Animated objects in shells is on ---------------------------------
-do
-  fresh()
-  addAnimatedTo1021()
-  local s = fresh({ creationMode = "resident", unloadCooldown = 0 })
-  local anim, first
-  s.addListener({ onObjectCreated = function(self, key, obj, item) if item.name == "XTU_ANIM_TEST_1" then anim = obj; first = first or obj end end })
-  settle(s, 40)
-  check(anim ~= nil and not anim.hidden, "27t: the animated object is created")
-  H.cam = { x = 4100, y = -320, z = 0 }; settle(s, 40)           -- 1021 is no longer active
-  check(first.deleted, "27t: it is deleted, not pooled, when its section goes")
-  eq(s.getShapeCacheStatus().ambientRestarts, 0, "27t: nothing to restart")
-  H.cam = { x = 3950, y = -200, z = 0 }; settle(s, 40)
-  check(anim ~= first and not anim.deleted and H.created["XTU_ANIM_TEST_1"] == 2, "27t: it comes back as a fresh object")
-  H.files = {}
 end
 
 print(string.format("%d passed, %d failed", passed, failed))

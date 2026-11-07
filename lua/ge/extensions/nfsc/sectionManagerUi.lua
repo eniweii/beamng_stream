@@ -555,6 +555,9 @@ function M.onUpdate()
   end
   drawOverrideList("Enabled overrides", on)
   drawOverrideList("Hidden overrides", off)
+  if (st.alwaysSuspectCount or 0) > 0 then
+    im.TextWrapped(string.format("WARNING: %d sections have scenery but are in no related list of sections.json, so it looks incomplete. They are not streamed. Export sections.json again with the full stream file loaded.", st.alwaysSuspectCount))
+  end
   im.Separator()
 
   -- Everything else, for debugging only.
@@ -563,8 +566,8 @@ function M.onUpdate()
     debugLogPtr[0] = nfsc_sectionStreamer.getTuning().debugLog == true
     if im.Checkbox("Detailed logs##debuglog", debugLogPtr) then nfsc_sectionStreamer.setTuning({ debugLog = debugLogPtr[0] }, true) end
     tip("The cacher lines, the full run summary and the fill progress go to the log.")
-    im.Text(string.format("Active sections: %d    Live objects: %d    Queued: %d objects, %d section reads    Pending unload: %d",
-      st.activeSectionCount or 0, st.liveObjectCount or 0, st.queuedObjectCount or 0, st.queuedSectionReads or 0, st.pendingUnloadCount or 0))
+    im.Text(string.format("Active sections: %d (always-loaded: %d)    Live objects: %d    Queued: %d objects, %d section reads    Pending unload: %d",
+      st.activeSectionCount or 0, st.alwaysLoadedCount or 0, st.liveObjectCount or 0, st.queuedObjectCount or 0, st.queuedSectionReads or 0, st.pendingUnloadCount or 0))
     im.Text(string.format("Created: %d    Deleted: %d    Failures: %d", st.createdTotal or 0, st.deletedTotal or 0, st.failureCount or 0))
     drawCreationMode(st)
     drawShapeCache(st)
@@ -580,11 +583,7 @@ function M.onUpdate()
         st.residentMax or 0, st.residentReserve or 0))
     end
     if st.shapeIndex and st.shapeIndex.state == "done" then
-      if st.shapeIndex.prebuilt then
-        im.TextDisabled(string.format("Shape index: %d unique shapes from index.json (%d sections, no section file read)", st.shapeIndex.unique, st.shapeIndex.files))
-      else
-        im.TextDisabled(string.format("Shape index: %d unique shapes from %d section files (read in %s)", st.shapeIndex.unique, st.shapeIndex.files, duration(st.shapeIndex.readSeconds)))
-      end
+      im.TextDisabled(string.format("Shape index: %d unique shapes from %d section files (read in %s)", st.shapeIndex.unique, st.shapeIndex.files, duration(st.shapeIndex.readSeconds)))
     end
     drawShapeCacheResults(st)
     local run = st.run

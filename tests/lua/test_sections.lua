@@ -24,7 +24,7 @@ local function fresh(tuning, keepFilter)
   local manager = H.load(repo .. "/lua/ge/extensions/nfsc/sectionManager.lua")
   nfsc_sectionManager = manager
   H.loaded = { streamer, manager }
-  streamer.setTuning({ maxFirstUsePerFrame = 1000 })   -- the first-use cap has its own test (21)
+  streamer.setTuning({ maxFirstUsePerFrame = 1000, indexBeforeStreaming = false })   -- the first-use cap has its own test (21); level-load indexing has test 1b
   if tuning then streamer.setTuning(tuning) end
   manager.onExtensionLoaded()
   if not keepFilter then streamer.setCreateFilter(nil) end
@@ -50,6 +50,20 @@ do
   eq(H.hooks("onNfscSectionChanged")[1].args[1], 1021, "section changed to 1021")
   local g = H.byName("NFSC_StreamedScenery")
   check(g and #g.children == 9, "all objects live in the runtime group")
+end
+
+-- 1b. level-load indexing: the section files are read before anything is streamed ---------------------------
+do
+  local s = fresh({ indexBeforeStreaming = true })
+  H.tick(s, 1, 0.016)
+  eq(s.getStatus().liveObjectCount, 0, "nothing is streamed during the level-load indexing")
+  eq(s.getShapeIndexStatus().state, "done", "the shape index is done after the first frame (small fixture)")
+  settle(s, 5)
+  eq(s.getStatus().liveObjectCount, 9, "streaming starts once the index is done")
+  local off = fresh()
+  H.tick(off, 1, 0.016)
+  check(off.getStatus().liveObjectCount > 0, "indexBeforeStreaming off: streaming starts at once")
+  eq(off.getShapeIndexStatus().state, "scanning", "indexBeforeStreaming off: the index waits for idle time")
 end
 
 -- 2. throttle: objects are created across frames, not all at once ------------------------------
