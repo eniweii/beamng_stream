@@ -143,10 +143,28 @@ local function drawSway(env, st)
   end
 end
 
+-- One radio button. RadioButton1(label, active) follows the overload-suffix convention of the section manager panel
+-- (unverified in the engine like the rest of this panel).
+local function radio(label, active)
+  local fn = im.RadioButton1 or im.RadioButton
+  return fn(label, active)
+end
+
+local ANIM_MODES = {
+  { "export", "As exported", "Nothing is written. A sequence converted to a native strip runs on the GPU, the others stay on their first frame." },
+  { "off", "Off", "Every material on its exported frame, standing still." },
+  { "native", "Native", "Converted sequences run natively (strip texture and sequence flags, no Lua cost per frame); the rest use the frame swap." },
+  { "frameswap", "Frame swap", "Every sequence is shown by rewriting its materials from Lua. Expensive: each rewrite reloads the material." },
+}
+
 local function animationBody(env, st)
-  local on = boolPtr("animon", st.animEnabled)
-  if im.Checkbox("Animate image sequences##animon", on) then env.setAnimationEnabled(on[0]) end
-  tip("Signs, screens and lights that cycle through several textures. Only the textures of the materials change; a scroll on the same material keeps running. Switching it off puts every material back on its exported frame.")
+  im.Text("Image sequences")
+  for i = 1, #ANIM_MODES do
+    local m = ANIM_MODES[i]
+    if i > 1 then im.SameLine() end
+    if radio(m[2] .. "##animmode", st.animMode == m[1]) then env.setAnimationMode(m[1]) end
+    tip(m[3])
+  end
   if st.animState == "failed" then
     im.TextDisabled("Animation file failed: " .. tostring(st.animInfo.error))
   elseif st.animState == "missing" then
@@ -154,7 +172,7 @@ local function animationBody(env, st)
   elseif st.animState ~= "ready" then
     im.TextDisabled("Reading the animation file...")
   else
-    im.Text(string.format("%d image sequences on %d materials", st.animSequences, st.animMaterials))
+    im.Text(string.format("%d image sequences on %d materials, %d stage(s) with a native strip", st.animSequences, st.animMaterials, st.animNativeStages))
     if st.animPending > 0 then im.Text(string.format("Writing materials: %d waiting", st.animPending)) end
   end
 end

@@ -947,11 +947,6 @@ end
 
 -- A section with streamed objects that is in no polygon and in no related list can never be reached through the camera
 -- (the section table comes from the level's own data): it is always loaded. Needs loadSections and loadStreamIndex first.
--- More always-loaded sections than this is not a level design, it is a sections.json whose related lists lost the
--- sections that have scenery but no boundary (an export made with the wrong or a partial stream file): streaming them
--- all would load hundreds of sections around the camera. They are then left unloaded and the Section Manager says so.
-local ALWAYS_LOADED_MAX = 16
-
 function hold.findAlways()
   local reached = {}
   for _, sec in pairs(sections) do
@@ -965,12 +960,7 @@ function hold.findAlways()
     if not hold.hasSection(id) and not reached[id] then set[id], list[#list + 1] = true, id end
   end
   table.sort(list)
-  if #list > ALWAYS_LOADED_MAX then
-    logMsg("W", "%d sections have scenery but are in no section polygon and in no related list of sections.json: it looks incomplete, so they are not loaded as always-loaded. Export sections.json again with the full stream file loaded", #list)
-    hold.always = { set = {}, list = {}, dirty = true, suspect = #list }
-    return
-  end
-  hold.always = { set = set, list = list, dirty = true, suspect = 0 }
+  hold.always = { set = set, list = list, dirty = true }
   for _, id in ipairs(list) do
     logMsg("I", "always-loaded section %d: %d objects, in no section polygon and in no related list", id, sectionIndex[id].count or 0)
   end
@@ -3729,7 +3719,6 @@ function M.getStatus()
     currentSectionID = currentSectionID,
     currentSectionName = M.sectionIDToDisplayName(currentSectionID),
     activeSectionCount = active,
-    alwaysLoadedCount = #hold.always.list, alwaysSuspectCount = hold.always.suspect or 0,
     liveObjectCount = liveCount,
     queuedObjectCount = (lqTail - lqHead + 1) + (pqTail - pqHead + 1),
     queuedUrgentCount = pqTail - pqHead + 1, promotedObjectCount = promotedTotal,
