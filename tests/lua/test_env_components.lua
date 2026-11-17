@@ -192,6 +192,29 @@ do
   check("no write errors", anim.getStatus().animErrors == 0)
 end
 
+-- 4b. frame swap of an add-folder stage: the frame lists its diffuse as its emissive, both maps follow the frame
+do
+  local ANIM = {
+    animations = { arrow = { name = "arrow", fps = 2, timeBase = "World", frames = {
+      { path = "add/a0.dds", emissive = "add/a0.dds" }, { path = "add/a1.dds", emissive = "add/a1.dds" } } } },
+    materials = { ARROW_01_D_WorldShader = { { type = "frame_swap", animation = "arrow", stage = 0, frame = 0, emissive = true } } },
+  }
+  local host = fresh({ [ANIM_FILE] = ANIM })
+  mats.ARROW_01_D_WorldShader = newMaterial()
+  host.initialize("levels/nfsc")
+  local anim = host.getComponent("textureAnimation")
+  frames(host, 2)
+  anim.setAnimationEnabled(true)
+  frames(host, 1, 0.6)
+  local f = mats.ARROW_01_D_WorldShader.fields[0]
+  check("add stage: diffuse and emissive show frame 1", f and f.baseColorMap == "add/a1.dds" and f.emissiveMap == "add/a1.dds",
+    f and (tostring(f.baseColorMap) .. " / " .. tostring(f.emissiveMap)))
+  host.onExtensionUnloaded()
+  f = mats.ARROW_01_D_WorldShader.fields[0]
+  check("add stage: shutdown puts both maps back on frame 0", f.baseColorMap == "add/a0.dds" and f.emissiveMap == "add/a0.dds",
+    tostring(f.baseColorMap) .. " / " .. tostring(f.emissiveMap))
+end
+
 -- 5. missing data does not break the host
 do
   local host = fresh({})
