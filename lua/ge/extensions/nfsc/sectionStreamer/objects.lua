@@ -20,9 +20,9 @@ end
 
 function destroyRuntimeGroup()
   local g = scenetree.findObject(TUNING.runtimeGroupName)
-  if g then pcall(g.delete, g) end
+  if g then do local ok_, e_ = pcall(g.delete, g) if not ok_ then engineFail("objects.delete", e_) end end end
   runtimeGroup = nil
-  if shellScratch then pcall(shellScratch.delete, shellScratch); shellScratch = nil end
+  if shellScratch then do local ok_, e_ = pcall(shellScratch.delete, shellScratch) if not ok_ then engineFail("objects.delete", e_) end end; shellScratch = nil end
 end
 
 function fieldText(value)
@@ -120,19 +120,19 @@ function createStreamedObject(item, nameOverride, diag)
   if diag then diag:recordOperation("createObject", diagCreateObjectMs, currentSectionID, item.__streamKey or item.name, shape, split.path, diagCreateObjectMs, "createObject API elapsed") end
   if not obj then return nil, "createObject(TSStatic) returned nil" end
   local diagFieldsStart = diag and diag:now()
-  pcall(obj.setField, obj, "shapeName", 0, shape)
+  do local ok_, e_ = pcall(obj.setField, obj, "shapeName", 0, shape) if not ok_ then engineFail("objects.setField", e_, "shapeName") end end
   for field, value in pairs(item) do
     if field ~= "shapeName" and not RESERVED[field] then
       local text = fieldText(value)
       if text ~= nil then
-        pcall(obj.setField, obj, field, 0, text)
-        if applied then applied[field] = true end
+        do local ok_, e_ = pcall(obj.setField, obj, field, 0, text) if not ok_ then engineFail("objects.setField", e_, field) end end
+        if applied then applied[field] = text end
       end
     end
   end
   if TUNING.forceCollisionNone then
-    pcall(obj.setField, obj, "collisionType", 0, "None")
-    pcall(obj.setField, obj, "decalType", 0, "None")
+    do local ok_, e_ = pcall(obj.setField, obj, "collisionType", 0, "None") if not ok_ then engineFail("objects.setField", e_, "collisionType") end end
+    do local ok_, e_ = pcall(obj.setField, obj, "decalType", 0, "None") if not ok_ then engineFail("objects.setField", e_, "decalType") end end
   end
   local t2 = os.clock()
   if diag then diag:recordOperation("field-application", (diag:now() - diagFieldsStart) * 1000, currentSectionID, item.__streamKey or item.name, shape, split.path, nil, "fieldText formatting + setField API calls; mixed elapsed scope") end
@@ -149,12 +149,12 @@ function createStreamedObject(item, nameOverride, diag)
   end
   if ok and err == false then ok, err = false, "the engine refused it (returned false)" end
   if not ok then
-    pcall(obj.delete, obj)
+    do local ok_, e_ = pcall(obj.delete, obj) if not ok_ then engineFail("objects.delete", e_) end end
     return nil, "registerObject failed: " .. tostring(err)
   end
   local t3 = os.clock()
   local group = ensureRuntimeGroup()
-  pcall(group.addObject, group, obj)
+  do local ok_, e_ = pcall(group.addObject, group, obj) if not ok_ then engineFail("objects.addObject", e_) end end
   local t4 = os.clock()
   if diag then diag:recordOperation("group-add", (t4 - t3) * 1000, currentSectionID, item.__streamKey or wantedName, shape, split.path, (t4 - t3) * 1000, "SimGroup.addObject API elapsed") end
   if applied then shellFields[obj:getID()] = applied end
@@ -222,7 +222,7 @@ function deleteLive(key, diag)
   local obj = scenetree.findObjectById(entry.id)
   if obj then
     local deleteStart = diag and diag:now()
-    pcall(obj.delete, obj)
+    do local ok_, e_ = pcall(obj.delete, obj) if not ok_ then engineFail("objects.delete", e_) end end
     if diag then local ms = (diag:now() - deleteStart) * 1000; diag:recordOperation("object-delete-api", ms, currentSectionID, key, entry.shape, "delete", ms, "object.delete API elapsed") end
   end
 end
@@ -234,15 +234,15 @@ function hold.hideAmbient(obj, id)
   if not TUNING.restartAmbient then return end
   local applied = shellFields[id]
   if not (applied and applied.playAmbient) then return end
-  pcall(obj.setField, obj, "playAmbient", 0, "0")
-  pcall(obj.postApply, obj)
+  do local ok_, e_ = pcall(obj.setField, obj, "playAmbient", 0, "0") if not ok_ then engineFail("objects.setField", e_, "playAmbient") end end
+  do local ok_, e_ = pcall(obj.postApply, obj) if not ok_ then engineFail("objects.postApply", e_) end end
 end
 
 function hold.showAmbient(obj, item)
   local v = item.playAmbient
   if not TUNING.restartAmbient or not (v == true or v == 1 or v == "1" or v == "true") then return end
-  pcall(obj.setField, obj, "playAmbient", 0, "1")
-  pcall(obj.postApply, obj)
+  do local ok_, e_ = pcall(obj.setField, obj, "playAmbient", 0, "1") if not ok_ then engineFail("objects.setField", e_, "playAmbient") end end
+  do local ok_, e_ = pcall(obj.postApply, obj) if not ok_ then engineFail("objects.postApply", e_) end end
   hold.stats.ambient = hold.stats.ambient + 1
 end
 

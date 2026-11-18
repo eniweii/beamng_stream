@@ -15,6 +15,8 @@
 --
 -- Events (coarse, via extensions.hook):
 --   onNfscStreamerInitialized()
+--   onNfscSectionsReady()                              -- once every section file is read and checked in (the shape index is built);
+--                                                      -- level objects that register late can be looked for again
 --   onNfscSectionChanged(newSectionID, oldSectionID)   -- nil = camera outside every section
 -- Events (fine, via M.addListener(table)); each is called as listener:method(...):
 --   onObjectCreated(key, obj, item)   onObjectDeleted(key)   onStreamerReset()
@@ -135,6 +137,7 @@ function resetState()
   seenShapes, shapeLive, recentFirstMs, idleFrameMs = {}, {}, nil, nil
   change, frameDeleteMs = newChange(), 0
   for k in pairs(fb.ms) do fb.ms[k], fb.avg[k] = 0, 0 end
+  fb.eff, fb.frameEma = nil, nil
   changeStamp, createdSinceChange, settled, settleSeconds, settlePeak = 0, 0, true, 0, 0
   resetPoolState()                                             -- the runtime group (and its shells) was deleted before this
 end
@@ -161,6 +164,8 @@ function M.initialize(basePath)
   end
   initialized = true
   if readPresets().startup then M.loadPreset("startup") end
+  if pendingState then applyReloadState(pendingState); pendingState = nil end   -- the live state before a Lua reload wins over the startup preset
+  if not hold.mem.provider and hold.engineMemory() then M.setMemoryProvider(hold.engineMemory) end   -- the game's own numbers, unless a provider was set
   local okShapes, errShapes = pcall(loadShapeList)
   if not okShapes then warm = newWarm(); logMsg("W", "the shape index could not be started: %s", tostring(errShapes)) end
   hold.costLoad()
@@ -189,6 +194,7 @@ function M.resetStats()
   for k in pairs(fb.ms) do fb.ms[k], fb.avg[k] = 0, 0 end
   changeStamp, createdSinceChange, settled, settleSeconds, settlePeak = totalTime, 0, true, 0, 0
   createdTotal, deletedTotal, failureCount, failures = 0, 0, 0, {}
+  engineFails = { total = 0, sites = {}, order = {} }
   droppedSections, droppedObjects, droppedLast = 0, 0, nil
   for k in pairs(shellStats) do shellStats[k] = 0 end
   shellStats.peakLive = liveCount
@@ -284,7 +290,7 @@ function M.onUpdate(dtReal)
     local queuedN = math.max(0, lqTail - lqHead + 1) + math.max(0, pqTail - pqHead + 1)
     local poolN = poolTotal()
     diag:beginFrame({
-      started = diag:now(), section = currentSectionID, budgetMs = TUNING.frameBudgetMs,
+      started = diag:now(), section = currentSectionID, budgetMs = fb.budget(),
       queue = { urgent = math.max(0, pqTail - pqHead + 1), load = math.max(0, lqTail - lqHead + 1),
         queued = queuedN, pending = pendingCount, reads = math.max(0, srTail - srHead + 1),
         unloads = math.max(0, uqTail - uqHead + 1), deferred = deferredN, backlog = queuedN + pendingCount + deferredN + math.max(0, srTail - srHead + 1),
@@ -297,6 +303,7 @@ function M.onUpdate(dtReal)
   end
   local selectionStart = diag and diag:beginStage("selection")
   totalTime = totalTime + (dtReal or 0)
+  fb.adapt(dtReal)
   if hold.always.dirty then hold.activateAlways() end
   updateCamera(dtReal or 0)
   priorityTimer = priorityTimer + (dtReal or 0)
@@ -485,6 +492,30 @@ function M.onExtensionUnloaded()
   while not hold.release(100000) do end
   resetState()
   initialized = false
+end
+
+-- A Lua reload unloads and loads the extension again. The settings that differ from the defaults and the suspend switch
+-- come back; the objects, the pool and the section selection do not (they are rebuilt from the camera). initialize
+-- applies them, after the startup preset.
+function M.onSerialize()
+  local values = {}
+  for k, v in pairs(tunableValues()) do
+    if v ~= TUNING_DEFAULTS[k] then values[k] = v end
+  end
+  return { tuning = values, suspended = suspended }
+end
+
+function applyReloadState(data)
+  if type(data.tuning) == "table" then
+    local changed = tun.apply(data.tuning, "reload")
+    if #changed > 0 then logMsg("I", "reload: %d settings restored", #changed) end
+  end
+  if type(data.suspended) == "boolean" then suspended = data.suspended end
+end
+
+function M.onDeserialized(data)
+  if type(data) ~= "table" then return end
+  if initialized then applyReloadState(data) else pendingState = data end
 end
 
 return M

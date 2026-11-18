@@ -55,11 +55,33 @@ fb = {
   avg = { reads = 0, deletes = 0, creates = 0, shells = 0, warm = 0 },     -- the same as a moving average (0.9 / 0.1)
 }
 
-function fb.remaining() return TUNING.frameBudgetMs - (os.clock() - fb.start) * 1000 end
+-- The budget in use: TUNING.frameBudgetMs, or less while the adaptive budget is on (fb.eff, see fb.adapt).
+function fb.budget() return fb.eff or TUNING.frameBudgetMs end
+
+function fb.remaining() return fb.budget() - (os.clock() - fb.start) * 1000 end
+
+-- Adaptive budget, once per frame with the real frame time. TUNING.frameBudgetMs is the ceiling. The ceiling is also held
+-- to what the target leaves after the game's own frame time while nothing loads (idleFrameMs). Over the target the budget
+-- shrinks by 15 % a frame, under 85 % of it it grows by 0.25 ms a frame. Frames over half a second (loading screens,
+-- pauses) are not measured.
+function fb.adapt(dtReal)
+  local ceiling = TUNING.frameBudgetMs
+  if not TUNING.adaptiveBudget then fb.eff, fb.frameEma = nil, nil; return end
+  local ms = (dtReal or 0) * 1000
+  if ms <= 0 or ms >= 500 then return end
+  fb.frameEma = fb.frameEma and (fb.frameEma * 0.8 + ms * 0.2) or ms
+  local target = TUNING.adaptiveTargetMs
+  local floor = math.min(TUNING.adaptiveMinMs, ceiling)
+  if idleFrameMs then ceiling = math.min(ceiling, math.max(floor, target - idleFrameMs)) end
+  local eff = math.min(fb.eff or ceiling, ceiling)
+  if fb.frameEma > target then eff = eff * 0.85
+  elseif fb.frameEma < target * 0.85 then eff = eff + 0.25 end
+  fb.eff = math.max(floor, math.min(ceiling, eff))
+end
 
 -- min(share of the main budget, what the frame has left); 0 when the frame is already spent.
 function fb.cap(share)
-  local cap = TUNING.frameBudgetMs * share
+  local cap = fb.budget() * share
   local left = fb.remaining()
   if left < cap then cap = left end
   return cap > 0 and cap or 0
@@ -94,15 +116,16 @@ createdTotal, deletedTotal, failureCount, verified = 0, 0, 0, 0
 failures = {}
 listeners = {}
 runtimeGroup = nil
-shellFree, shellFreeN = {}, 0      -- object ids of parked shells, last in first out
-shellFields = {}                   -- object id -> set of field names its current item applied
+shellFreeDot, shellFreeByShape, shellFreeInfo, shellFreeN = {}, {}, {}, 0   -- parked shells: wearing the dot shape / wearing a shape / id -> { shape, at }
+shellFields = {}                   -- object id -> field name -> the text its current item applied
 shellDefaults, shellScratch = {}, nil   -- field name -> engine default text (read once from an untouched object)
 droppedSections, droppedObjects, droppedLast = 0, 0, nil   -- sections entered but left before their load settled
 shellSerial, shellBuildFails, shellBuildOff = 0, 0, false
 dormant, dormantOrder, doHead, doTail, dormantCount, dormantSerial = {}, {}, 1, 0, 0, 0   -- resident mode: key -> { id, shape, stamp }, oldest first
 dormantByShape = {}                -- shape -> keys of deactivated residents that can be reused without changing shapeName
 shellStats = { built = 0, buildMs = 0, recycled = 0, recycleMs = 0, fresh = 0, parked = 0, parkMs = 0, peakLive = 0,
-                     revived = 0, reviveMs = 0, deactivated = 0, evicted = 0, residentShapeReuses = 0, residentShapeReuseMs = 0 }
+                     revived = 0, reviveMs = 0, deactivated = 0, evicted = 0, residentShapeReuses = 0, residentShapeReuseMs = 0,
+                     shapeKept = 0, fieldsSkipped = 0, fieldsWritten = 0 }
 scratch = { x = 0, y = 0 }
 aheadPoint = { x = 0, y = 0 }
 
@@ -118,11 +141,45 @@ function logMsg(level, fmt, ...)
   if log then log(level, "nfscSectionStreamer", msg) else print("[nfscSectionStreamer] " .. msg) end
 end
 
+-- Camera position as three numbers. core_camera.getPositionXYZ does not allocate a vec3; getPosition is the fallback.
+function cameraXYZ()
+  local c = core_camera
+  if not c then return nil end
+  if c.getPositionXYZ then
+    local x, y, z = c.getPositionXYZ()
+    if x then return x, y, z end
+  end
+  local p = c.getPosition and c.getPosition()
+  if p then return p.x, p.y, p.z end
+  return nil
+end
+
 function recordFailure(msg)
   failureCount = failureCount + 1
   failures[#failures + 1] = msg
   if #failures > 20 then table.remove(failures, 1) end
   logMsg("E", "%s", msg)
+end
+
+-- Engine calls that run under pcall and whose result nobody used before (setField, postApply, hidden, addObject,
+-- delete). A failure is counted per site ("pool.setField:shapeName"); the first one per site is logged when
+-- Debug > Log engine call failures is on. The success path of those calls only pays one branch.
+engineFails = { total = 0, sites = {}, order = {} }
+function engineFail(site, err, detail)
+  local key = detail ~= nil and (site .. ":" .. tostring(detail)) or site
+  local e = engineFails
+  e.total = e.total + 1
+  local rec = e.sites[key]
+  if not rec then
+    if #e.order >= 64 then key = "other"; rec = e.sites[key] end
+    if not rec then
+      rec = { n = 0, first = tostring(err) }
+      e.sites[key] = rec
+      e.order[#e.order + 1] = key
+    end
+    if TUNING.logEngineFailures then logMsg("W", "engine call failed at %s: %s", key, tostring(err)) end
+  end
+  rec.n = rec.n + 1
 end
 
 function notify(method, ...)

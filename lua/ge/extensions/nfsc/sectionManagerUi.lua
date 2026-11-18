@@ -161,7 +161,11 @@ local function drawBudgetUse(st)
   if not b then return end
   im.TextDisabled(string.format("Streaming per frame (avg): reads %.2f, deletes %.2f, creates %.2f, shells %.2f, holds %.2f ms",
     b.avgMs.reads, b.avgMs.deletes, b.avgMs.creates, b.avgMs.shells, b.avgMs.warm))
-  im.TextDisabled(string.format("Streaming per frame: budget %.1f ms", b.mainMs))
+  if b.adaptive then
+    im.TextDisabled(string.format("Streaming per frame: budget %.1f ms in use (ceiling %.1f ms, frame %s ms)", b.effectiveMs, b.mainMs, b.frameEmaMs and string.format("%.1f", b.frameEmaMs) or "n/a"))
+  else
+    im.TextDisabled(string.format("Streaming per frame: budget %.1f ms", b.mainMs))
+  end
   tip("Time each streaming task used per frame, averaged over about 10 frames. Reads, deletes, creates, shell building and holds share the frame budget: each is capped by what the frame has left, so together they stay within it. One indivisible engine call (a first-use import) can still overrun it.")
 end
 
@@ -599,11 +603,22 @@ function M.onUpdate()
     end
     im.Text(string.format("Scene: %d emitters, %d lights, %d shown    Managed streamed objects: %d    Unknown flags: %d",
       st.sceneEmitters or 0, st.sceneLights or 0, st.sceneShown or 0, st.managedObjectsLive or 0, st.unknownFlagCount or 0))
+    if im.Button("Scene report to log##scenerep") then nfsc_sectionManager.explainScene() end
+    im.SameLine()
+    if im.Button("Rescan scene##scenerescan") then nfsc_sectionManager.rescanScene() end
+    tip("Looks for the emitters and lights with a sectionID again. Use it if the scene count above is 0 or objects were added after the level loaded.")
+    tip("Writes to the log why each emitter and light is on or off (class switch, no active section, override, far clip) and whether the engine agrees with the manager.")
     drawPurge(st)
     im.Separator()
     drawTuning(st)
     if (st.failureCount or 0) > 0 and im.TreeNode1("Last failures") then
       for _, msg in ipairs(nfsc_sectionStreamer.getFailures()) do im.TextWrapped(msg) end
+      im.TreePop()
+    end
+    if (st.engineFailCount or 0) > 0 and im.TreeNode1(string.format("Engine call failures (%d)##engfail", st.engineFailCount)) then
+      for _, e in ipairs(nfsc_sectionStreamer.getEngineFailures()) do
+        im.TextWrapped(string.format("%s: %d  (first: %s)", e.site, e.count, e.first))
+      end
       im.TreePop()
     end
   end

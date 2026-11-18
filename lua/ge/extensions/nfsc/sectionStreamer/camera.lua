@@ -65,33 +65,33 @@ end
 -- Tracks the camera velocity and picks the section to stream for: the one under the camera, or,
 -- once it has been stable for predictionStableTime, the one the camera is about to enter.
 function updateCamera(dt)
-  local cam = core_camera and core_camera.getPosition and core_camera.getPosition()
-  if not cam then return end
   selectTimer = selectTimer + dt
   local interval = currentSectionID and TUNING.selectionInterval or TUNING.noSectionLookupInterval
   if selectTimer < interval then return end
+  local cx, cy, cz = cameraXYZ()                                   -- only when a lookup is due, not every frame
+  if not cx then return end
   local step = math.min(selectTimer, 1.0)
   selectTimer = 0
 
   local vx, vy = 0, 0
-  if camPos then vx, vy = (cam.x - camPos.x) / step, (cam.y - camPos.y) / step end
+  if camPos then vx, vy = (cx - camPos.x) / step, (cy - camPos.y) / step end
   camPos = camPos or { x = 0, y = 0 }
-  camPos.x, camPos.y = cam.x, cam.y
+  camPos.x, camPos.y = cx, cy
   if math.sqrt(vx * vx + vy * vy) > TUNING.predictionMaxSpeed then
     camVel.x, camVel.y = 0, 0                                      -- a jump, not driving
   else
     camVel.x, camVel.y = camVel.x * 0.5 + vx * 0.5, camVel.y * 0.5 + vy * 0.5
   end
 
-  scratch.x, scratch.y = cam.x, cam.y
-  local actual = sectionAt(scratch, cam.z)
+  scratch.x, scratch.y = cx, cy
+  local actual = sectionAt(scratch, cz)
   local desired = actual
   predictedSectionID = nil
   local speed = math.sqrt(camVel.x * camVel.x + camVel.y * camVel.y)
   if TUNING.predictionEnabled and speed >= TUNING.predictionMinSpeed then
     local reach = math.min(TUNING.predictionSeconds, TUNING.predictionMaxDistance / speed)
-    aheadPoint.x, aheadPoint.y = cam.x + camVel.x * reach, cam.y + camVel.y * reach
-    predictedSectionID = sectionAt(aheadPoint, cam.z)
+    aheadPoint.x, aheadPoint.y = cx + camVel.x * reach, cy + camVel.y * reach
+    predictedSectionID = sectionAt(aheadPoint, cz)
   end
   if predictedSectionID and predictedSectionID ~= actual then
     if aheadCandidate == predictedSectionID then

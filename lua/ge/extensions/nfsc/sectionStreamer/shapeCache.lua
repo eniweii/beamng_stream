@@ -145,6 +145,7 @@ function hold.scanFinish(sc)
   sc.done, sc.perSection, sc.counts, sc.terrain = true, nil, nil, nil               -- the working tables are no longer needed
   logMsg("D", "shape index built: %d unique shapes from %d section files (%d records, %d unreadable), %.1f s of reads in %.0f s of idle time",
     #names, sc.files, sc.records, sc.failed, sc.ms / 1000, sc.runSeconds)
+  hook("onNfscSectionsReady")                                          -- every section file is read and checked in
 end
 
 -- Returns how many section files it read this frame.
@@ -165,7 +166,7 @@ function hold.scanUpdate(dt)
     if sc.idle < ((TUNING.shapeCacheAtLoad and not hold.started) and 0 or TUNING.shapeCacheIdleSeconds) then return 0 end
   end
   sc.runSeconds = sc.runSeconds + dt
-  local limit = first and TUNING.frameBudgetMs or fb.cap(TUNING.shapeIndexBudgetShare)
+  local limit = first and fb.budget() or fb.cap(TUNING.shapeIndexBudgetShare)
   local started, n = os.clock(), 0
   while sc.pos <= #sc.ids do
     if n > 0 and (os.clock() - started) * 1000 >= limit then break end
@@ -237,20 +238,20 @@ function hold.placeholderStep()
   if limit <= 0 then return 0 end
   local group = hold.ensureGroup()
   if not group then return 0 end
-  local cam = core_camera and core_camera.getPosition and core_camera.getPosition()
-  local pos = cam and string.format("%.3f %.3f %.3f", cam.x, cam.y, cam.z - 800) or "0 0 -800"
+  local cx, cy, cz = cameraXYZ()
+  local pos = cx and string.format("%.3f %.3f %.3f", cx, cy, cz - 800) or "0 0 -800"
   local started, built = os.clock(), 0
   while hold.phN < want and built < 8 do
     local obj = createObject("TSStatic")
     if not obj then break end
-    pcall(function() obj.hidden = true end)
-    pcall(obj.setField, obj, "shapeName", 0, TUNING.shellShape)
-    pcall(obj.setField, obj, "position", 0, pos)
-    pcall(obj.setField, obj, "collisionType", 0, "None")
-    pcall(obj.setField, obj, "decalType", 0, "None")
+    do local ok_, e_ = pcall(function() obj.hidden = true end) if not ok_ then engineFail("shapeCache.hidden", e_) end end
+    do local ok_, e_ = pcall(obj.setField, obj, "shapeName", 0, TUNING.shellShape) if not ok_ then engineFail("shapeCache.setField", e_, "shapeName") end end
+    do local ok_, e_ = pcall(obj.setField, obj, "position", 0, pos) if not ok_ then engineFail("shapeCache.setField", e_, "position") end end
+    do local ok_, e_ = pcall(obj.setField, obj, "collisionType", 0, "None") if not ok_ then engineFail("shapeCache.setField", e_, "collisionType") end end
+    do local ok_, e_ = pcall(obj.setField, obj, "decalType", 0, "None") if not ok_ then engineFail("shapeCache.setField", e_, "decalType") end end
     local okc, res = pcall(obj.registerObject, obj, "")
-    if not (okc and res ~= false) then pcall(obj.delete, obj); break end
-    pcall(group.addObject, group, obj)
+    if not (okc and res ~= false) then do local ok_, e_ = pcall(obj.delete, obj) if not ok_ then engineFail("shapeCache.delete", e_) end end; break end
+    do local ok_, e_ = pcall(group.addObject, group, obj) if not ok_ then engineFail("shapeCache.addObject", e_) end end
     hold.phN = hold.phN + 1
     hold.ph[hold.phN] = obj:getID()
     built = built + 1
@@ -270,22 +271,22 @@ function hold.add(name, channel)
   local ok = false
   local obj = hold.takePlaceholder()
   if obj then
-    pcall(obj.setField, obj, "shapeName", 0, name)             -- the load happens here, on the dot-wearing object
-    pcall(obj.postApply, obj)
+    do local ok_, e_ = pcall(obj.setField, obj, "shapeName", 0, name) if not ok_ then engineFail("shapeCache.setField", e_, "shapeName") end end             -- the load happens here, on the dot-wearing object
+    do local ok_, e_ = pcall(obj.postApply, obj) if not ok_ then engineFail("shapeCache.postApply", e_) end end
     ok = true
   else
-    local cam = core_camera and core_camera.getPosition and core_camera.getPosition()
-    local pos = cam and string.format("%.3f %.3f %.3f", cam.x, cam.y, cam.z - 800) or "0 0 -800"
+    local cx, cy, cz = cameraXYZ()
+    local pos = cx and string.format("%.3f %.3f %.3f", cx, cy, cz - 800) or "0 0 -800"
     obj = createObject("TSStatic")
     if obj then
-      pcall(function() obj.hidden = true end)
-      pcall(obj.setField, obj, "shapeName", 0, name)
-      pcall(obj.setField, obj, "position", 0, pos)
-      pcall(obj.setField, obj, "collisionType", 0, "None")
-      pcall(obj.setField, obj, "decalType", 0, "None")
+      do local ok_, e_ = pcall(function() obj.hidden = true end) if not ok_ then engineFail("shapeCache.hidden", e_) end end
+      do local ok_, e_ = pcall(obj.setField, obj, "shapeName", 0, name) if not ok_ then engineFail("shapeCache.setField", e_, "shapeName") end end
+      do local ok_, e_ = pcall(obj.setField, obj, "position", 0, pos) if not ok_ then engineFail("shapeCache.setField", e_, "position") end end
+      do local ok_, e_ = pcall(obj.setField, obj, "collisionType", 0, "None") if not ok_ then engineFail("shapeCache.setField", e_, "collisionType") end end
+      do local ok_, e_ = pcall(obj.setField, obj, "decalType", 0, "None") if not ok_ then engineFail("shapeCache.setField", e_, "decalType") end end
       local okc, res = pcall(obj.registerObject, obj, "")
       ok = okc and res ~= false
-      if ok then pcall(group.addObject, group, obj) else pcall(obj.delete, obj) end
+      if ok then do local ok_, e_ = pcall(group.addObject, group, obj) if not ok_ then engineFail("shapeCache.addObject", e_) end end else do local ok_, e_ = pcall(obj.delete, obj) if not ok_ then engineFail("shapeCache.delete", e_) end end end
     end
   end
   local ms = (os.clock() - started) * 1000
@@ -319,7 +320,7 @@ function hold.release(batch)
   local n = 0
   for name, id in pairs(hold.ids) do
     local obj = scenetree.findObjectById(id)
-    if obj then pcall(obj.delete, obj) end
+    if obj then do local ok_, e_ = pcall(obj.delete, obj) if not ok_ then engineFail("shapeCache.delete", e_) end end end
     hold.ids[name], hold.shape[name] = nil, nil
     hold.held = hold.held - 1
     n = n + 1
@@ -327,14 +328,14 @@ function hold.release(batch)
   end
   while hold.phN > 0 do
     local obj = scenetree.findObjectById(hold.ph[hold.phN])
-    if obj then pcall(obj.delete, obj) end
+    if obj then do local ok_, e_ = pcall(obj.delete, obj) if not ok_ then engineFail("shapeCache.delete", e_) end end end
     hold.ph[hold.phN] = nil
     hold.phN = hold.phN - 1
     n = n + 1
     if n >= batch then return false end
   end
   local g = scenetree.findObject(TUNING.warmGroupName)
-  if g then pcall(g.delete, g) end
+  if g then do local ok_, e_ = pcall(g.delete, g) if not ok_ then engineFail("shapeCache.delete", e_) end end end
   if hold.group or hold.costDirty > 0 then logMsg("D", "shape cache: holders released") end
   hold.costSave()
   hold.reset()
@@ -650,7 +651,7 @@ function hold.evictStep(cap)
     k = name
     if not (hold.islandSet and hold.islandSet[name]) and (shapeLive[name] or 0) == 0 then
       local obj = scenetree.findObjectById(id)
-      if obj then pcall(obj.delete, obj) end
+      if obj then do local ok_, e_ = pcall(obj.delete, obj) if not ok_ then engineFail("shapeCache.delete", e_) end end end
       hold.ids[name], hold.shape[name] = nil, nil
       hold.held, hold.evicted, n = hold.held - 1, hold.evicted + 1, n + 1
       if hold.held <= cap or n >= 16 then break end
@@ -804,6 +805,16 @@ end
 
 -- fn() returns { freeGB, availableGB, processGB } (any may be nil). Without a provider the RAM floor has nothing to compare.
 function M.setMemoryProvider(fn) hold.mem.provider = type(fn) == "function" and fn or nil end
+
+-- Default source, from Engine.Platform.getMemoryInfo (bytes). freeGB is availableBytes: the RAM floor compares that one.
+-- availableGB is the machine's available physical memory (osPhysAvailable), processGB this process's physical use.
+function hold.engineMemory()
+  local platform = Engine and Engine.Platform
+  local info = platform and platform.getMemoryInfo and platform.getMemoryInfo()
+  if type(info) ~= "table" then return nil end
+  local function gb(v) return type(v) == "number" and v / 1073741824 or nil end
+  return { freeGB = gb(info.availableBytes), availableGB = gb(info.osPhysAvailable), processGB = gb(info.processPhysUsed) }
+end
 
 -- The shape cache lines of the run summary: key=value, fixed order, units in the names (header cacher-log v1).
 function hold.logSummary()

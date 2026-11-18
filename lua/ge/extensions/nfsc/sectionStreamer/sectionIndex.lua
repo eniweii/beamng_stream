@@ -54,10 +54,17 @@ function findSection(p)
     if isInSection(p, id) then return id end
   end
   local bestID, bestDist = nil, math.huge
+  local tol = TUNING.containmentTolerance
+  local px, py = p.x, p.y
   for i = 1, #sectionOrder do
     local id = sectionOrder[i]
-    local d = distanceToPolygonEdges(p, sections[id].points)
-    if d <= TUNING.containmentTolerance and d < bestDist then bestID, bestDist = id, d end
+    local s = sections[id]
+    local bmin, bmax = s.boundsMin, s.boundsMax
+    -- a polygon lies inside its bounds, so it is no closer than the bounds widened by the tolerance: skip it before measuring
+    if px >= bmin.x - tol and px <= bmax.x + tol and py >= bmin.y - tol and py <= bmax.y + tol then
+      local d = distanceToPolygonEdges(p, s.points)
+      if d <= tol and d < bestDist then bestID, bestDist = id, d end
+    end
   end
   return bestID
 end

@@ -24,7 +24,7 @@ local function fresh(tuning, keepFilter)
   local manager = H.load(repo .. "/lua/ge/extensions/nfsc/sectionManager.lua")
   nfsc_sectionManager = manager
   H.loaded = { streamer, manager }
-  streamer.setTuning({ maxFirstUsePerFrame = 1000, indexBeforeStreaming = false })   -- the first-use cap has its own test (21); level-load indexing has test 1b
+  streamer.setTuning({ maxFirstUsePerFrame = 1000, indexBeforeStreaming = false, creationMode = "current" })   -- the first-use cap has its own test (21); level-load indexing has test 1b
   if tuning then streamer.setTuning(tuning) end
   manager.onExtensionLoaded()
   if not keepFilter then streamer.setCreateFilter(nil) end
@@ -549,12 +549,12 @@ do
   s.initialize("levels/nfsc")
   H.cam = { x = 0, y = 0, z = 0 }
   H.tick(s, 1, 0.1)
-  eq(table.concat(s.getLoadOrder(), ","), "9001,9002,9003", "standing still: static order")
+  eq(table.concat(s.getLoadOrder(), ","), "9001,9002,9003,1021,1022,1101", "standing still: static order, the always-loaded sections last")
   for _ = 1, 8 do
     H.cam.x = H.cam.x - 3                                        -- 30 m/s west
     H.tick(s, 1, 0.1)
   end
-  eq(table.concat(s.getLoadOrder(), ","), "9001,9003,9002", "heading west: the section ahead loads first")
+  eq(table.concat(s.getLoadOrder(), ","), "9001,9003,9002,1021,1022,1101", "heading west: the section ahead loads first, the always-loaded sections last")
   H.readFilter = nil
 end
 
@@ -599,9 +599,9 @@ do
   os.clock = realClock
 end
 
--- 22. first use / reload / warm split and the most expensive shapes ----------------------------------
+-- 22. first use / reload / warm split and the most expensive shapes (shapeCache off: with it a held shape is warm) -----
 do
-  local s = fresh({ unloadCooldown = 0.2 })
+  local s = fresh({ unloadCooldown = 0.2, shapeCache = false })
   settle(s, 10)
   local st = s.getStatus()
   eq(st.changeFirstUse + st.changeReload + st.changeWarm, st.changeCreates, "every create is first use, reload or warm")
@@ -827,51 +827,7 @@ do
   local before2, after2 = run({ cacheWarm = false, unloadCooldown = 1000, logEmptySettles = true })
   eq(after2 - before2, 2, "27d: logEmptySettles brings the empty one back")
 end
-do
-  -- the warm-up lane walks every shape once: used ones and ones with a .cdae are skipped, the rest imported
-  H.fsMock, H.preCdae = true, { MESH .. "XTU_TREESPINGA_1A_00.cdae" }
-  local baseline = fresh({ cacheWarm = false })       -- (every fresh() reinstalls the mock, so the comparison run goes first)
-  settle(baseline, 80)
-  local liveWithout = baseline.getStatus().liveObjectCount
-  local s = fresh({ cacheWarmIdleSeconds = 0, cacheWarmGapSeconds = 0, cacheWarmPerFrame = 1, maxCreatesPerFrame = 1, frameBudgetMs = 1000 })
-  H.tick(s, 3, 0.1)
-  eq(s.getCacheWarmStatus().imported, 0, "27e: the lane waits while the load queues have work")
-  settle(s, 80)
-  local w = s.getCacheWarmStatus()
-  check(w.available and w.finished, "27e: the lane finished")
-  eq(w.total, 9, "27e: all unique shapes of shapes.json")
-  eq(w.processed, 9, "27e: every shape was looked at once")
-  eq(w.failed, 0, "27e: no failures")
-  eq(w.imported + w.alreadyCached + w.skipped, 9, "27e: imported + already cached + skipped covers everything")
-  check(w.imported >= 1, "27e: shapes nobody used yet were imported (" .. w.imported .. ")")
-  check(#H.imported >= w.imported, "27e: the engine wrote their .cdae")
-  eq(s.getStatus().liveObjectCount, liveWithout, "27e: the warm-up objects are gone again, only the streamed ones are live")
-  check(logHas("cache warm finished"), "27e: finish line")
-  -- the same shapes are not imported twice
-  local importedNow = w.imported
-  settle(s, 40)
-  eq(s.getCacheWarmStatus().imported, importedNow, "27e: a finished lane does nothing more")
-  H.fsMock, H.preCdae = false, nil
-end
-do
-  -- no FS:fileExists: the lane stays off instead of importing blindly
-  local s = fresh({ cacheWarmIdleSeconds = 0, cacheWarmGapSeconds = 0 })
-  settle(s, 60)
-  local w = s.getCacheWarmStatus()
-  check(not w.available and w.imported == 0, "27f: the lane switched itself off")
-  check(logHas("FS:fileExists is not available"), "27f: and says why")
-  -- switched off by tuning: nothing happens either
-  H.fsMock = true
-  local off = fresh({ cacheWarm = false, cacheWarmIdleSeconds = 0, cacheWarmGapSeconds = 0 })
-  settle(off, 60)
-  eq(off.getCacheWarmStatus().imported, 0, "27f: cacheWarm = false keeps the lane idle")
-  off.setCacheWarm(true)
-  settle(off, 60)
-  check(off.getCacheWarmStatus().finished, "27f: setCacheWarm(true) starts it")
-  off.restartCacheWarm()
-  check(not off.getCacheWarmStatus().finished and off.getCacheWarmStatus().processed == 0, "27f: restartCacheWarm starts over")
-  H.fsMock = false
-end
+-- (27e/27f, the cache warm-up lane, were replaced by the shape cache; its lane is tested with the shape cache tests below)
 
 -- 28. patch 0015: shell pool (creationMode = "shells") ---------------------------------------------
 do
@@ -1178,7 +1134,7 @@ end
 
 -- 32. patch 0016: panel smoke test (mock imgui) ------------------------------------------------------
 do
-  local s, m = fresh()
+  local s, m = fresh({ creationMode = "resident" })
   settle(s, 5)
   local texts, clicks, sliders = {}, {}, {}
   local function ptr(v) return { [0] = v } end
@@ -1222,7 +1178,7 @@ do
   ui.onUpdate()
   clicks = {}
   eq(s.getTuning().maxCreatesPerFrame, 16, "32f: reset to defaults")
-  eq(s.getCreationMode(), "current", "32f: including the creation mode")
+  eq(s.getCreationMode(), s.getDefaultTuning().creationMode, "32f: including the creation mode")
   ui_imgui = nil
   H.files = {}
 end
@@ -1237,11 +1193,10 @@ do
   s.setTuning({ frameBudgetMs = 16 })
   settle(s, 10)
   check(s.getStatus().shellsBuilt > 0, "34a: with a budget they are built")
-  s.setTuning({ frameBudgetMs = 20, shellBuildBudgetShare = 0.5, deleteBudgetShare = 0.25, cacheWarmCheckShare = 0.1 })
+  s.setTuning({ frameBudgetMs = 20, shellBuildBudgetShare = 0.5, deleteBudgetShare = 0.25 })
   local caps = s.getStatus().frameBudget.capsMs
   eq(caps.shells, 10, "34b: shell build cap = share x main budget")
   eq(caps.deletes, 5, "34b: delete cap too")
-  eq(caps.warmCheck, 2, "34b: and the warm-up check")
   s.setTuning({ frameBudgetMs = 8 })
   caps = s.getStatus().frameBudget.capsMs
   eq(caps.shells, 4, "34c: changing the main budget rescales the shell cap")
@@ -1285,7 +1240,6 @@ do
   H.files["levels/nfsc/lua/streamer/tuning_presets.json"] = { old = { frameBudgetMs = 20, shellBuildBudgetMs = 5, cacheWarmCheckMs = 2 } }
   check(s.loadPreset("old"), "35g: an old preset loads")
   eq(s.getTuning().shellBuildBudgetShare, 0.25, "35g: shell build ms became a share of the budget saved with it")
-  eq(s.getTuning().cacheWarmCheckShare, 0.1, "35g: so did the warm-up check")
   H.files = {}
 end
 
@@ -1416,8 +1370,7 @@ do
   check(has("Max creates per frame"), "38a: a common setting shows in current mode")
   check(not has("Pool size") and not has("Shells built ahead") and not has("Deactivate delay"), "38a: pool settings are hidden in current mode")
   check(has("Unload cooldown"), "38a: the unload cooldown shows")
-  clicks["Shells##creation"] = true
-  frame(); clicks = {}
+  s.setCreationMode("shells")                                    -- the panel offers Current and Resident only
   frame()
   check(has("Shells built ahead") and has("Shell build share"), "38b: shell settings appear in shells mode")
   check(not has("Pool size") and not has("Deactivate delay"), "38b: resident-only settings stay hidden")
@@ -1552,6 +1505,284 @@ do
   settle(s, 3)
   eq(s.getStatus().liveObjectCount, 9, "40e: the returning section is back fast, the refill cap does not hold revives")
   eq(s.getRunStats().costlyCapHits, capsBefore, "40e: and it did not touch the refill cap")
+end
+
+-- 41. engine call failures are counted per place, logged once per place with the Debug setting ----------------
+do
+  local ok = fresh()
+  settle(ok, 10)
+  eq(ok.getStatus().engineFailCount, 0, "41a: normal operation records no engine call failure")
+  eq(#ok.getEngineFailures(), 0, "41a: and the list is empty")
+  for _, mode in ipairs({ "current", "resident" }) do
+    H.failFields = { collisionType = true }
+    local s = fresh({ creationMode = mode, logEngineFailures = true })
+    settle(s, 10)
+    H.failFields = nil
+    local st = s.getStatus()
+    check(st.engineFailCount > 0, "41b " .. mode .. ": failed setField calls are counted")
+    eq(st.liveObjectCount, 9, "41b " .. mode .. ": the objects are still created")
+    local list = s.getEngineFailures()
+    local found
+    for _, e in ipairs(list) do if e.site:find("setField:collisionType", 1, true) then found = e end end
+    check(found and found.count >= 9 and found.first:find("mock setField failure", 1, true), "41b " .. mode .. ": the place and the first error are kept")
+    local logged = 0
+    for _, l in ipairs(H.logs) do if l:find("engine call failed at", 1, true) then logged = logged + 1 end end
+    check(logged >= 1 and logged <= #list, "41b " .. mode .. ": only the first failure per place is logged (" .. logged .. " lines, " .. #list .. " places)")
+    s.resetStats()
+    eq(s.getStatus().engineFailCount, 0, "41c " .. mode .. ": resetStats clears the counts")
+    H.logs = {}
+  end
+  H.logs = {}
+  H.failFields = { collisionType = true }
+  local quiet = fresh({ logEngineFailures = false })
+  settle(quiet, 10)
+  H.failFields = nil
+  local noisy = 0
+  for _, l in ipairs(H.logs) do if l:find("engine call failed at", 1, true) then noisy = noisy + 1 end end
+  eq(noisy, 0, "41d: nothing is logged while the setting is off")
+  check(quiet.getStatus().engineFailCount > 0, "41d: but the counts are kept")
+end
+
+-- 42. a Lua reload: the settings and the suspend switch come back, nothing else -------------------------------
+do
+  local s1 = fresh({ maxCreatesPerFrame = 3, creationMode = "shells", logEngineFailures = true })
+  settle(s1, 5)
+  s1.setSuspended(true)
+  local data = s1.onSerialize()
+  eq(data.tuning.maxCreatesPerFrame, 3, "42a: a changed setting is saved")
+  eq(data.tuning.frameBudgetMs, nil, "42a: a setting at its default is not saved")
+  eq(data.suspended, true, "42a: the suspend switch is saved")
+  local s2 = H.load(repo .. "/lua/ge/extensions/nfsc/sectionStreamer.lua")        -- the extension, loaded again
+  eq(s2.getTuning().maxCreatesPerFrame ~= 3, true, "42b: the new instance starts from the defaults")
+  s2.onDeserialized(data)
+  eq(s2.getTuning().maxCreatesPerFrame ~= 3, true, "42b: nothing is applied before initialize")
+  assert(s2.initialize("levels/nfsc"))
+  local t = s2.getTuning()
+  eq(t.maxCreatesPerFrame, 3, "42c: the setting is back after initialize")
+  eq(t.creationMode, "shells", "42c: the creation mode is back")
+  eq(t.logEngineFailures, true, "42c: the debug setting is back")
+  eq(s2.isSuspended(), true, "42c: still suspended")
+  eq(s2.getStatus().liveObjectCount, 0, "42c: no object survives a reload")
+  s2.onDeserialized(nil)
+  s2.onDeserialized({ tuning = { maxCreatesPerFrame = 7 } })
+  eq(s2.getTuning().maxCreatesPerFrame, 7, "42d: a state that arrives after initialize is applied at once")
+end
+
+-- 43. scene report: why lights and emitters are on or off, and whether the engine agrees ----------------------
+do
+  local s, m = fresh()
+  local l1 = H.addSceneObject{ class = "PointLight", name = "rep_l1", sectionID = "1021" }
+  local l2 = H.addSceneObject{ class = "PointLight", name = "rep_l2", sectionID = "1101" }
+  local e1 = H.addSceneObject{ class = "ParticleEmitterNode", name = "rep_e1", sectionID = "1021" }
+  m.rescanScene()
+  settle(s, 5)
+  local r = m.getSceneReport()
+  eq(r.lights, 2, "43a: lights found"); eq(r.emitters, 1, "43a: emitters found")
+  eq(r.shown, 2, "43a: the light and the emitter of the current section are on")
+  eq(r.noActiveSection, 1, "43a: the light of an inactive section is off for that reason")
+  eq(r.engineMismatch, 0, "43a: the engine agrees")
+  m.setSceneClassEnabled("lights", false)
+  r = m.getSceneReport()
+  eq(r.classOff, 2, "43b: the Lights switch explains both lights")
+  eq(r.shown, 1, "43b: only the emitter is on")
+  m.setSceneClassEnabled("lights", true)
+  l1.isEnabled = false                                           -- something else turns it off behind the manager's back
+  r = m.getSceneReport()
+  eq(r.engineMismatch, 1, "43c: a light the engine shows off while the manager thinks it is on is reported")
+  local diff
+  for _, x in ipairs(r.samples) do if x.why == "engine state differs" then diff = x end end
+  check(diff ~= nil and diff.kind == "lights", "43c: with the reason")
+  local before = #H.logs
+  m.explainScene()
+  check(#H.logs > before, "43d: explainScene writes to the log")
+end
+
+-- 44. memory provider: the game's numbers feed the RAM floor ----------------------------------------------
+do
+  local none = fresh()
+  eq(none.getShapeCacheStatus().ramSource, false, "44a: without Engine.Platform there is no memory source")
+  Engine = { Platform = { getMemoryInfo = function() return {            -- the values from the in-game console dump
+    availableBytes = 8027410432, osPhysAvailable = 29705728000, osPhysUsed = 21678317568,
+    osVirtAvailable = 56139132928, osVirtUsed = 36665200640, processPhysUsed = 5080449024, processVirtUsed = 7233269760 } end } }
+  local s = fresh({ shapeCache = true })
+  Engine.Platform.getMemoryInfo()
+  settle(s, 5)
+  local sc = s.getShapeCacheStatus()
+  eq(sc.ramSource, true, "44b: the engine becomes the memory source")
+  check(math.abs(sc.memory.freeGB - 8027410432 / 1073741824) < 1e-6, "44b: freeGB is availableBytes")
+  check(math.abs(sc.memory.availableGB - 29705728000 / 1073741824) < 1e-6, "44b: availableGB is osPhysAvailable")
+  check(math.abs(sc.memory.processGB - 5080449024 / 1073741824) < 1e-6, "44b: processGB is processPhysUsed")
+  local custom = fresh({ shapeCache = true })
+  custom.setMemoryProvider(function() return { freeGB = 1.0 } end)
+  assert(custom.initialize("levels/nfsc"))
+  settle(custom, 3)
+  eq(custom.getShapeCacheStatus().memory.freeGB, 1.0, "44c: a provider set before initialize is kept")
+  Engine = nil
+end
+
+-- 45. patch B: free shells wear a shape, refills skip unchanged fields ----------------------------------------
+do
+  local s = fresh()
+  local env = getfenv(s.getCurrentSectionID)
+  local function expectTake(shape, id, wears, label)
+    local gotId, gotWears = env.freeShellTake(shape)
+    check(gotId == id and gotWears == wears, label .. " (got " .. tostring(gotId) .. ", " .. tostring(gotWears) .. ")")
+  end
+  env.freeShellAdd(1, nil); env.freeShellAdd(2, "a"); env.freeShellAdd(3, "a"); env.freeShellAdd(4, "b"); env.freeShellAdd(5, nil)
+  eq(env.shellFreeN, 5, "45a: five free shells")
+  expectTake("a", 3, true, "45a: a shell that wears the shape is taken first")
+  expectTake("a", 2, true, "45a: and the next one")
+  expectTake("a", 5, false, "45a: none left: a dot shell, so shaped shells stay available")
+  env.freeShellRemove(1)
+  eq(env.shellFreeN, 1, "45a: removing by id keeps the count")
+  expectTake("zz", 4, false, "45a: only a shaped shell left: it is taken anyway")
+  expectTake("zz", nil, false, "45a: nothing left")
+  check(next(env.shellFreeInfo) == nil and #env.shellFreeDot == 0 and next(env.shellFreeByShape) == nil, "45a: the index is empty again")
+  env.freeShellAdd(7, env.TUNING.shellShape)
+  expectTake(env.TUNING.shellShape, 7, true, "45a: a shell on the dot shape matches the dot shape")
+
+  -- 45b: an evicted shell is reused as it is: no shapeName write, unchanged fields skipped, changed ones written
+  local r = fresh({ creationMode = "resident" })
+  local made = {}
+  r.addListener({ onObjectCreated = function(self, key, obj, item) made[item.name] = { key = key, obj = obj, item = item } end })
+  settle(r, 5)
+  local gate = made["XWS_BARRIERCHGATE_1A_00_016"]
+  r.releaseObject(gate.key, gate.item)
+  settle(r, 40)
+  local renv = getfenv(r.getCurrentSectionID)
+  eq(r.getStatus().residentDormant, 1, "45b: the gate rests in the pool")
+  renv.evictOldest(1)
+  local info = renv.shellFreeInfo[gate.obj:getID()]
+  check(info and info.shape == gate.item.shapeName, "45b: the evicted shell is indexed under the shape it wears")
+  local writes = 0
+  local orig = gate.obj.setField
+  gate.obj.setField = function(self, name, ...) if name == "shapeName" then writes = writes + 1 end return orig(self, name, ...) end
+  local item2 = {}
+  for k, v in pairs(gate.item) do item2[k] = v end
+  item2.__streamKey = "45b_other_key"
+  item2.position = { gate.item.position[1] + 5, gate.item.position[2], gate.item.position[3] }
+  local before = r.getStatus()
+  local obj = renv.createStreamedObject(item2)
+  gate.obj.setField = orig
+  check(obj == gate.obj, "45b: the evicted shell is the one reused")
+  eq(writes, 0, "45b: the shape was not written again")
+  local st = r.getStatus()
+  eq(st.shellsShapeKept - before.shellsShapeKept, 1, "45b: counted")
+  check(st.fieldsSkipped - before.fieldsSkipped >= 2, "45b: unchanged fields were skipped (" .. (st.fieldsSkipped - before.fieldsSkipped) .. ")")
+  check(obj.fields.position ~= nil and obj.fields.position:find(tostring(item2.position[1]), 1, true), "45b: the changed position was written")
+  eq(obj.hidden, false, "45b: and the shell is shown")
+
+  -- 45c: a skipped field must not hide a real change, and a field the next item lacks goes back to the default
+  local item3 = {}
+  for k, v in pairs(item2) do item3[k] = v end
+  item3.__streamKey = "45c_key"
+  item3.sectionOverrideName = nil
+  renv.parkShell(obj:getID())
+  local obj3 = renv.acquireShell(item3)
+  check(obj3 == obj, "45c: the parked shell is taken again")
+  check(obj3.fields.sectionOverrideName == "" or obj3.fields.sectionOverrideName == nil, "45c: a field the item lacks is back to its default")
+  eq(obj3.fields.shapeName, item3.shapeName, "45c: and the shape is right after a trip through the dot")
+end
+
+-- 46. patch B: updateInstanceRenderData after a pooled object is shown again (Debug setting) ------------------
+do
+  for _, on in ipairs({ false, true }) do
+    local s = fresh({ creationMode = "resident", updateRenderData = on })
+    local made = {}
+    s.addListener({ onObjectCreated = function(self, key, obj, item) made[item.name] = { key = key, obj = obj, item = item } end })
+    settle(s, 5)
+    local gate = made["XWS_BARRIERCHGATE_1A_00_016"]
+    s.releaseObject(gate.key, gate.item)
+    settle(s, 40)
+    local e = getfenv(s.getCurrentSectionID)
+    local obj = e.createStreamedObject(gate.item)                 -- the same key: revived
+    check(obj == gate.obj, "46: the resting object is revived")
+    eq(gate.obj.renderUpdates or 0, on and 1 or 0, "46: updateInstanceRenderData " .. (on and "is called once" or "is not called while the setting is off"))
+  end
+end
+
+-- 47. patch C: adaptive frame budget -------------------------------------------------------------------------
+do
+  local s = fresh({ frameBudgetMs = 16, adaptiveBudget = false })
+  local e = getfenv(s.getCurrentSectionID)
+  H.tick(s, 20, 0.040)
+  eq(e.fb.budget(), 16, "47a: off: the budget is the setting, whatever the frame time")
+  eq(e.fb.eff, nil, "47a: and nothing adaptive is kept")
+
+  s.setTuning({ adaptiveBudget = true, adaptiveTargetMs = 20, adaptiveMinMs = 2 })
+  e.idleFrameMs = nil
+  H.tick(s, 40, 0.040)
+  check(e.fb.budget() <= 2.01 and e.fb.budget() >= 2, "47b: frames over the target shrink the budget to the minimum (" .. e.fb.budget() .. ")")
+  e.fb.start = os.clock()
+  check(e.fb.cap(1) <= 2.01, "47b: every task is capped by the budget in use")
+  local st = s.getStatus().frameBudget
+  if st then
+    eq(st.mainMs, 16, "47b: the status keeps the ceiling")
+    check(st.effectiveMs <= 2.01 and st.adaptive == true, "47b: and shows the budget in use")
+  end
+
+  e.idleFrameMs = nil
+  for _ = 1, 200 do e.fb.adapt(0.008); e.idleFrameMs = nil end
+  check(e.fb.budget() >= 15.99 and e.fb.budget() <= 16, "47c: frames well under the target grow it back to the ceiling (" .. e.fb.budget() .. ")")
+
+  e.idleFrameMs = 19.5
+  e.fb.adapt(0.010)
+  check(e.fb.budget() <= 2.01, "47d: a game frame that already takes the target leaves only the minimum (" .. e.fb.budget() .. ")")
+  e.idleFrameMs = 8
+  for _ = 1, 100 do e.fb.adapt(0.008) end
+  check(e.fb.budget() > 11.9 and e.fb.budget() <= 12.01, "47d: with an 8 ms game frame the target leaves 12 ms (" .. e.fb.budget() .. ")")
+
+  e.fb.adapt(1.0)
+  e.fb.adapt(0)
+  check(e.fb.budget() > 11.9, "47e: frames of half a second or more, and paused frames, are not measured")
+
+  s.setTuning({ adaptiveMinMs = 30 })
+  e.fb.eff = nil
+  e.fb.adapt(0.040)
+  eq(e.fb.budget(), 16, "47f: a minimum above the ceiling cannot raise the budget past it")
+
+  s.setTuning({ adaptiveBudget = false })
+  H.tick(s, 1, 0.040)
+  eq(e.fb.budget(), 16, "47g: switching it off gives the setting back at once")
+end
+
+-- 48. the scene scan retries while it finds nothing, and says what it saw ---------------------------------------
+do
+  local s, m = fresh()
+  m.onNfscStreamerInitialized()                                  -- the level has no lights yet
+  settle(s, 1)
+  eq(m.getSceneReport().lights, 0, "48a: nothing found at first")
+  local l1 = H.addSceneObject{ class = "PointLight", name = "late_l1", sectionID = "1021" }
+  local e1 = H.addSceneObject{ class = "ParticleEmitterNode", name = "late_e1", sectionID = "1021" }
+  H.addSceneObject{ class = "PointLight", name = "late_plain" }  -- a light nobody tagged
+  H.tick(s, 30, 0.1)                                              -- 3 s: the first retry is due at 2 s
+  local r = m.getSceneReport()
+  eq(r.lights, 1, "48b: the retry finds the light registered later"); eq(r.emitters, 1, "48b: and the emitter")
+  eq(r.scan.lightsWithout, 1, "48b: the scan counts lights without a sectionID")
+  check(r.scan.objects >= 3 and r.scan.withSection >= 2, "48b: and how many objects it looked at (" .. r.scan.objects .. ")")
+  eq(l1.isEnabled, true, "48c: the light of the current section is on"); eq(e1.active, true, "48c: and so is the emitter")
+  local logsBefore = #H.logs
+  H.tick(s, 600, 0.1)
+  local retries = 0
+  for i = logsBefore + 1, #H.logs do if H.logs[i]:find("trying again", 1, true) then retries = retries + 1 end end
+  eq(retries, 0, "48d: once something is found it does not retry")
+end
+
+-- 49. onNfscSectionsReady: the hook fires once the shape index is built, and the manager looks for its objects again -----
+do
+  local s, m = fresh({ shapeCache = true })
+  local fired = 0
+  H.loaded[#H.loaded + 1] = { onNfscSectionsReady = function() fired = fired + 1 end }
+  m.onNfscStreamerInitialized()                                   -- the first scan: nothing registered yet
+  eq(m.getSceneReport().lights, 0, "49a: nothing found by the first scan")
+  H.addSceneObject{ class = "PointLight", name = "ready_l1", sectionID = "1021" }
+  H.addSceneObject{ class = "ParticleEmitterNode", name = "ready_e1", sectionID = "1021" }
+  H.tick(s, 10, 0.1)                                              -- 1 s: before the first timed retry (2 s)
+  eq(fired, 1, "49b: the hook fired once, when the index was built")
+  local r = m.getSceneReport()
+  eq(r.lights, 1, "49c: the manager found the light by the hook, not by a timer"); eq(r.emitters, 1, "49c: and the emitter")
+  H.tick(s, 50, 0.1)
+  eq(fired, 1, "49d: and it does not fire again")
 end
 
 -- 33. LuaJIT: no function may get near the 60 upvalue limit ------------------------------------------

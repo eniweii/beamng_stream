@@ -11,6 +11,9 @@ TUNING = {
   maxCheapPerFrame = 1024,        -- resident mode: revives and same-shape reuses (nearly free) per frame
   maxDeletesPerFrame = 256,
   frameBudgetMs = 16.0,           -- one budget for the whole frame: deletes first, creates get what is left
+  adaptiveBudget = false,         -- the budget below is a ceiling: it shrinks while frames run over the target and grows back with headroom
+  adaptiveTargetMs = 20.0,        -- frame time the adaptive budget tries to stay under (20 = 50 fps)
+  adaptiveMinMs = 2.0,            -- the adaptive budget never goes below this
   deleteBudgetShare = 0.25,       -- deletes may use at most this share of frameBudgetMs (and never more than the frame has left)
   maxFirstUsePerFrame = 3,        -- new shapes (4-20 ms each) per frame; a later new shape waits for the next frame
   firstUseGuessMs = 6.0,          -- expected first-use cost until a real average exists
@@ -27,6 +30,8 @@ TUNING = {
   shapeCacheMax = 100000,         -- Max meshes to save: most holders kept (the fill stops there; holders of other islands are evicted first)
   shapeCacheAlways = false,       -- Preload always: fill while the camera moves too (default: only when it is still)
   debugLog = false,               -- Debug: the detailed logs (cacher lines, run summary details, fill progress)
+  logEngineFailures = false,      -- Debug: log the first failed engine call (setField, postApply, hidden, addObject, delete) per site
+  updateRenderData = false,       -- Debug: call updateInstanceRenderData after a pooled object is shown again (untested in game)
   shapeCacheAtLoad = true,        -- start filling at level load (no idle wait before the first hold)
   shapeCacheIdleSeconds = 1.0,    -- both load queues must have been empty this long before a hold (after the first)
   shapeCacheGapSeconds = 0.02,    -- pause after every hold (0 = back to back, for a loading screen)
@@ -86,6 +91,12 @@ local SHELL_MODES = { shells = true, resident = true }
 tun.schema = {
   { key = "frameBudgetMs", debug = true, group = "Frame budget", label = "Frame budget (ms)", kind = "float", min = 1, max = 50,
     desc = "Time one frame may spend on streaming: section reads, deletes, creates and shell building together. Every task below is capped by what is left of it. Higher: sections settle sooner but frames run longer. Lower: smoother frames, slower loading." },
+  { key = "adaptiveBudget", debug = true, group = "Frame budget", label = "Adaptive frame budget", kind = "bool",
+    desc = "On: the frame budget is a ceiling. It shrinks while the measured frame time is over the target and grows back with headroom, and it never goes above what the target leaves after the game's own frame time. The manager shows the value in use. Off: the budget is always the value above." },
+  { key = "adaptiveTargetMs", debug = true, group = "Frame budget", label = "Adaptive target frame time (ms)", kind = "float", min = 8, max = 100, requires = "adaptiveBudget",
+    desc = "Frame time the adaptive budget tries to stay under. 20 = 50 fps, 33 = 30 fps. Lower: smoother frames and slower loading while the game is busy." },
+  { key = "adaptiveMinMs", debug = true, group = "Frame budget", label = "Adaptive minimum budget (ms)", kind = "float", min = 0.5, max = 50, requires = "adaptiveBudget",
+    desc = "The adaptive budget never goes below this, so loading always makes some progress, even when frames are over the target." },
   { key = "deleteBudgetShare", debug = true, group = "Frame budget", label = "Delete / park share", kind = "share", min = 0.05, max = 1,
     desc = "Largest part of the frame budget that deleting (or parking / deactivating) objects may use. Deletes run first, creates get the rest. Lower: more time for creates, but objects wait longer to be removed. Higher: the unload backlog clears faster and loading slows." },
   { key = "shellBuildBudgetShare", debug = true, group = "Frame budget", label = "Shell build share", kind = "share", min = 0.01, max = 1, modes = SHELL_MODES,
@@ -145,6 +156,10 @@ tun.schema = {
     desc = "On: the fill also runs while the car and camera move (still only while nothing is queued; heavy meshes still wait for a still camera). Off: it runs only when they are still." },
   { key = "debugLog", group = "Debug", debug = true, label = "Detailed logs", kind = "bool",
     desc = "On: the cacher lines, the full run summary and the fill progress go to the log. Off: only a short summary and warnings." },
+  { key = "logEngineFailures", group = "Debug", debug = true, label = "Log engine call failures", kind = "bool",
+    desc = "On: the first failed engine call per place (setField, postApply, hidden, addObject, delete) goes to the log. The counts are always kept and shown in the manager." },
+  { key = "updateRenderData", group = "Debug", debug = true, label = "Update instance render data on show", kind = "bool",
+    desc = "On: updateInstanceRenderData is called on a pooled object when it is shown again, as the game's own show/hide node does. Off by default until it is tested in game; may matter for objects that look wrong or do not animate after being shown again." },
   { key = "shapeCacheAtLoad", debug = true, group = "Shape cache", label = "Fill at level load", kind = "bool", requires = "shapeCache",
     desc = "On: the fill starts at once, without waiting for the idle time. Off: it waits for the idle time before the first hold like after every section change." },
   { key = "shapeCacheIdleSeconds", debug = true, group = "Shape cache", label = "Idle before fill (s)", kind = "float", min = 0, max = 5, requires = "shapeCache",

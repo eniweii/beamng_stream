@@ -2,7 +2,14 @@
 
 Work list for `nfsc_sectionStreamer`, from a read of this repo and the BeamNG Lua atlas
 (https://github.com/Tim0219800/beamng-lua-atlas, docs for 0.40.5), checked against the settled rules below.
-Nothing here is built yet. Plan each item first and confirm it before any code.
+Status: patches A, B and C are written and pass the Lua suites; none of it has run in the game yet. Notes on what was built:
+- A: engine call failures counted per place (Debug > "Log engine call failures"), reload state, bounded section lookup, `getPositionXYZ`,
+  scene report for lights/emitters, memory provider (freeGB = `availableBytes`).
+- B: free shells indexed by the shape they wear (`freeShellAdd/Take/Remove`, `shellFreeDot`, `shellFreeByShape`), unchanged field texts
+  skipped on refill (transform fields and `playAmbient` are always written; counters `shapeKept`, `fieldsSkipped`, `fieldsWritten` in the
+  status), Debug setting "Update instance render data on show" (default off).
+- C: setting "Adaptive frame budget" (default off) with target and minimum; `frameBudgetMs` is the ceiling, `fb.budget()` the value in use.
+Still open: the lights/emitters report from a broken run; in-game checks of B and C.
 
 ## Where things live (after the split)
 `lua/ge/extensions/nfsc/sectionStreamer.lua` is the facade (public API, initialize / reset / purge, listeners, `onUpdate`).
@@ -43,10 +50,9 @@ locals are shared names): `stall`, `tuning`, `state`, `sectionIndex`, `objects`,
    Presets become the ceiling; the Section Manager shows the effective value.
 
 ## Waiting
-- **Memory provider for the RAM floor.** Nothing calls `M.setMemoryProvider`, so the RAM floor never compares anything. The game's
-  memory tracker (atlas: `telemetry_trackers_memory`) reads `Engine.Platform.getMemoryInfo`. Needs the output of
-  `dump(Engine.Platform.getMemoryInfo())` (and `dump(Engine.Render.getVRAMUsage())` if VRAM should count) from the in-game console
-  before mapping it to `freeGB`, `availableGB`, `processGB`.
+- **Memory provider for the RAM floor: done in patch A.** `hold.engineMemory` reads `Engine.Platform.getMemoryInfo`: freeGB = `availableBytes`
+  (the RAM floor compares it), availableGB = `osPhysAvailable`, processGB = `processPhysUsed`. A provider set before `initialize` wins.
+  VRAM (`Engine.Render.getVRAMUsage`) is not counted.
 - **Direct transform setters** (`setPosRot`, `setTransform`, `setScale`): he decides later. They conflict with the rule that
   transforms are applied exactly as exported (rotationEuler text, negative scales, no conversion).
 - **Prediction for TrackPathZones**: zones come in as `zones.json`; prediction / look-ahead becomes a `streamer_prediction`

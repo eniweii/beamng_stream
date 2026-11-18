@@ -6,6 +6,7 @@
 --
 --   component.init(ctx)                    -- once; ctx is shared by all components (see below)
 --   component.onSectionChanged(new, old)   -- optional; the streamer's onNfscSectionChanged hook, forwarded
+--   component.onSectionsReady()            -- optional; the streamer's onNfscSectionsReady hook (all section files read), forwarded
 --   component.onObjectCreated(key, obj, item), onObjectDeleted(key), onStreamerReset()
 --                                          -- optional; the streamer's object events (the host is the one listener)
 --   component.onUpdate(dtReal, dtSim)      -- optional; every frame
@@ -296,6 +297,14 @@ end
 -- Section events and frame
 -- ---------------------------------------------------------------------------
 -- Called by the streamer's hook (extensions.hook), nothing is registered on the streamer.
+-- The streamer's onNfscSectionsReady hook (every section file read and checked in), forwarded.
+function M.onNfscSectionsReady()
+  for i = 1, #components do
+    local comp = components[i]
+    if comp.ok and not comp.failed then callComponent(comp, "onSectionsReady") end
+  end
+end
+
 function M.onNfscSectionChanged(newID, oldID)
   for i = 1, #components do
     local comp = components[i]

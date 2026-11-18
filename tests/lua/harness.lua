@@ -67,7 +67,11 @@ H.decode = decode
 local function newObject(class)
   local o = { class = class, fields = {}, id = nextId, deleted = false, hidden = false, children = {} }
   nextId = nextId + 1
-  function o:setField(name, idx, value) self.fields[name] = value end
+  function o:updateInstanceRenderData() self.renderUpdates = (self.renderUpdates or 0) + 1 end
+  function o:setField(name, idx, value)
+    if H.failFields and H.failFields[name] then error("mock setField failure: " .. name) end   -- test switch: the engine rejects this field
+    self.fields[name] = value
+  end
   function o:getField(name, idx)                                      -- engine defaults for what nobody set
     if self.fields[name] ~= nil then return self.fields[name] end
     return H.fieldDefaults[name] or ""
@@ -130,7 +134,7 @@ function H.install(root)
   for _, path in ipairs(H.preCdae or {}) do H.cdaeFiles[path] = true end
   FS = H.fsMock and { fileExists = function(_, path) return H.cdaeFiles[path] == true end } or nil
   be = { reloadCollision = function() H.reloadCalls = H.reloadCalls + 1 end }
-  core_camera = { getPosition = function() return H.cam end }
+  core_camera = { getPosition = function() return H.cam end, getPositionXYZ = function() return H.cam.x, H.cam.y, H.cam.z end }
   log = function(level, origin, msg) H.logs[#H.logs + 1] = level .. " " .. msg end
   H.readFilter = nil
   jsonWriteFile = function(path, data) H.files[path] = data; return true end

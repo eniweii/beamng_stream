@@ -104,16 +104,29 @@ local function selfCheck()
   end
 end
 
+-- The scan runs once at level load. If the level had not registered its static objects yet it finds nothing,
+-- so while there are no nodes it looks again after 2, 5, 10, 20 and 40 seconds.
+local retryDelays = { 2, 5, 10, 20, 40 }
+local retryIndex, retryTimer = 1, 0
+
 local function init(ctx)
   math.randomseed(os.time())
   selfCheckDone = false
   broken = false
+  retryIndex, retryTimer = 1, 0
   scanNodes()
   return true
 end
 
+-- All section files are read and checked in: look for the nodes again, they may have been registered after the first scan.
+local function onSectionsReady()
+  retryIndex, retryTimer = 1, 0
+  scanNodes()
+end
+
 -- Stops the movement. Nothing was created here, so the nodes are left where they are.
 local function shutdown()
+  retryIndex, retryTimer = 1, 0
   nodes = {}
   cursor = 1
   selfCheckDone = false
@@ -121,6 +134,14 @@ local function shutdown()
 end
 
 local function onUpdate(dtReal, dtSim, dtRaw)
+  if enabled and not broken and #nodes == 0 and retryIndex <= #retryDelays then
+    retryTimer = retryTimer + (dtReal or 0)
+    if retryTimer >= retryDelays[retryIndex] then
+      retryIndex = retryIndex + 1
+      print(string.format("[volumeScatter] no volume emitter nodes yet, scanning again (%d of %d)", retryIndex - 1, #retryDelays))
+      scanNodes()
+    end
+  end
   if not enabled or broken or #nodes == 0 then return end
   if not selfCheckDone then selfCheck() end
   if broken then return end
@@ -163,6 +184,7 @@ M.getStatus = getStatus
 M.setMaxDistance = setMaxDistance
 M.setMaxUpdates = setMaxUpdates
 M.onUpdate = onUpdate
+M.onSectionsReady = onSectionsReady
 M.setEnabled = setEnabled
 M.isEnabled = isEnabled
 M.getNodeCount = getNodeCount

@@ -35,8 +35,8 @@ function runProbe(shapeName, count, auto, diag)
     end
   end
   if not shapeName then return nil, "no streamed object is live yet (stand in a loaded section, or pass a shapeName)" end
-  local cam = core_camera and core_camera.getPosition and core_camera.getPosition()
-  local pos = cam and string.format("%.3f %.3f %.3f", cam.x, cam.y, cam.z - 800) or "0 0 -800"
+  local cx, cy, cz = cameraXYZ()
+  local pos = cx and string.format("%.3f %.3f %.3f", cx, cy, cz - 800) or "0 0 -800"
   local results = {}
   local function pass(label, named)
     local objs, regMs, lookupMs, failed = {}, {}, {}, 0
@@ -249,10 +249,12 @@ function M.getStatus()
     pendingUnloadCount = pending,
     createdTotal = createdTotal, deletedTotal = deletedTotal,
     failureCount = failureCount,
+    engineFailCount = engineFails.total,
     forceCollisionNone = TUNING.forceCollisionNone,
     creationMode = TUNING.creationMode, shellPoolActive = (TUNING.creationMode == "shells" or TUNING.creationMode == "resident") and not shellDisabled,
     shellsFree = shellFreeN, shellsBuilt = shellStats.built, shellTarget = TUNING.shellTarget,
     shellsRecycled = shellStats.recycled, shellsFresh = shellStats.fresh, shellsParked = shellStats.parked,
+    shellsShapeKept = shellStats.shapeKept, fieldsSkipped = shellStats.fieldsSkipped, fieldsWritten = shellStats.fieldsWritten,
     shellRecycleAvgMs = shellStats.recycled > 0 and shellStats.recycleMs / shellStats.recycled or 0,
     shellParkAvgMs = shellStats.parked > 0 and shellStats.parkMs / shellStats.parked or 0,
     shellBuildMs = shellStats.buildMs, shellPeakLive = shellStats.peakLive,
@@ -265,11 +267,11 @@ function M.getStatus()
     poolTotal = poolTotal(),
     diagnostics = TUNING.testingMode and M.stallDiagnostics:summary() or nil,
     frameBudget = {
-      mainMs = TUNING.frameBudgetMs,
+      mainMs = TUNING.frameBudgetMs, effectiveMs = fb.budget(), adaptive = TUNING.adaptiveBudget == true, frameEmaMs = fb.frameEma,
       lastMs = { reads = fb.ms.reads, deletes = fb.ms.deletes, creates = fb.ms.creates, shells = fb.ms.shells, warm = fb.ms.warm },
       avgMs = { reads = fb.avg.reads, deletes = fb.avg.deletes, creates = fb.avg.creates, shells = fb.avg.shells, warm = fb.avg.warm },
-      capsMs = { deletes = TUNING.frameBudgetMs * TUNING.deleteBudgetShare, shells = TUNING.frameBudgetMs * TUNING.shellBuildBudgetShare,
-                 holds = TUNING.frameBudgetMs * TUNING.shapeCacheBudgetShare },
+      capsMs = { deletes = fb.budget() * TUNING.deleteBudgetShare, shells = fb.budget() * TUNING.shellBuildBudgetShare,
+                 holds = fb.budget() * TUNING.shapeCacheBudgetShare },
     },
     tuningRevision = tun.state.revision, lastPurge = tun.state.purge, run = M.getRunStats(),
     droppedSections = droppedSections, droppedObjects = droppedObjects, droppedLast = droppedLast,
@@ -317,6 +319,17 @@ function M.logDiagnosticSummary(section)
 end
 
 function M.getFailures() return failures end
+
+-- Failed engine calls per place, most frequent first: { site, count, first error text }.
+function M.getEngineFailures()
+  local out = {}
+  for i, key in ipairs(engineFails.order) do
+    local rec = engineFails.sites[key]
+    out[i] = { site = key, count = rec.n, first = rec.first }
+  end
+  table.sort(out, function(a, b) return a.count > b.count end)
+  return out
+end
 
 -- Sections in loading order (current first); a copy.
 function M.getLoadOrder()

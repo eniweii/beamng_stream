@@ -130,6 +130,11 @@ for _, name in ipairs(ALWAYS_ON_OVERRIDES) do enabled[name] = true end
 
 local function streamer() return nfsc_sectionStreamer end
 
+local function mlog(level, fmt, ...)
+  local msg = select("#", ...) > 0 and string.format(fmt, ...) or fmt
+  if log then log(level, "nfscSectionManager", msg) else print("[nfscSectionManager] " .. msg) end
+end
+
 -- One override, one name: a hex key the exporter could name (sections.json "overrideNames") becomes that name, so
 -- objects exported with the hex and objects exported with the name are the same entry in the list.
 local function canonName(name)
@@ -329,16 +334,28 @@ local function syncActiveSections()
   rebuildActiveFarRecs()
 end
 
+-- What the last scan saw, and the retries while it found nothing (objects registered after the streamer initialized).
+local scanStats = { objects = 0, withSection = 0, lightsWithout = 0 }
+local scanRetry = { delays = { 2, 5, 10, 20, 40 }, i = 1, t = 0 }
+
 function M.rescanScene()
   sceneBySection, sceneByOverride, sceneRecs = {}, {}, {}
+  scanStats = { objects = 0, withSection = 0, lightsWithout = 0 }
   lastActive = {}
   activeFarRecs = {}
   local names = scenetree:getAllObjects()
   if names then
     for _, name in pairs(names) do
+      scanStats.objects = scanStats.objects + 1
       local obj = scenetree.findObject(name)
       local sectionID = obj and obj.sectionID
+      if obj and (sectionID == nil or sectionID == "") and (obj:isSubClassOf("ParticleEmitterNode") or isLight(obj)) then
+        -- a light or emitter without the property: try the field read before giving up on it
+        local ok, v = pcall(obj.getField, obj, "sectionID", 0)
+        if ok and v ~= nil and v ~= "" then sectionID = v else scanStats.lightsWithout = scanStats.lightsWithout + 1 end
+      end
       if sectionID and sectionID ~= "" then
+        scanStats.withSection = scanStats.withSection + 1
         local kind = obj:isSubClassOf("ParticleEmitterNode") and "emitters" or (isLight(obj) and "lights" or nil)
         if kind then
           local ids = {}
@@ -380,6 +397,57 @@ function M.rescanScene()
   end
   syncActiveSections()
   for _, rec in ipairs(sceneRecs) do applyScene(rec) end   -- everything off until a section is active
+  local c = M.getSceneStatus()
+  mlog("I", "scene scan: %d emitters, %d lights, %d shown now (looked at %d objects, %d with a sectionID, %d lights or emitters without one)",
+    c.emitters, c.lights, c.shown, scanStats.objects, scanStats.withSection, scanStats.lightsWithout)
+end
+
+-- Why each scene object is on or off, and whether the engine agrees with what the manager did to it.
+-- engineMismatch counts objects whose real state differs from the state the manager set last (missing: object gone).
+local function asBool(v)
+  return v == true or v == 1 or v == "1" or v == "true"
+end
+
+function M.getSceneReport()
+  local r = { emitters = 0, lights = 0, shown = 0, classOff = 0, noActiveSection = 0, overrideOff = 0, far = 0,
+              engineMismatch = 0, missing = 0, activeSections = 0, samples = {},
+              scan = scanStats }
+  local s = streamer()
+  if s then r.activeSections = #s.getActiveSections() end
+  for _, rec in ipairs(sceneRecs) do
+    r[rec.kind] = r[rec.kind] + 1
+    local why
+    if not sceneClassOn[rec.kind] then why = "classOff"
+    elseif not anySectionActive(rec.sections) then why = "noActiveSection"
+    elseif #rec.names > 0 and not isAllowed(rec.names) then why = "overrideOff"
+    elseif rec.far then why = "far" end
+    if why then r[why] = r[why] + 1 else r.shown = r.shown + 1 end
+    local obj = scenetree.findObjectById(rec.id)
+    local mismatch = false
+    if not obj then
+      r.missing = r.missing + 1
+    else
+      local real = asBool(rec.kind == "lights" and obj.isEnabled or (rec.kind == "emitters" and obj.active))
+      if rec.shown ~= nil and real ~= rec.shown then r.engineMismatch = r.engineMismatch + 1; mismatch = true end
+    end
+    if (why or mismatch) and #r.samples < 6 then
+      r.samples[#r.samples + 1] = { id = rec.id, kind = rec.kind, sections = table.concat(rec.sections, ","),
+                                    why = why or "engine state differs", managerShown = rec.shown }
+    end
+  end
+  return r
+end
+
+-- Writes the report to the log (console: nfsc_sectionManager.explainScene()).
+function M.explainScene()
+  local r = M.getSceneReport()
+  mlog("I", "last scan looked at %d objects: %d with a sectionID, %d lights or emitters without one", r.scan.objects, r.scan.withSection, r.scan.lightsWithout)
+  mlog("I", "scene report: %d emitters, %d lights, %d on; off because: class switch %d, no active section %d, override %d, far %d; engine disagrees on %d, objects missing %d; %d active sections",
+    r.emitters, r.lights, r.shown, r.classOff, r.noActiveSection, r.overrideOff, r.far, r.engineMismatch, r.missing, r.activeSections)
+  for _, x in ipairs(r.samples) do
+    mlog("I", "  e.g. %s %d (sections %s): %s, manager shown=%s", x.kind, x.id, x.sections, x.why, tostring(x.managerShown))
+  end
+  return r
 end
 
 function M.getSceneStatus()
@@ -532,6 +600,13 @@ end
 -- ---------------------------------------------------------------------------
 function M.onNfscStreamerInitialized()
   loadOverrideIndex()
+  scanRetry.i, scanRetry.t = 1, 0
+  M.rescanScene()
+end
+
+-- Every section file is read and checked in: look for the emitters and lights again (they may have been registered after
+-- the first scan; the timed retries stay as a backup).
+function M.onNfscSectionsReady()
   M.rescanScene()
 end
 
@@ -541,6 +616,14 @@ function M.onNfscSectionChanged(newID, oldID)
 end
 
 function M.onUpdate(dtReal)
+  if scanRetry.i <= #scanRetry.delays and #sceneRecs == 0 and streamer() then
+    scanRetry.t = scanRetry.t + (dtReal or 0)
+    if scanRetry.t >= scanRetry.delays[scanRetry.i] then
+      scanRetry.i = scanRetry.i + 1
+      mlog("I", "scene scan found nothing; trying again (%d of %d)", scanRetry.i - 1, #scanRetry.delays)
+      M.rescanScene()
+    end
+  end
   farTimer = farTimer + (dtReal or 0)
   if farTimer < TUNING.emitterCheckInterval then return end
   farTimer = 0

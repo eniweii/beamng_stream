@@ -71,39 +71,120 @@ end
 
 function forceNoCollision(obj)
   if TUNING.forceCollisionNone then
-    pcall(obj.setField, obj, "collisionType", 0, "None")
-    pcall(obj.setField, obj, "decalType", 0, "None")
+    do local ok_, e_ = pcall(obj.setField, obj, "collisionType", 0, "None") if not ok_ then engineFail("pool.setField", e_, "collisionType") end end
+    do local ok_, e_ = pcall(obj.setField, obj, "decalType", 0, "None") if not ok_ then engineFail("pool.setField", e_, "decalType") end end
   end
+end
+
+-- Free shells, indexed by the shape they wear: shellFreeDot (parked on the dot shape) and shellFreeByShape[shape] (evicted
+-- from the resident pool, still wearing their old shape). shellFreeInfo[id] = { shape, at } gives O(1) removal. A shell that
+-- wears the shape an item needs skips the shapeName write; otherwise a dot shell is taken first so shaped ones stay available.
+function freeShellAdd(id, shape)
+  if shape == TUNING.shellShape then shape = nil end
+  local list
+  if shape then
+    list = shellFreeByShape[shape]
+    if not list then list = {}; shellFreeByShape[shape] = list end
+  else
+    list = shellFreeDot
+  end
+  list[#list + 1] = id
+  shellFreeInfo[id] = { shape = shape, at = #list }
+  shellFreeN = shellFreeN + 1
+end
+
+function freeShellRemove(id)
+  local info = shellFreeInfo[id]
+  if not info then return end
+  local list = info.shape and shellFreeByShape[info.shape] or shellFreeDot
+  local at, lastAt = info.at, #list
+  local last = list[lastAt]
+  list[at] = last
+  list[lastAt] = nil
+  if last ~= id then shellFreeInfo[last].at = at end
+  if info.shape and lastAt == 1 then shellFreeByShape[info.shape] = nil end
+  shellFreeInfo[id] = nil
+  shellFreeN = shellFreeN - 1
+end
+
+-- id of a free shell for this shape, removed from the pool; second value true when it already wears the shape.
+function freeShellTake(shape)
+  local list = shape and (shape == TUNING.shellShape and shellFreeDot or shellFreeByShape[shape])
+  if list and #list > 0 then
+    local id = list[#list]
+    freeShellRemove(id)
+    return id, true
+  end
+  if #shellFreeDot > 0 then
+    local id = shellFreeDot[#shellFreeDot]
+    freeShellRemove(id)
+    return id, false
+  end
+  local _, any = next(shellFreeByShape)
+  if any then
+    local id = any[#any]
+    freeShellRemove(id)
+    return id, false
+  end
+  return nil, false
+end
+
+-- Fields that are always written, never skipped as "unchanged": the transform (the sway manager moves live objects) and
+-- playAmbient (hideAmbient / showAmbient change it behind shellFields).
+SKIP_NEVER = { position = true, rotation = true, rotationEuler = true, rotationMatrix = true, scale = true, playAmbient = true }
+
+-- Writes the item's fields into obj, skipping the ones whose text is what the previous item wrote. Resets what the previous
+-- item had and this one has not. Returns the table of applied texts (id -> shellFields).
+function hold.refillFields(obj, item, last)
+  local applied = {}
+  local skipNone = TUNING.forceCollisionNone
+  for field, value in pairs(item) do
+    if field ~= "shapeName" and not RESERVED[field] then
+      local text = fieldText(value)
+      if text ~= nil then
+        if last and last[field] == text and not SKIP_NEVER[field] and not (skipNone and (field == "collisionType" or field == "decalType")) then
+          shellStats.fieldsSkipped = shellStats.fieldsSkipped + 1
+        else
+          do local ok_, e_ = pcall(obj.setField, obj, field, 0, text) if not ok_ then engineFail("pool.setField", e_, field) end end
+          shellStats.fieldsWritten = shellStats.fieldsWritten + 1
+        end
+        applied[field] = text
+      end
+    end
+  end
+  if last then
+    for field in pairs(last) do
+      if not applied[field] then do local ok_, e_ = pcall(obj.setField, obj, field, 0, shellDefault(field)) if not ok_ then engineFail("pool.setField", e_, field) end end end
+    end
+  end
+  return applied
+end
+
+-- Debug setting: the game's show/hide node calls updateInstanceRenderData after it sets obj.hidden; the streamer's objects
+-- use useInstanceRenderData but never did.
+function hold.renderData(obj)
+  if not TUNING.updateRenderData or not obj.updateInstanceRenderData then return end
+  local ok_, e_ = pcall(obj.updateInstanceRenderData, obj)
+  if not ok_ then engineFail("pool.updateInstanceRenderData", e_) end
 end
 
 -- Takes a parked shell and fills it in from item. Returns the object, or nil when no parked shell is left.
 function acquireShell(item)
   while shellFreeN > 0 do
-    local id = shellFree[shellFreeN]
-    shellFree[shellFreeN] = nil
-    shellFreeN = shellFreeN - 1
+    local id, wears = freeShellTake(item.shapeName)
+    if not id then break end
     local obj = scenetree.findObjectById(id)
     if obj then
-      local last, applied = shellFields[id], {}
-      pcall(obj.setField, obj, "shapeName", 0, item.shapeName)
-      for field, value in pairs(item) do
-        if field ~= "shapeName" and not RESERVED[field] then
-          local text = fieldText(value)
-          if text ~= nil then
-            pcall(obj.setField, obj, field, 0, text)
-            applied[field] = true
-          end
-        end
+      if wears then
+        shellStats.shapeKept = shellStats.shapeKept + 1                       -- already wears the shape: no shapeName write
+      else
+        do local ok_, e_ = pcall(obj.setField, obj, "shapeName", 0, item.shapeName) if not ok_ then engineFail("pool.setField", e_, "shapeName") end end
       end
-      if last then                                   -- what the previous item set and this one does not
-        for field in pairs(last) do
-          if not applied[field] then pcall(obj.setField, obj, field, 0, shellDefault(field)) end
-        end
-      end
-      shellFields[id] = applied
+      shellFields[id] = hold.refillFields(obj, item, shellFields[id])
       forceNoCollision(obj)
-      pcall(obj.postApply, obj)
-      pcall(function() obj.hidden = false end)
+      do local ok_, e_ = pcall(obj.postApply, obj) if not ok_ then engineFail("pool.postApply", e_) end end
+      do local ok_, e_ = pcall(function() obj.hidden = false end) if not ok_ then engineFail("pool.hidden", e_) end end
+      hold.renderData(obj)
       hold.showAmbient(obj, item)
       return obj
     end
@@ -116,12 +197,11 @@ end
 function parkShell(id)
   local obj = scenetree.findObjectById(id)
   if not obj then shellFields[id] = nil; return false end
-  pcall(function() obj.hidden = true end)
+  do local ok_, e_ = pcall(function() obj.hidden = true end) if not ok_ then engineFail("pool.hidden", e_) end end
   hold.hideAmbient(obj, id)
-  pcall(obj.setField, obj, "shapeName", 0, TUNING.shellShape)
-  pcall(obj.postApply, obj)
-  shellFreeN = shellFreeN + 1
-  shellFree[shellFreeN] = id
+  do local ok_, e_ = pcall(obj.setField, obj, "shapeName", 0, TUNING.shellShape) if not ok_ then engineFail("pool.setField", e_, "shapeName") end end
+  do local ok_, e_ = pcall(obj.postApply, obj) if not ok_ then engineFail("pool.postApply", e_) end end
+  freeShellAdd(id, nil)
   return true
 end
 
@@ -129,21 +209,20 @@ end
 function buildShell()
   local obj = createObject("TSStatic")
   if not obj then return false, "createObject(TSStatic) returned nil" end
-  pcall(obj.setField, obj, "shapeName", 0, TUNING.shellShape)
+  do local ok_, e_ = pcall(obj.setField, obj, "shapeName", 0, TUNING.shellShape) if not ok_ then engineFail("pool.setField", e_, "shapeName") end end
   forceNoCollision(obj)
-  pcall(function() obj.hidden = true end)
+  do local ok_, e_ = pcall(function() obj.hidden = true end) if not ok_ then engineFail("pool.hidden", e_) end end
   local ok, err = pcall(obj.registerObject, obj, shellName())
   if ok and err == false then ok, err = false, "the engine refused it (returned false)" end
   if not ok then
-    pcall(obj.delete, obj)
+    do local ok_, e_ = pcall(obj.delete, obj) if not ok_ then engineFail("pool.delete", e_) end end
     return false, tostring(err)
   end
   local okId, id = pcall(obj.getID, obj)
   if not okId or not id or not scenetree.findObjectById(id) then return false, "the object is not alive after registerObject" end
   local group = ensureRuntimeGroup()
-  pcall(group.addObject, group, obj)
-  shellFreeN = shellFreeN + 1
-  shellFree[shellFreeN] = id
+  do local ok_, e_ = pcall(group.addObject, group, obj) if not ok_ then engineFail("pool.addObject", e_) end end
+  freeShellAdd(id, nil)
   shellStats.built = shellStats.built + 1
   return true
 end
@@ -174,7 +253,7 @@ end
 function deactivateDormant(key, entry)
   local obj = scenetree.findObjectById(entry.id)
   if not obj then shellFields[entry.id] = nil; return false end
-  pcall(function() obj.hidden = true end)
+  do local ok_, e_ = pcall(function() obj.hidden = true end) if not ok_ then engineFail("pool.hidden", e_) end end
   hold.hideAmbient(obj, entry.id)
   dormantSerial = dormantSerial + 1
   local d = { id = entry.id, shape = entry.shape, stamp = dormantSerial }
@@ -212,7 +291,8 @@ function reviveDormant(item)
   forgetDormantShape(d)                                  -- registerLive counts it again
   local obj = scenetree.findObjectById(d.id)
   if not obj then shellFields[d.id] = nil; return nil end
-  pcall(function() obj.hidden = false end)
+  do local ok_, e_ = pcall(function() obj.hidden = false end) if not ok_ then engineFail("pool.hidden", e_) end end
+  hold.renderData(obj)
   hold.showAmbient(obj, item)
   return obj
 end
@@ -235,25 +315,11 @@ function acquireDormantShape(item)
       forgetDormantShape(d)
       local obj = scenetree.findObjectById(d.id)
       if obj then
-        local last, applied = shellFields[d.id], {}
-        for field, value in pairs(item) do
-          if field ~= "shapeName" and not RESERVED[field] then
-            local text = fieldText(value)
-            if text ~= nil then
-              pcall(obj.setField, obj, field, 0, text)
-              applied[field] = true
-            end
-          end
-        end
-        if last then
-          for field in pairs(last) do
-            if not applied[field] then pcall(obj.setField, obj, field, 0, shellDefault(field)) end
-          end
-        end
-        shellFields[d.id] = applied
+        shellFields[d.id] = hold.refillFields(obj, item, shellFields[d.id])
         forceNoCollision(obj)
-        pcall(obj.postApply, obj)
-        pcall(function() obj.hidden = false end)
+        do local ok_, e_ = pcall(obj.postApply, obj) if not ok_ then engineFail("pool.postApply", e_) end end
+        do local ok_, e_ = pcall(function() obj.hidden = false end) if not ok_ then engineFail("pool.hidden", e_) end end
+        hold.renderData(obj)
         hold.showAmbient(obj, item)
         return obj
       end
@@ -285,8 +351,7 @@ function evictOldest(n)
       dormant[q.key] = nil
       dormantCount = dormantCount - 1
       forgetDormantShape(d)
-      shellFreeN = shellFreeN + 1
-      shellFree[shellFreeN] = d.id
+      freeShellAdd(d.id, d.shape)                        -- keeps wearing its shape: an item of that shape reuses it as it is
       shellStats.evicted = shellStats.evicted + 1
       change.residentEvicts = change.residentEvicts + 1
       done = done + 1
@@ -304,7 +369,7 @@ function releaseDormant(deleteThem)
     forgetDormantShape(d)
     if deleteThem then
       local obj = scenetree.findObjectById(d.id)
-      if obj then pcall(obj.delete, obj) end
+      if obj then do local ok_, e_ = pcall(obj.delete, obj) if not ok_ then engineFail("pool.delete", e_) end end end
       shellFields[d.id] = nil
     else
       parkShell(d.id)
@@ -320,7 +385,7 @@ end
 -- The pool, resting and dropped-section state. Its own function: LuaJIT allows 60 upvalues per function and
 -- resetState is already near that.
 function resetPoolState()
-  shellFree, shellFreeN, shellFields = {}, 0, {}
+  shellFreeDot, shellFreeByShape, shellFreeInfo, shellFreeN, shellFields = {}, {}, {}, 0, {}
   shellChecked, shellDisabled, shellBuildFails, shellBuildOff = false, false, 0, false
   dormant, dormantOrder, doHead, doTail, dormantCount = {}, {}, 1, 0, 0
   dormantByShape = {}
@@ -353,15 +418,13 @@ function M.getCreationMode() return TUNING.creationMode end
 -- Deletes every parked shell; returns how many.
 function M.clearShellPool()
   local n = 0
-  for i = shellFreeN, 1, -1 do
-    local id = shellFree[i]
+  for id in pairs(shellFreeInfo) do
     local obj = scenetree.findObjectById(id)
-    if obj then pcall(obj.delete, obj) end
+    if obj then do local ok_, e_ = pcall(obj.delete, obj) if not ok_ then engineFail("pool.delete", e_) end end end
     shellFields[id] = nil
-    shellFree[i] = nil
     n = n + 1
   end
-  shellFreeN = 0
+  shellFreeDot, shellFreeByShape, shellFreeInfo, shellFreeN = {}, {}, {}, 0
   return n
 end
 
