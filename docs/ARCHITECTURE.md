@@ -194,8 +194,17 @@ so the policy only decides when to pay for it and measures the cost.
 
 Per-object events use direct listeners because `extensions.hook` visits every loaded extension.
 
+## Streamer parts
+`sectionStreamer.lua` is the only engine extension of the streamer. It keeps the public API, initialize / reset /
+purge, the listeners and the per-frame `onUpdate`, and loads the parts in `lua/ge/extensions/nfsc/sectionStreamer/`
+with `loadfile` (like the level host components): `stall`, `tuning`, `state`, `sectionIndex`, `objects`, `pool`,
+`queues`, `camera`, `shapeCache`, `diagnostics`. All parts run in one shared environment, so a name that used to be a
+file-level local (`TUNING`, `live`, `hold`, `fb` ...) is the same variable in every part. A new part is added to
+`PARTS` in the facade; a function a part defines is visible to all parts and to the facade.
+
 ## BeamNG integration point
-Put `lua/ge/extensions/nfsc/*.lua` in the mod zip. `examples/mainLevel_nfsc_extensions.lua` loads
+Put `lua/ge/extensions/nfsc/*.lua` and its two subfolders `sectionStreamer/` (the streamer parts) and `components/`
+(the level host components) in the mod zip. `examples/mainLevel_nfsc_extensions.lua` loads
 the three extensions, calls `nfsc_sectionStreamer.initialize("levels/nfsc")` and unloads them with
 the level. The builder's `runtime/levels/nfsc/lua/` folder (index and sections) and `sections.json`
 go next to the level. Copy the builder's patched items files over the level's, since streamed

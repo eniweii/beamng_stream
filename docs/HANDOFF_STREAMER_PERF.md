@@ -17,7 +17,7 @@ maintainer; the assistant only runs the offline tests (`python tests/run_lua_tes
   classes, 0020 everything-is-warm mode. 0018 was the last one he named as applied; his logs show 0019.
 
 ## Architecture in one screen
-`lua/ge/extensions/nfsc/sectionStreamer.lua` (queues, budget, pools, tuning schema), `sectionManager.lua` (+ `sectionManagerUi.lua`,
+`lua/ge/extensions/nfsc/sectionStreamer.lua` (facade) and its parts in `sectionStreamer/` (`queues`, `pool`, `shapeCache`, `tuning`, `state` ...), `sectionManager.lua` (+ `sectionManagerUi.lua`,
 the panel), `sectionCollision.lua`. Tests: `tests/lua/test_sections.lua` + `harness.lua`.
 Creation modes: `current` (create/delete), `shells` (recycled shell pool, shells wear the tiny dot shape), `resident` (shells plus a
 resting state). The camera track is run in game only and is not in the repo.

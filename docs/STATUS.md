@@ -7,7 +7,8 @@
 - Manager: all 32 instance flags parsed, draw-gate flags applied, emitters/lights with On/Off radios (legacy scene streamer retired). Fidelity notes: `docs/FIDELITY.md`.
 - Collision policy extension (off / settled, timed refreshes) kept apart from rendering.
 - Streamer, manager and panel as engine extensions in `lua/ge/extensions/nfsc/`; offline Lua tests
-  run against the builder's real output (`tests/test_lua_modules.py`).
+  run against the builder's real output (`tests/test_lua_modules.py`). The streamer is split into a facade and ten
+  parts in `lua/ge/extensions/nfsc/sectionStreamer/` (see `docs/ARCHITECTURE.md`).
 - Architecture, interface and diagnostics: `docs/ARCHITECTURE.md`.
 
 - Queue: bounded feeding from pending lists, stale purge on section change, terrain-first and
