@@ -231,8 +231,29 @@ local function drawVolumeScatter(comp)
   if im.SliderInt("Nodes moved per frame##vsupdates", up, 1, 1000) then vs.setMaxUpdates(up[0]) end
 end
 
+local FLIP_AXES = { { "x", "X" }, { "y", "Y" }, { "z", "Z" } }
+
+local function drawBarrierSets(mod, st)
+  if st.active then
+    im.Text(string.format("Mission: %s (%d groups on, %d off)", tostring(st.active), st.enabled, st.disabled))
+  else
+    im.TextDisabled("No mission with barrier groups is running")
+  end
+  local on = boolPtr("flipon", st.flipEnabled)
+  if im.Checkbox("Mirror flipped artwork##flipon", on) then mod.setFlipEnabled(on[0]) end
+  tip("Barrier groups the race turns on flipped: their objects flagged FlipOnBackwardsTrack are mirrored horizontally while the group is on.")
+  im.Text("Mirror axis")
+  for i = 1, #FLIP_AXES do
+    if i > 1 then im.SameLine() end
+    if radio(FLIP_AXES[i][2] .. "##flipaxis", st.flipAxis == FLIP_AXES[i][1]) then mod.setFlipAxis(FLIP_AXES[i][1]) end
+  end
+  tip("The local axis of the object whose sign changes. If the arrows still point the wrong way, try another axis.")
+  im.Text(string.format("Flippable objects: %d live, %d mirrored now; flipped groups: %d", st.flippable, st.mirrored, st.flippedGroups))
+  if st.scaleErrors > 0 then im.TextDisabled(string.format("%d scale writes failed", st.scaleErrors)) end
+end
+
 local LABEL = { soundZones = "Sound zones", volumeScatter = "Volume scatter", roughness = "Roughness",
-               sway = "Sway", textureAnimation = "Texture animation" }
+               sway = "Sway", textureAnimation = "Texture animation", barrierSets = "Barrier sets" }
 
 function M.onUpdate()
   if not nfsc_levelHost then return end
@@ -254,6 +275,7 @@ function M.onUpdate()
         if comp.name == "roughness" then drawRoughness(mod, comp.status) end
         if comp.name == "sway" then drawSway(mod, comp.status) end
         if comp.name == "textureAnimation" then drawAnimation(mod, comp.status) end
+        if comp.name == "barrierSets" then drawBarrierSets(mod, comp.status) end
       end
     end
   end

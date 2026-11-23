@@ -5,6 +5,7 @@
     python tests/run_lua_tests_lupa.py --stacked  # the stacked (depth) sections tests
     python tests/run_lua_tests_lupa.py --host     # the level host and component tests
     python tests/run_lua_tests_lupa.py --env      # the environment components (roughness, sway, texture animation)
+    python tests/run_lua_tests_lupa.py --barriers # the barrier sets component (mission groups through the Section Manager API)
 
 LuaJIT matters: it refuses a function with more than 60 upvalues and has a few other limits that newer Lua
 versions do not have. A file that only loads under Lua 5.4 does not load in the game.
@@ -46,7 +47,7 @@ def main():
     lua.execute('function os.exit(c) error("EXIT:" .. tostring(c)) end')
     lua.execute('arg = {[0] = "t", [1] = "%s", [2] = "%s"}' % (REPO.as_posix(), (tmp / "game").as_posix()))
     try:
-        lua.execute((REPO / "tests" / "lua" / ("test_env_components.lua" if "--env" in sys.argv else "test_level_host.lua" if "--host" in sys.argv else "test_stacked_sections.lua" if stacked else "test_sections.lua")).read_text(encoding="utf-8"))
+        lua.execute((REPO / "tests" / "lua" / ("test_barrier_sets.lua" if "--barriers" in sys.argv else "test_env_components.lua" if "--env" in sys.argv else "test_level_host.lua" if "--host" in sys.argv else "test_stacked_sections.lua" if stacked else "test_sections.lua")).read_text(encoding="utf-8"))
     except Exception as exc:  # the test file ends with os.exit
         print("ended:", str(exc).splitlines()[0][-80:])
     shutil.rmtree(tmp, ignore_errors=True)

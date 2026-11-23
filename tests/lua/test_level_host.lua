@@ -47,8 +47,8 @@ do
   local host = fresh({ TUNNEL })
   host.initialize("levels/nfsc")
   local st = host.getStatus()
-  check("five components in order", #st.components == 5 and st.components[1].name == "soundZones" and st.components[2].name == "volumeScatter"
-    and st.components[3].name == "roughness" and st.components[4].name == "sway" and st.components[5].name == "textureAnimation")
+  check("six components in order", #st.components == 6 and st.components[1].name == "soundZones" and st.components[2].name == "volumeScatter"
+    and st.components[3].name == "roughness" and st.components[4].name == "sway" and st.components[5].name == "textureAnimation" and st.components[6].name == "barrierSets")
   check("component running", st.components[1].ok == true, st.components[1].err)
   check("scatter running without nodes", st.components[2].ok == true and st.components[2].status.nodes == 0, st.components[2].err)
   check("component status passed on", st.components[1].status and st.components[1].status.boxes == 1)

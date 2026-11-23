@@ -7,6 +7,8 @@
 --   component.init(ctx)                    -- once; ctx is shared by all components (see below)
 --   component.onSectionChanged(new, old)   -- optional; the streamer's onNfscSectionChanged hook, forwarded
 --   component.onSectionsReady()            -- optional; the streamer's onNfscSectionsReady hook (all section files read), forwarded
+--   component.onMissionChanged(state, mission, ...)
+--                                          -- optional; the engine's onAnyMissionChanged hook ("started" / "stopped"), forwarded
 --   component.onObjectCreated(key, obj, item), onObjectDeleted(key), onStreamerReset()
 --                                          -- optional; the streamer's object events (the host is the one listener)
 --   component.onUpdate(dtReal, dtSim)      -- optional; every frame
@@ -44,7 +46,7 @@ local TUNING = {
 }
 
 -- Components in load order. Add a name here and a file components/<name>.lua.
-local COMPONENTS = { "soundZones", "volumeScatter", "roughness", "sway", "textureAnimation" }
+local COMPONENTS = { "soundZones", "volumeScatter", "roughness", "sway", "textureAnimation", "barrierSets" }
 
 -- TrackPathZone enum, used when a zone has no typeName.
 local TYPE_NAMES = {
@@ -309,6 +311,14 @@ function M.onNfscSectionChanged(newID, oldID)
   for i = 1, #components do
     local comp = components[i]
     if comp.ok and not comp.failed then callComponent(comp, "onSectionChanged", newID, oldID) end
+  end
+end
+
+-- The engine's mission hook, extensions.hook("onAnyMissionChanged", state, mission, ...), forwarded to the components.
+function M.onAnyMissionChanged(state, mission, ...)
+  for i = 1, #components do
+    local comp = components[i]
+    if comp.ok and not comp.failed then callComponent(comp, "onMissionChanged", state, mission, ...) end
   end
 end
 
